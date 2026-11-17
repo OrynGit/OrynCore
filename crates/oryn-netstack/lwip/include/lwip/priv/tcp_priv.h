@@ -443,6 +443,8 @@ void tcp_seg_free(struct tcp_seg *seg);
 struct tcp_seg *tcp_seg_copy(struct tcp_seg *seg);
 
 #ifdef ORYN_ACK_STRETCH
+/* 有延迟确认挂着（TF_ACK_DELAY 已置位且还没到间隔）：Core 每批输入处理完后据此决定要不要刷（oryn_lwip_flush_acks） */
+extern u8_t oryn_ack_dirty;
 /* Oryn：连接刚开始每 2 个段确认一次（慢启动不被延迟确认拖住）；已接收超过 ORYN_ACK_BULK_SEGS 个段的大流量
  * 每 ORYN_ACK_EVERY 个段确认一次，减少反向的 ACK 包（真机 9 Gbps 上行时约 14 万个 ACK/秒，每个都要写线程一次发送
  * 和内核入站线程一次处理）。 */
@@ -458,6 +460,9 @@ struct tcp_seg *tcp_seg_copy(struct tcp_seg *seg);
     } else {                                                                          \
       tcp_set_flags(pcb, TF_ACK_DELAY);                                               \
       (pcb)->oryn_ack_pending = 1;                                                    \
+    }                                                                                 \
+    if ((pcb)->flags & TF_ACK_DELAY) {                                                \
+      oryn_ack_dirty = 1;                                                             \
     }                                                                                 \
     if ((pcb)->oryn_rx_segs < 0xFFFFU) {                                              \
       (pcb)->oryn_rx_segs++;                                                          \

@@ -205,6 +205,11 @@ impl LwipStack {
         (out[0], out[1], out[2])
     }
 
+    /// 每批输入处理完后调用：把挂着的延迟确认立即发出去（见 shim 里的说明）。
+    pub fn flush_acks(&self) {
+        unsafe { lwip::oryn_lwip_flush_acks() };
+    }
+
     pub fn listener_count(&self) -> usize {
         self.shared.listeners.borrow().len()
     }

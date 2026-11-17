@@ -37,7 +37,7 @@ const TX_QUEUE_MAX_BYTES: usize = 4 * 1024 * 1024;
 const TX_DONE_MAX: usize = 256;
 const AF_HEADER_LEN: usize = 4;
 /// utun 套接字收发缓冲目标大小。
-const SOCKET_BUFFER: libc::c_int = 4 * 1024 * 1024;
+const SOCKET_BUFFER: libc::c_int = 8 * 1024 * 1024;
 
 /// Darwin 的 `struct msghdr_x`（`recvmsg_x` / `sendmsg_x` 使用的批量消息头）。
 #[repr(C)]

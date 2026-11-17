@@ -20,7 +20,7 @@ use crate::lwip::{self, err_t, pbuf, tcp_pcb, ERR_CLSD, ERR_MEM, ERR_OK};
 use crate::stack::StackShared;
 
 /// 与 lwipopts.h 的 TCP_SND_BUF 一致。
-const SND_BUF: usize = 256 * 1024;
+const SND_BUF: usize = 512 * 1024;
 /// 所有正在发送的连接共享的在途数据预算，以及单连接下限。
 ///
 /// 真机测量：往内核 utun 写入的在途数据超过约 1 MiB（4 KiB 包 ≈ 256 个）后，内核入站队列静默丢包，
@@ -33,7 +33,7 @@ const SEND_MIN: usize = 32 * 1024;
 /// 这里做接收窗口的“慢启动”（见 `poll_read`）：relay 读完后缓冲不超过窗口一半时额外多放行，直到 `RCV_WND_MAX`；
 /// 对端慢、缓冲一直排不空的连接保持小窗口，避免很多慢连接各自缓冲 256 KiB。
 const INITIAL_RCV_WND: u32 = 65535;
-const RCV_WND_MAX: u32 = 256 * 1024;
+const RCV_WND_MAX: u32 = 512 * 1024;
 
 fn send_cap(senders: u32) -> usize {
     (SEND_BUDGET / senders.max(1) as usize).clamp(SEND_MIN, SND_BUF)

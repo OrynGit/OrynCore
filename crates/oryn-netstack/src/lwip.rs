@@ -38,6 +38,7 @@ extern "C" {
     pub fn oryn_lwip_setup(mtu: u16, output: OutputFn, ctx: *mut c_void);
     pub fn oryn_lwip_input(data: *const u8, len: usize) -> err_t;
     pub fn oryn_lwip_check_timeouts();
+    pub fn oryn_lwip_flush_acks();
     pub fn oryn_lwip_sleeptime() -> u32;
     pub fn oryn_lwip_reset();
     pub fn oryn_lwip_pcb_counts(out: *mut u32);
