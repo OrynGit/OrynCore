@@ -71,18 +71,18 @@
 /* TCP：针对 iOS Extension 调小窗口与缓冲 */
 /* MSS 只是编译期上限：实际 MSS 取 min(TCP_MSS, 虚拟接口 MTU - 40)，由 Core 的 mtu 选项决定。 */
 #define TCP_MSS                         4024
-#define TCP_WND                         (256 * 1024)
-#define TCP_SND_BUF                     (256 * 1024)
+#define TCP_WND                         (512 * 1024)
+#define TCP_SND_BUF                     (512 * 1024)
 #define LWIP_DISABLE_TCP_SANITY_CHECKS  1
 #define PBUF_POOL_BUFSIZE               1600
-#define TCP_SND_QUEUELEN                192
+#define TCP_SND_QUEUELEN                400
 #define TCP_QUEUE_OOSEQ                 1
 #define TCP_OOSEQ_MAX_PBUFS             16
 #define TCP_LISTEN_BACKLOG              0
 #define LWIP_TCP_KEEPALIVE              0
 #define LWIP_TCP_TIMESTAMPS             0
 #define LWIP_WND_SCALE                  1
-#define TCP_RCV_SCALE                  3
+#define TCP_RCV_SCALE                  4
 #define LWIP_TCP_SACK_OUT               0
 #define SO_REUSE                        1
 

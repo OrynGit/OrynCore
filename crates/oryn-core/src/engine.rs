@@ -537,6 +537,7 @@ async fn event_loop(
                         if let Some(io) = utun.as_ref() {
                             io.for_each_received(|packet| ctx.stack.input_packet(packet));
                         }
+                        ctx.stack.flush_acks();
                         crate::perf::add(&crate::perf::INPUT_NS, crate::perf::since(t));
                         let t = std::time::Instant::now();
                         dispatch(&ctx);

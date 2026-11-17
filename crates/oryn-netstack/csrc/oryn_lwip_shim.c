@@ -111,6 +111,19 @@ int8_t oryn_lwip_input(const uint8_t *data, size_t len)
   return err;
 }
 
+/* ACK 拉长（lwIP 补丁 ORYN_ACK_STRETCH）会让不足 ORYN_ACK_EVERY 个段的尾巴等 250 ms 的慢定时器才确认，发送端的重传
+ * 定时器先到期就会伪重传并砍拥塞窗口（真机单流上行偶发掉到 4.5 Gbps、发送端 18 个重传而没有任何丢包计数）。
+ * Core 每批输入处理完调用这里：有延迟确认挂着就立即发出去，吞吐期间仍是每 8 段一个 ACK，批尾不再等定时器。 */
+u8_t oryn_ack_dirty = 0;
+
+void oryn_lwip_flush_acks(void)
+{
+  if (oryn_ack_dirty) {
+    oryn_ack_dirty = 0;
+    tcp_fasttmr();
+  }
+}
+
 void oryn_lwip_check_timeouts(void)
 {
   sys_check_timeouts();
