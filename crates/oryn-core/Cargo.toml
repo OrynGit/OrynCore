@@ -1,0 +1,69 @@
+[package]
+name = "oryn-core"
+description = "Oryn Engine：Flow Manager、事件循环、统计与控制命令"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+oryn-udp.workspace = true
+async-trait.workspace = true
+oryn-http.workspace = true
+oryn-http-inspect.workspace = true
+oryn-script.workspace = true
+cron = "0.15"
+chrono = "0.4"
+oryn-module.workspace = true
+base64.workspace = true
+regex.workspace = true
+sha2.workspace = true
+url = "2"
+oryn-mitm.workspace = true
+oryn-tls.workspace = true
+tokio-rustls.workspace = true
+rustls.workspace = true
+bytes.workspace = true
+http.workspace = true
+hyper = { version = "1", features = ["client", "server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+oryn-sniff.workspace = true
+oryn-config.workspace = true
+oryn-router.workspace = true
+oryn-outbound.workspace = true
+oryn-dns.workspace = true
+oryn-netstack.workspace = true
+log.workspace = true
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt", "net", "time", "io-util", "sync", "macros"] }
+libmimalloc-sys = { workspace = true, optional = true }
+mimalloc = { workspace = true, optional = true }
+
+[features]
+# 全部协议默认编入（含 Extension 发布构建）；--no-default-features 为开发用精简版
+default = ["hysteria2", "tuic", "wireguard", "quic"]
+quic = ["oryn-outbound/quic", "oryn-config/quic"]
+hysteria2 = ["oryn-outbound/hysteria2", "oryn-config/hysteria2"]
+tuic = ["oryn-outbound/tuic", "oryn-config/tuic"]
+wireguard = ["oryn-outbound/wireguard", "oryn-config/wireguard"]
+# 由 oryn-ffi 开启：全局分配器为 mimalloc，事件循环定期把空闲页还给系统（alloc.rs）
+mimalloc = ["dep:libmimalloc-sys", "dep:mimalloc"]
+
+[dev-dependencies]
+x25519-dalek.workspace = true
+oryn-transport.workspace = true
+tokio-rustls.workspace = true
+rcgen.workspace = true
+ring.workspace = true
+oryn-protocol.workspace = true
+base64.workspace = true
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+bytes.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "rt", "net", "time", "io-util", "sync", "macros"] }
+oryn-tls.workspace = true
+rustls.workspace = true
+quinn.workspace = true

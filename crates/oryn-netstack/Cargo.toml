@@ -1,0 +1,16 @@
+[package]
+name = "oryn-netstack"
+description = "用户态 TCP/IP：lwIP + Rust Adapter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+links = "oryn_lwip"
+
+[dependencies]
+libc.workspace = true
+log.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+
+[build-dependencies]
+cc = "1"

@@ -1,0 +1,15 @@
+[package]
+name = "oryn-module"
+description = "Surge module 与 Loon plugin 的输入解析和统一 IR"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+regex-automata.workspace = true
+regex.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

@@ -1,0 +1,51 @@
+# 锚点、别名与流式写法（合并键 `<<` 见 Swift 单测：Core 的解析器不支持，转换时会展开）
+common: &common
+  udp: true
+  skip-cert-verify: false
+
+proxies:
+  - name: "A#1, special"
+    type: trojan
+    server: a.example.com
+    port: 443
+    password: &pw "123456"
+    sni: &host a.example.com
+    udp: true
+  - name: B
+    type: vmess
+    server: b.example.com
+    port: "8443"
+    uuid: 11111111-2222-3333-4444-555555555555
+    alterId: 0
+    cipher: auto
+    udp: true
+    skip-cert-verify: false
+  - name: C
+    type: ss
+    server: c.example.com
+    port: 8388
+    cipher: chacha20-ietf-poly1305
+    password: *pw
+    udp: on
+  - {name: D, type: trojan, server: *host, port: 443, password: *pw, udp: true}
+
+proxy-providers:
+  provider-a:
+    type: inline
+    payload:
+      - {name: P1, type: socks5, server: 9.9.9.9, port: 1080}
+
+proxy-groups:
+  - name: Pick
+    type: select
+    proxies: &members ["A#1, special", B, C]
+  - name: AutoAll
+    type: url-test
+    use: [provider-a]
+    proxies: *members
+
+  - {name: Nested, type: select, flatten: true, proxies: [Pick, AutoAll, DIRECT]}
+
+rules:
+  - DOMAIN-SUFFIX,example.com,Pick
+  - MATCH,DIRECT

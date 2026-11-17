@@ -1,0 +1,21 @@
+[package]
+name = "oryn-http-inspect"
+description = "HTTP message 级 Rewrite、JSON Key Path 与 jq 执行"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+oryn-module.workspace = true
+oryn-script.workspace = true
+oryn-jq.workspace = true
+regex.workspace = true
+serde_json.workspace = true
+
+fancy-regex = "0.14"
+base64.workspace = true
+log.workspace = true
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+brotli = "8"
+http.workspace = true

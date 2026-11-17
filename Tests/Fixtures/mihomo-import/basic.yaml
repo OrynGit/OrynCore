@@ -1,0 +1,199 @@
+# 典型订阅风格配置（假数据）
+mixed-port: 7890
+allow-lan: true
+mode: rule
+log-level: warning
+geo-auto-update: true
+geo-update-interval: 48
+geox-url:
+  geoip: https://example.com/geoip.dat
+  mmdb: https://example.com/country.mmdb
+
+hosts:
+  router.lan: 192.168.1.1
+  multi.example.com:
+    - 10.0.0.1
+    - 10.0.0.2
+
+dns:
+  enable: true
+  listen: 0.0.0.0:1053
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  fake-ip-filter:
+    - "*.lan"
+    - +.example.org
+  default-nameserver: [223.5.5.5, 119.29.29.29]
+  nameserver:
+    - https://dns.alidns.com/dns-query
+    - 8.8.8.8
+  proxy-server-nameserver: [tls://1.1.1.1]
+  nameserver-policy:
+    "+.example.cn": 223.5.5.5
+
+sniffer:
+  enable: true
+  force-domain:
+    - +.v2ex.com
+  skip-domain:
+    - Mijia Cloud
+
+tun:
+  enable: false
+
+proxies:
+  - {name: "🇭🇰 HK 01", type: ss, server: hk.example.com, port: 8388, cipher: aes-256-gcm, password: "pass1", udp: true}
+  - name: "🇯🇵 JP vmess ws"
+    type: vmess
+    server: jp.example.com
+    port: 443
+    uuid: 11111111-2222-3333-4444-555555555555
+    alterId: 0
+    cipher: auto
+    tls: true
+    servername: cdn.example.com
+    skip-cert-verify: false
+    network: ws
+    ws-opts:
+      path: /ws
+      headers:
+        Host: cdn.example.com
+    udp: true
+  - name: US vless reality
+    type: vless
+    server: us.example.com
+    port: 443
+    uuid: 11111111-2222-3333-4444-555555555555
+    flow: xtls-rprx-vision
+    tls: true
+    servername: www.microsoft.com
+    client-fingerprint: chrome
+    reality-opts:
+      public-key: 7yXkRU4O-4UQbsMJLJ1CvDdgXkzu3IRZxWT4S7p3Dl0
+      short-id: abcd1234
+    udp: true
+  - name: SG trojan grpc
+    type: trojan
+    server: sg.example.com
+    port: 443
+    password: trojan-pass
+    sni: sg.example.com
+    network: grpc
+    grpc-opts:
+      grpc-service-name: sg-grpc
+    udp: true
+  - name: KR hysteria2
+    type: hysteria2
+    server: kr.example.com
+    port: 443
+    password: hy2-pass
+    sni: kr.example.com
+    up: 50 Mbps
+    down: 200 Mbps
+    obfs: salamander
+    obfs-password: obfs-pass
+  - name: TW tuic
+    type: tuic
+    server: tw.example.com
+    port: 443
+    uuid: 11111111-2222-3333-4444-555555555555
+    password: tuic-pass
+    sni: tw.example.com
+    udp-relay-mode: native
+    congestion-controller: bbr
+  - name: Office socks
+    type: socks5
+    server: 10.0.0.5
+    port: 1080
+    username: user
+    password: pw
+    udp: true
+  - name: Office http
+    type: http
+    server: 10.0.0.6
+    port: 8080
+  - name: AnyTLS node
+    type: anytls
+    server: any.example.com
+    port: 443
+    password: any-pass
+    sni: any.example.com
+    idle-session-timeout: 60
+  - {name: WG node, type: wireguard, server: wg.example.com, port: 51820, private-key: "yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk=", public-key: "xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=", ip: 10.0.0.2}
+  - name: SS obfs
+    type: ss
+    server: obfs.example.com
+    port: 8388
+    cipher: aes-128-gcm
+    password: p
+    plugin: obfs
+    plugin-opts: {mode: tls, host: bing.com}
+  - {name: Chained, type: ss, server: chain.example.com, port: 8388, cipher: aes-128-gcm, password: c, dialer-proxy: "🇭🇰 HK 01", tfo: true, ip-version: ipv4}
+
+proxy-groups:
+  - name: Proxy
+    type: select
+    proxies: [Auto, Fallback, "🇭🇰 HK 01", "🇯🇵 JP vmess ws", DIRECT, REJECT]
+  - name: Auto
+    type: url-test
+    include-all: true
+    filter: "HK|JP"
+    url: https://www.gstatic.com/generate_204
+    interval: 300
+    tolerance: 50
+    lazy: true
+  - name: Fallback
+    type: fallback
+    proxies: [US vless reality, SG trojan grpc]
+    url: http://cp.cloudflare.com/generate_204
+    interval: 120
+  - name: Balance
+    type: load-balance
+    proxies: ["🇭🇰 HK 01", "🇯🇵 JP vmess ws"]
+    strategy: round-robin
+  - name: Relay
+    type: relay
+    proxies: ["🇭🇰 HK 01", Chained]
+
+rule-providers:
+  cn-domain:
+    type: http
+    behavior: domain
+    format: text
+    url: https://example.com/cn.txt
+    interval: 86400
+  my-ips:
+    type: inline
+    behavior: ipcidr
+    payload:
+      - 10.0.0.0/8
+  local-file:
+    type: file
+    behavior: classical
+    path: rules/local.yaml
+  fancy:
+    type: http
+    behavior: domain
+    format: mrs
+    url: https://example.com/x.mrs
+
+rules:
+  - DOMAIN,ad.example.com,REJECT
+  - DOMAIN-SUFFIX,google.com,Proxy
+  - DOMAIN-KEYWORD,github,Proxy
+  - DOMAIN-WILDCARD,*.apple.com,DIRECT
+  - DOMAIN-REGEX,^ads?\.,REJECT
+  - IP-CIDR,192.168.0.0/16,DIRECT,no-resolve
+  - IP-CIDR6,fe80::/10,DIRECT,no-resolve
+  - GEOIP,CN,DIRECT
+  - DST-PORT,80/443,Proxy
+  - NETWORK,udp,Balance
+  - RULE-SET,cn-domain,DIRECT
+  - RULE-SET,my-ips,DIRECT,no-resolve
+  - RULE-SET,https://example.com/surge.list,Proxy
+  - DOMAIN-SET,https://example.com/domains.txt,REJECT
+  - AND,((DOMAIN,a.example.com),(NETWORK,udp)),REJECT
+  - PROCESS-NAME,curl,DIRECT
+  - DOMAIN-SUFFIX,example.net,Relay
+  - MATCH,Proxy
+  - DOMAIN,never.example.com,DIRECT

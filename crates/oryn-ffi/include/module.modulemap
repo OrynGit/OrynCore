@@ -1,0 +1,4 @@
+module OrynCoreFFI {
+    header "oryn_core.h"
+    export *
+}

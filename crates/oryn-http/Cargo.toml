@@ -1,0 +1,18 @@
+[package]
+name = "oryn-http"
+description = "最小 HTTP/1.1 客户端：规则集下载、健康检查、公网 IP 查询"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+oryn-outbound.workspace = true
+oryn-config.workspace = true
+oryn-tls.workspace = true
+async-trait.workspace = true
+log.workspace = true
+tokio = { workspace = true, features = ["net", "io-util", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["net", "io-util", "time", "rt", "macros", "test-util"] }

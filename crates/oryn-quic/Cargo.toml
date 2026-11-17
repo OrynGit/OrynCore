@@ -1,0 +1,26 @@
+[package]
+name = "oryn-quic"
+description = "Hysteria2 与 TUIC 共用的 QUIC 客户端：套接字、窗口、会话"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+blake2.workspace = true
+digest.workspace = true
+log.workspace = true
+quinn.workspace = true
+quinn-proto.workspace = true
+# Salamander 每包盐的线程本地 CSPRNG：已是传递依赖（oryn-outbound 用同一版本），不增加体积；MIT / Apache-2.0。
+rand = "0.9"
+oryn-tls.workspace = true
+oryn-udp.workspace = true
+ring.workspace = true
+tokio = { workspace = true, features = ["net", "time", "sync", "macros", "rt"] }
+
+[dev-dependencies]
+rcgen.workspace = true
+rustls.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "io-util"] }

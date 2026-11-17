@@ -1,0 +1,15 @@
+[package]
+name = "oryn-udp"
+description = "QUIC 与 WireGuard 共用的数据报通道抽象：直连 UDP 套接字或经由另一个出站"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+libc.workspace = true
+tokio = { workspace = true, features = ["net", "rt"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "net", "time"] }

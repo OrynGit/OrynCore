@@ -1,0 +1,16 @@
+mitm:
+  enabled: true
+  http2: true
+  auto-quic-block: true
+  hostnames:
+    - "api.example.com"
+    - "-private.example.com"
+modules:
+  - url: "https://example.com/a.sgmodule"
+    format: "auto"
+    enabled: true
+    update-interval: 86400
+    arguments:
+      a: "quote\"value"
+    policy-map:
+      PROXY: "GLOBAL"

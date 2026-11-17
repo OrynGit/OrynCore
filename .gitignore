@@ -1,0 +1,59 @@
+# macOS
+.DS_Store
+
+# Rust 构建缓存（包含测试对端的嵌套 target；保留 build/ 构建脚本）
+target/
+
+# 签名材料与密钥（永不上传）
+*.p12
+*.pfx
+*.mobileprovision
+*.cer
+*.certSigningRequest
+.env
+.env.*
+
+# 编辑器
+.idea/
+.vscode/
+*.swp
+
+# 工具遗留
+*.orig
+*.rej
+*.profraw
+*.log
+__pycache__/
+
+# Claude Code 的本机设置与临时工作区
+/.claude/settings.local.json
+/.claude/worktrees/
+
+# 代理规则统一放在工作区 Oryn_dev/AGENTS.md；本地临时工作区
+AGENTS.md
+AGENTSMD
+/.worktrees/
+
+# 独立测试与本机对端；源码直接引用的契约样例继续跟踪
+/Tests/*
+!/Tests/Fixtures/
+/crates/*/tests/
+/test-support/
+
+# 临时文件、文档草稿与测试输出
+scratchpad/
+tmp/
+temp/
+.tmp/
+/docs/drafts/
+# 更新日志与更改记录只留本地
+/docs/changelog/
+/docs/tmp/
+/docs/temp/
+/test-results/
+/test-reports/
+/coverage/
+*.tmp
+*.temp
+*.bak
+*~

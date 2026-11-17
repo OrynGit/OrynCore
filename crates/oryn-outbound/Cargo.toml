@@ -1,0 +1,86 @@
+[package]
+name = "oryn-outbound"
+description = "出站与策略组：DIRECT、REJECT、SOCKS5、HTTP、SS、Trojan、VLESS"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Smart 站点先验：按公共后缀列表取可注册域名（MIT / Apache-2.0，数据 MPL-2.0），不能截取最后两个标签。
+psl = "2"
+# Sudoku 的密钥规范化与 KIP 握手：已有传递依赖，BSD-3-Clause / MIT / Apache-2.0。
+curve25519-dalek = "4"
+x25519-dalek.workspace = true
+tokio-tungstenite.workspace = true
+# Mieru XChaCha20-Poly1305：现有传递依赖，MIT / Apache-2.0，不新增算法库。
+chacha20poly1305 = "0.10"
+# Mieru 每个数据报的随机数（nonce / 填充）：线程本地 CSPRNG，避免每包一次 getentropy。
+# 已是传递依赖（vendored shadowsocks 用同一版本与默认特性），不增加体积；MIT / Apache-2.0。
+rand = { version = "0.9", features = ["small_rng"] }
+yamux = "0.13"
+tokio-util = { version = "0.7", features = ["compat"] }
+h2.workspace = true
+http.workspace = true
+futures-util.workspace = true
+oryn-transport.workspace = true
+ring.workspace = true
+bytes.workspace = true
+oryn-tls.workspace = true
+oryn-router.workspace = true
+oryn-config.workspace = true
+oryn-protocol.workspace = true
+async-trait.workspace = true
+log.workspace = true
+# UDP 发送瞬时错误的 errno 判定（ENOBUFS 等）；已是工作区依赖，不增加体积。
+libc.workspace = true
+tokio = { workspace = true, features = ["net", "time", "io-util", "sync", "macros"] }
+h3 = { workspace = true, optional = true }
+h3-quinn = { workspace = true, optional = true }
+oryn-quic = { workspace = true, optional = true }
+quinn = { workspace = true, optional = true }
+oryn-wireguard = { workspace = true }
+oryn-udp.workspace = true
+# ShadowsocksR：已在依赖树里（shadowsocks-rust 与 VMess 用到），这里直接使用，不新增依赖
+shadowsocks-crypto = { version = "0.6", default-features = false, features = ["v1-stream", "v1-aead", "ring"] }
+hmac = "0.12"
+sha1 = "0.10"
+md-5 = "0.10"
+aes = "0.8"
+crc32fast = "1"
+base64.workspace = true
+# Snell：密钥派生是 Argon2id（RustCrypto，MIT / Apache-2.0，纯 Rust；依赖的 blake2 已在树里），
+# v6 的流量画像用 BLAKE2b-256
+argon2 = { version = "0.5", default-features = false }
+blake2.workspace = true
+# SSH 出站：russh（Apache-2.0），只开 ring 后端与 RSA，不引入 aws-lc / C 代码与 zlib
+russh = { version = "0.63", default-features = false, features = ["ring", "rsa"] }
+# Hysteria2 Realm 的会合服务器请求 / 响应是 JSON；oryn-core 已依赖它，不增加体积
+serde_json.workspace = true
+
+serde.workspace = true
+crypto_box = "0.9"
+url = "2"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+ts_control_noise = { path = "../../vendor/tailscale-rs/ts_control_noise" }
+ts_keys = { path = "../../vendor/tailscale-rs/ts_keys", features = ["serde"] }
+ts_capabilityversion = { path = "../../vendor/tailscale-rs/ts_capabilityversion" }
+
+[features]
+# 全部协议默认编入（含 Extension 发布构建）；--no-default-features 为开发用精简版
+default = ["hysteria2", "tuic", "wireguard", "quic"]
+quic = ["dep:oryn-quic", "dep:quinn", "oryn-config/quic"]
+hysteria2 = ["quic", "dep:h3", "dep:h3-quinn", "oryn-config/hysteria2"]
+tuic = ["quic", "oryn-config/tuic"]
+wireguard = [ "oryn-config/wireguard"]
+
+[dev-dependencies]
+x25519-dalek.workspace = true
+serde_json.workspace = true
+base64.workspace = true
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+rcgen.workspace = true
+tokio-rustls.workspace = true
+rustls.workspace = true
+tokio = { workspace = true, features = ["net", "time", "io-util", "rt", "rt-multi-thread", "macros"] }

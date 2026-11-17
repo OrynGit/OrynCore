@@ -1,0 +1,95 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+exclude = ["vendor/tailscale-rs"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "GPL-3.0-or-later"
+publish = false
+
+[workspace.dependencies]
+oryn-config = { path = "crates/oryn-config", default-features = false }
+oryn-router = { path = "crates/oryn-router" }
+oryn-protocol = { path = "crates/oryn-protocol" }
+oryn-outbound = { path = "crates/oryn-outbound", default-features = false }
+oryn-dns = { path = "crates/oryn-dns" }
+oryn-netstack = { path = "crates/oryn-netstack" }
+oryn-core = { path = "crates/oryn-core", default-features = false }
+oryn-transport = { path = "crates/oryn-transport" }
+oryn-tls = { path = "crates/oryn-tls" }
+oryn-http = { path = "crates/oryn-http" }
+oryn-sniff = { path = "crates/oryn-sniff" }
+oryn-quic = { path = "crates/oryn-quic" }
+oryn-wireguard = { path = "crates/oryn-wireguard" }
+oryn-udp = { path = "crates/oryn-udp" }
+oryn-module = { path = "crates/oryn-module" }
+oryn-mitm = { path = "crates/oryn-mitm" }
+oryn-jq = { path = "crates/oryn-jq" }
+oryn-script = { path = "crates/oryn-script" }
+oryn-http-inspect = { path = "crates/oryn-http-inspect" }
+
+async-trait = "0.1"
+libc = "0.2"
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", default-features = false }
+yaml-rust2 = { version = "0.13", default-features = false }
+regex = { version = "1", default-features = false, features = ["std", "perf", "unicode-case", "unicode-perl"] }
+# 与 regex 同一份 regex-automata；直接用 meta 引擎以关闭 onepass DFA（见 oryn-module 的 compile_regex）
+regex-automata = { version = "0.4", default-features = false, features = ["std", "syntax", "perf", "unicode-case", "unicode-perl", "meta", "nfa-pikevm", "nfa-backtrack", "hybrid"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "aws-lc-rs", "prefer-post-quantum", "std", "tls12", "logging", "brotli", "zlib"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls-platform-verifier = "0.7"
+quinn = { version = "0.11", default-features = false, features = ["rustls-ring", "runtime-tokio", "log"] }
+h2 = "0.4"
+http = "1"
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+bytes = "1"
+ring = "0.17"
+zeroize = "1"
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets", "zeroize"] }
+sha2 = { version = "0.10", default-features = false }
+base64 = "0.22"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
+shadowsocks = { version = "=1.23.2", default-features = false, features = ["aead-cipher", "aead-cipher-2022", "aead-cipher-extra", "stream-cipher"] }
+maxminddb = { version = "0.32", features = ["mmap"] }
+# Extension 的 Rust 全局分配器（见 oryn-core/src/alloc.rs）；v2 为稳定版本线
+mimalloc = { version = "0.1.52", default-features = false, features = ["v2"] }
+libmimalloc-sys = { version = "0.1.49", default-features = false, features = ["v2", "extended"] }
+rcgen = { version = "0.14", features = ["x509-parser"] }
+blake2 = "0.10"
+blake3 = "1.8"
+ml-kem = { version = "0.3.2", features = ["zeroize"] }
+digest = "0.10"
+quinn-proto = { version = "0.11", default-features = false }
+boringtun = { version = "0.7.1", default-features = false }
+smoltcp = { version = "0.11", default-features = false }
+jaq-core = { version = "3.1.1", default-features = false, features = ["std"] }
+jaq-json = { version = "2.0.3", default-features = false, features = ["std", "serde"] }
+jaq-std = { version = "3.0.3", default-features = false, features = ["std", "format", "log", "math", "regex", "time"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+debug = false
+
+# 构建脚本与过程宏（只在构建机运行）不 strip：Xcode 2026-11 的工具链 strip 后部分过程宏 dylib
+# 被 dyld 拒绝加载（mis-aligned LINKEDIT string pool），表现为 `can't find crate for xxx_derive`。
+# 不影响交付的静态库，见 Oryn_dev/docs/oryncore/development.md「排错」。
+[profile.release.build-override]
+strip = "none"
+
+[patch.crates-io]
+jaq-core = { path = "vendor/jaq-core" }
+jaq-json = { path = "vendor/jaq-json" }
+blake3 = { path = "vendor/blake3" }
+shadowsocks = { path = "vendor/shadowsocks" }
+shadowsocks-crypto = { path = "vendor/shadowsocks-crypto" }
+tungstenite = { path = "vendor/tungstenite" }
+rustls = { path = "vendor/rustls" }

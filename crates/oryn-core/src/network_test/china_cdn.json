@@ -1,0 +1,27 @@
+[
+  {
+    "name": "realme OTA",
+    "url": "https://gauss-componentotacostmanual-cn.allawnfs.com/remove-3b1e78aa01ec7d57d31851c7938b305e/component-ota/24/10/22/ca8caed4166e43a8b65ffe2c6f15b173.zip",
+    "user_agent": "Dalvik/2.1.0 (Linux; U; Android 13)"
+  },
+  {
+    "name": "China Mobile Cloud",
+    "url": "https://yun.mcloud.139.com/mCloudPc/v832/mCloud_Setup-001.exe",
+    "user_agent": null
+  },
+  {
+    "name": "Huawei",
+    "url": "https://consumer.huawei.com/content/dam/huawei-cbg-site/cn/mkt/harmonyos-3/video/privacy/privacy-safe-center.webm",
+    "user_agent": null
+  },
+  {
+    "name": "Huawei WeLink",
+    "url": "https://static.hc-cdn.com/installpkg/WeLink_setup.exe",
+    "user_agent": null
+  },
+  {
+    "name": "Migu Video",
+    "url": "https://img.aikan.miguvideo.com/publish/noms/2024/04/22/1O5MNLF3AN2JL.gif",
+    "user_agent": null
+  }
+]

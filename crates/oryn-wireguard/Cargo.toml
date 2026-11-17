@@ -1,0 +1,19 @@
+[package]
+name = "oryn-wireguard"
+description = "单对端 WireGuard 出站内部的 Noise 与用户态 TCP/IP"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+boringtun = { workspace = true }
+smoltcp = { workspace = true, features = ["std", "alloc", "proto-ipv4", "proto-ipv6", "medium-ip", "socket-tcp", "socket-udp", "assembler-max-segment-count-32"] }
+log.workspace = true
+oryn-config.workspace = true
+oryn-udp.workspace = true
+tokio = { workspace = true, features = ["net", "time", "sync", "macros", "io-util", "rt"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "io-util"] }
+x25519-dalek.workspace = true

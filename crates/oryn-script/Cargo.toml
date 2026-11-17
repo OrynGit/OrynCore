@@ -1,0 +1,21 @@
+[package]
+name = "oryn-script"
+description = "受限的 Surge/Loon JavaScript 脚本运行器"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+[dependencies]
+# rust-alloc：QuickJS 的堆走 Rust 全局分配器（Extension 中为 mimalloc，见 oryn-core/src/alloc.rs），
+# 不再经系统 malloc 留下不归还的脏页
+rquickjs = { version = "0.14", features = ["rust-alloc"] }
+serde_json.workspace = true
+base64.workspace = true
+sha2.workspace = true
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+
+# iOS / Android 没有上游预生成绑定；交叉构建启用官方 bindgen（构建期工具，不进入客户端）。
+[target.'cfg(any(target_os = "ios", target_os = "android"))'.dependencies]
+rquickjs = { version = "0.14", features = ["bindgen", "rust-alloc"] }
+
+

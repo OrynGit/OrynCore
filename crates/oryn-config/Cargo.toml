@@ -1,0 +1,22 @@
+[package]
+name = "oryn-config"
+description = "OrynConfig 解析、校验与编译"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+# 全部协议默认编入（含 Extension 发布构建）；--no-default-features 为开发用精简版
+default = ["hysteria2", "tuic", "wireguard", "quic"]
+quic = []
+hysteria2 = ["quic"]
+tuic = ["quic"]
+wireguard = []
+
+[dependencies]
+base64.workspace = true
+serde_json.workspace = true
+yaml-rust2.workspace = true
+regex.workspace = true
+oryn-module.workspace = true

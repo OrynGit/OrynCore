@@ -1,0 +1,16 @@
+[package]
+name = "oryn-sniff"
+description = "域名嗅探：TLS SNI、HTTP Host、QUIC Initial"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+ring.workspace = true
+
+[dev-dependencies]
+oryn-tls.workspace = true
+rustls.workspace = true
+quinn.workspace = true
+tokio = { workspace = true, features = ["net", "rt", "macros"] }

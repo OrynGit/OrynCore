@@ -1,0 +1,29 @@
+[package]
+name = "oryn-tls"
+description = "TLS / QUIC 客户端配置（rustls + ring，系统证书校验）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# JLS 使用 32 字节 GCM nonce；ring 仅提供 12 字节 nonce，复用已有 RustCrypto 算法库。
+aes-gcm = "0.10"
+zeroize.workspace = true
+oryn-config.workspace = true
+x25519-dalek.workspace = true
+ring.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+rustls-platform-verifier.workspace = true
+quinn.workspace = true
+log.workspace = true
+tokio = { workspace = true, features = ["net", "io-util"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+webpki-root-certs = "1"
+
+[dev-dependencies]
+serde_json.workspace = true
+rcgen.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "net", "sync"] }

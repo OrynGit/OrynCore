@@ -1,0 +1,25 @@
+# 由 build.rs 调用，生成 include/oryn_core.h
+language = "C"
+header = """/*
+ * OrynCore C ABI
+ *
+ * 本文件由 cbindgen 根据 crates/oryn-ffi/src/lib.rs 生成，不要手动修改。
+ *
+ * 约定：
+ * - 只暴露不透明指针、字节、长度与状态码，不暴露任何 Rust 类型。
+ * - 返回的 char* 必须用 oryn_string_free 释放。
+ */"""
+include_guard = "ORYN_CORE_H"
+cpp_compat = true
+no_includes = true
+sys_includes = ["stddef.h", "stdint.h"]
+usize_is_size_t = true
+documentation = true
+documentation_style = "c99"
+style = "both"
+
+[parse]
+parse_deps = false
+
+[fn]
+args = "Vertical"

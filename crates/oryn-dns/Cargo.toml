@@ -1,0 +1,31 @@
+[package]
+name = "oryn-dns"
+description = "Oryn DNS Engine：缓存、域名映射、经 Router 选择上游"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+oryn-udp.workspace = true
+oryn-tls.workspace = true
+regex.workspace = true
+oryn-http.workspace = true
+quinn.workspace = true
+h2.workspace = true
+http.workspace = true
+h3.workspace = true
+h3-quinn.workspace = true
+bytes.workspace = true
+rustls.workspace = true
+oryn-config.workspace = true
+oryn-router.workspace = true
+oryn-outbound.workspace = true
+async-trait.workspace = true
+log.workspace = true
+tokio = { workspace = true, features = ["net", "time", "io-util", "sync"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["net", "time", "io-util", "rt", "macros"] }
+rcgen.workspace = true
+tokio-rustls.workspace = true
