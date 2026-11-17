@@ -1394,5 +1394,22 @@ other = type=http-request, pattern=^http://ad\\.test/x, ability=dns, script-path
         let Action::Mock { headers, body, .. } = &plan.request[0].actions[0] else { panic!("expected map local") };
         assert_eq!(headers, &[("Content-Type".into(), "application/json".into())]);
         assert_eq!(body, b"{}");
+        let mut message = Message {
+            url: "http://ad.test/".into(),
+            method: "GET".into(),
+            status: None,
+            headers: vec![],
+            body: vec![],
+        };
+        let mock = plan.apply_request(&mut message).unwrap().unwrap();
+        let types: Vec<_> = mock
+            .headers
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+            .map(|(_, v)| v.as_str())
+            .collect();
+        assert_eq!(types, ["application/json"]);
+        assert_eq!(mock.body, b"{}");
+        assert_eq!(mock.header("Content-Length"), Some("2"));
     }
 }

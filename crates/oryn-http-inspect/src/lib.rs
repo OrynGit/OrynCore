@@ -915,13 +915,21 @@ fn perform(
             content_type,
             headers,
         } => {
+            // 模块写明的头覆盖 data-type 推出的默认类型，避免 text/plain 和
+            // application/json 同时出现、客户端只认第一个。
             if let Some(s) = status {
                 let mut r = m.response(*s, body.clone(), content_type);
-                r.headers.extend(headers.clone());
+                for (k, v) in headers {
+                    r.set_header(k, v.clone());
+                }
+                r.set_header("Content-Length", body.len().to_string());
                 return Ok(Some(r));
             }
             m.body = body.clone();
             m.set_header("Content-Type", content_type.clone());
+            for (k, v) in headers {
+                m.set_header(k, v.clone());
+            }
             m.delete_header("Content-Encoding");
             m.length()
         }

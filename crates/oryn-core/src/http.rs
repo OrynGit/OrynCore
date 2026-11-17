@@ -1307,4 +1307,115 @@ response if ${url} ~= /fixture/ && ${response.header['X-State']} == "new" then s
             })
             .await;
     }
+
+    /// 请求脚本点名的出口必须真正拨出去，策略头不能出现在上游请求里。
+    #[tokio::test(flavor = "current_thread")]
+    async fn script_policy_dials_the_named_outbound() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let addr = listener.local_addr().unwrap();
+                    let policy_hits = Arc::new(AtomicUsize::new(0));
+                    let direct_hits = Arc::new(AtomicUsize::new(0));
+                    tokio::task::spawn_local(async move {
+                        let (mut sock, _) = listener.accept().await.unwrap();
+                        let mut buf = [0u8; 2048];
+                        let n = sock.read(&mut buf).await.unwrap();
+                        let text = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
+                        assert!(!text.contains("x-surge-policy"), "{text}");
+                        assert!(text.starts_with("get /play "), "{text}");
+                        let _ = sock
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                            .await;
+                    });
+                    struct Marked {
+                        tag: &'static str,
+                        addr: Option<std::net::SocketAddr>,
+                        hits: Arc<AtomicUsize>,
+                    }
+                    #[async_trait::async_trait]
+                    impl Outbound for Marked {
+                        fn tag(&self) -> &str {
+                            self.tag
+                        }
+                        fn kind(&self) -> &'static str {
+                            "test"
+                        }
+                        async fn connect_tcp(&self, _: &TargetAddr) -> io::Result<oryn_outbound::BoxStream> {
+                            self.hits.fetch_add(1, SeqCst);
+                            let Some(addr) = self.addr else {
+                                return Err(io::Error::other("original outbound was dialed"));
+                            };
+                            Ok(Box::new(tokio::net::TcpStream::connect(addr).await?))
+                        }
+                        async fn bind_udp(&self, _: &TargetAddr) -> io::Result<Box<dyn oryn_outbound::PacketConn>> {
+                            Err(io::Error::other("no udp"))
+                        }
+                    }
+                    let config = oryn_config::parse_config("rules: ['MATCH,DIRECT']").unwrap();
+                    let sets = Arc::new(oryn_router::RuleSetStore::new(&[]));
+                    let router = oryn_router::Router::new(&config, sets.clone(), Arc::new(oryn_router::GeoIp::default()));
+                    let dns = Arc::new(oryn_dns::DnsEngine::new(config.dns.clone(), vec![], sets));
+                    let routing = Arc::new(oryn_dns::Routing {
+                        router,
+                        outbounds: vec![
+                            Arc::new(Marked { tag: "DIRECT", addr: None, hits: direct_hits.clone() }) as Arc<dyn Outbound>,
+                            Arc::new(Marked { tag: "HK", addr: Some(addr), hits: policy_hits.clone() }),
+                        ],
+                    });
+                    let scripts = Arc::new(crate::scripts::ScriptHost::new(None));
+                    scripts.set_network(routing, dns);
+                    let ir = oryn_module::parse(
+                        "[Script]\npick = type=http-request, pattern=^http://example\\.test/, ability=http-client-policy, script-path=p.js\n",
+                        Some(oryn_module::ModuleFormat::Surge),
+                    )
+                    .unwrap();
+                    let mut resources = oryn_module::Resources::new();
+                    resources.insert(
+                        "p.js".into(),
+                        std::sync::Arc::<[u8]>::from(
+                            &b"$done({policy:'HK', headers:{Host:'example.test','X-Surge-Policy':'HK'}});"[..],
+                        ),
+                    );
+                    let plan = oryn_http_inspect::compile_module(&ir, &Default::default(), &resources).unwrap();
+                    assert!(plan.warnings.iter().all(|w| !w.contains("skipped")), "{:?}", plan.warnings);
+                    let inspector = Inspector {
+                        scripts,
+                        plan: Rc::new(plan),
+                        outbound: Arc::new(Marked { tag: "DIRECT", addr: None, hits: direct_hits.clone() }),
+                        origin: "http://example.test".into(),
+                        skip_verify: false,
+                        transactions: Some(Arc::new(Semaphore::new(4))),
+                        upstream_establish: Arc::new(Semaphore::new(4)),
+                        bodies: Arc::new(Semaphore::new(2)),
+                    };
+                    let (mut client, server) = tokio::io::duplex(8192);
+                    let serve = tokio::task::spawn_local(async move {
+                        let result = inspector.serve(server, false).await;
+                        result
+                    });
+                    client
+                        .write_all(b"GET /play HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n")
+                        .await
+                        .unwrap();
+                    let mut response = vec![0u8; 512];
+                    let n = tokio::time::timeout(Duration::from_secs(3), client.read(&mut response))
+                        .await
+                        .expect("no HTTP response")
+                        .unwrap();
+                    let text = String::from_utf8_lossy(&response[..n]);
+                    assert!(text.contains("200"), "{text}");
+                    assert!(text.contains("ok"), "{text}");
+                    assert_eq!(policy_hits.load(SeqCst), 1, "named outbound was not dialed");
+                    assert_eq!(direct_hits.load(SeqCst), 0, "original outbound was dialed");
+                    drop(client);
+                    let _ = serve.await;
+                })
+                .await
+                .unwrap();
+            })
+            .await;
+    }
 }
