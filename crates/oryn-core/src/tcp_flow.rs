@@ -172,15 +172,13 @@ async fn handle(ctx: Rc<EngineCtx>, mut stream: LwipTcpStream, phase: &crate::ad
         .as_deref()
         .is_some_and(|h| state.config.mitm.matches(h, destination.port()));
     let list_match = |items: &[String]| {
-        flow.domain.as_ref().is_some_and(|h| {
-            items.iter().any(|s| {
-                let (host, port) = s
-                    .rsplit_once(':')
-                    .and_then(|(h, p)| p.parse::<u16>().ok().map(|p| (h, p)))
-                    .unwrap_or((s.as_str(), destination.port()));
-                destination.port() == port
-                    && oryn_config::DomainPattern::parse(host).is_some_and(|p| p.matches(h))
-            })
+        items.iter().any(|s| {
+            oryn_config::listed_host_matches(
+                s,
+                flow.domain.as_deref(),
+                destination.port(),
+                oryn_config::ListedPort::Connection,
+            )
         })
     };
     let raw = list_match(&state.config.raw_tcp_hosts);

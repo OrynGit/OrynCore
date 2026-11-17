@@ -109,6 +109,78 @@ pub fn glob_match(pattern: &str, text: &str) -> bool {
     pi == p.len()
 }
 
+/// 主机列表项没写端口时怎么解释。
+#[derive(Clone, Copy)]
+pub enum ListedPort {
+    /// 与当前连接的端口比较（`force-http-engine-hosts` / `always-raw-tcp-hosts`）。
+    Connection,
+    /// 固定端口，MITM 未写端口时是 443。
+    Fixed(u16),
+}
+
+/// Surge 主机名：整段 `*` 匹配任意主机；`*` / `?` 出现在标签内部时只通配这一级，不跨过点。
+/// 其余写法交给 [`DomainPattern`]（`*.a.com` 仍只匹配一级）。
+pub fn hostname_matches(pattern: &str, host: &str) -> bool {
+    let pattern = normalize_domain(pattern);
+    let host = normalize_domain(host);
+    if pattern.is_empty() || host.is_empty() {
+        return false;
+    }
+    if pattern == "*" {
+        return true;
+    }
+    let infix = pattern
+        .split('.')
+        .any(|label| label != "*" && (label.contains('*') || label.contains('?')));
+    if !infix {
+        return DomainPattern::parse(&pattern).is_some_and(|p| p.matches(&host));
+    }
+    let labels: Vec<&str> = pattern.split('.').collect();
+    let parts: Vec<&str> = host.split('.').collect();
+    parts.len() == labels.len()
+        && parts.iter().zip(&labels).all(|(part, label)| {
+            if label.contains('*') || label.contains('?') {
+                glob_match(label, part)
+            } else {
+                *part == *label
+            }
+        })
+}
+
+/// `host`、`host:port`、`*`、`*:port` 是否盖住这次连接。
+/// 模式为 `*` 时，没有域名的连接（按 IP 直连）也命中。
+pub fn listed_host_matches(
+    item: &str,
+    domain: Option<&str>,
+    port: u16,
+    missing: ListedPort,
+) -> bool {
+    let item = item.trim();
+    if item.is_empty() {
+        return false;
+    }
+    let fallback = match missing {
+        ListedPort::Connection => port,
+        ListedPort::Fixed(fixed) => fixed,
+    };
+    let (pattern, wanted) = match item.rsplit_once(':').and_then(|(host, raw)| {
+        raw.parse::<u16>()
+            .ok()
+            .filter(|_| !host.is_empty())
+            .map(|parsed| (host, parsed))
+    }) {
+        Some(split) => split,
+        None => (item, fallback),
+    };
+    if port != wanted {
+        return false;
+    }
+    if pattern == "*" {
+        return true;
+    }
+    domain.is_some_and(|host| hostname_matches(pattern, host))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,5 +233,70 @@ mod tests {
         assert!(glob_match("a?c", "abc") && !glob_match("a?c", "ac"));
         assert!(glob_match("*", "") && glob_match("aa:bb:*", "AA:BB:CC:DD"));
         assert!(!glob_match("nr", "LTE"));
+    }
+
+    #[test]
+    fn surge_hostname_lists() {
+        assert!(hostname_matches("*", "a.b.com"));
+        assert!(hostname_matches(
+            "*.mcdn.bilivideo.cn",
+            "xy.mcdn.bilivideo.cn"
+        ));
+        assert!(!hostname_matches(
+            "*.mcdn.bilivideo.cn",
+            "a.xy.mcdn.bilivideo.cn"
+        ));
+        assert!(hostname_matches(
+            "upos-sz-mirror*bstar1.bilivideo.com",
+            "upos-sz-mirrorcosbstar1.bilivideo.com"
+        ));
+        assert!(hostname_matches(
+            "upos-*-mirrorakam.akamaized.net",
+            "upos-hz-mirrorakam.akamaized.net"
+        ));
+        assert!(!hostname_matches(
+            "upos-*-mirrorakam.akamaized.net",
+            "upos-hz-mirrorakam.akamaized.net.extra"
+        ));
+        // 整段 * 才忽略域名；mihomo 的单标签 * 仍只匹配一级。
+        assert!(DomainPattern::parse("*").unwrap().matches("localhost"));
+        assert!(!DomainPattern::parse("*").unwrap().matches("a.b.com"));
+
+        assert!(listed_host_matches(
+            "*:4480",
+            None,
+            4480,
+            ListedPort::Connection
+        ));
+        assert!(listed_host_matches(
+            "*:4480",
+            Some("a.mcdn.bilivideo.cn"),
+            4480,
+            ListedPort::Connection
+        ));
+        assert!(!listed_host_matches(
+            "*:4480",
+            Some("a.mcdn.bilivideo.cn"),
+            443,
+            ListedPort::Connection
+        ));
+        assert!(listed_host_matches(
+            "*.mcdn.bilivideo.cn",
+            Some("a.mcdn.bilivideo.cn"),
+            8000,
+            ListedPort::Connection
+        ));
+        assert!(!listed_host_matches(
+            "*.mcdn.bilivideo.cn",
+            Some("a.mcdn.bilivideo.cn"),
+            8000,
+            ListedPort::Fixed(443)
+        ));
+        assert!(listed_host_matches(
+            "upos-*-mirrorakam.akamaized.net",
+            Some("upos-bstar1-mirrorakam.akamaized.net"),
+            443,
+            ListedPort::Fixed(443)
+        ));
     }
 }

@@ -193,17 +193,25 @@ impl Inspector {
             .cloned()
             .collect::<Vec<_>>();
         // 依次执行，后一个脚本看到前一个的结果；某个脚本给出本地响应时后面的不再执行。
+        // 后写出的出口覆盖前面的。
+        let mut script_policy = None;
         for spec in &scripts {
             match self
                 .scripts
                 .execute(spec, &message, None, self.outbound.clone())
                 .await
             {
-                Ok(Some(updated)) if updated.status.is_some() => {
-                    return self.local_response(updated, _transaction, permit)
+                Ok(done) if done.message.as_ref().is_some_and(|m| m.status.is_some()) => {
+                    return self.local_response(done.message.unwrap(), _transaction, permit)
                 }
-                Ok(Some(updated)) => message = updated,
-                Ok(None) => {}
+                Ok(done) => {
+                    if let Some(updated) = done.message {
+                        message = updated;
+                    }
+                    if done.policy.is_some() {
+                        script_policy = done.policy;
+                    }
+                }
                 Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => return Err(e),
                 Err(e) => log::warn!("HTTP request script {} skipped: {e}", spec.name),
             }
@@ -218,7 +226,18 @@ impl Inspector {
         let host = target.host().ok_or_else(|| err("HTTP URL missing host"))?;
         let https = target.scheme_str() == Some("https");
         let port = target.port_u16().unwrap_or(if https { 443 } else { 80 });
-        // 仍使用父 Flow 的出站决策；跨主机重写不会再匹配 Router。
+        // 跨主机重写不再匹配 Router。请求脚本点名的策略组或节点只影响这一次上游连接。
+        let outbound = if let Some(name) = script_policy.as_deref() {
+            match self.scripts.policy_outbound(name, host, port) {
+                Ok(outbound) => outbound,
+                Err(e) => {
+                    log::warn!("HTTP request script policy {name}: {e}");
+                    return Err(e);
+                }
+            }
+        } else {
+            Arc::clone(&self.outbound)
+        };
         // 独立于入口预算，避免出站 DNS 再入时争抢入口额度；满载不排队。
         let establish = tokio::time::timeout(
             crate::admission::patience(20),
@@ -230,7 +249,7 @@ impl Inspector {
         .ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "HTTP upstream establish limit"))?;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         let timed_out = |_| io::Error::new(io::ErrorKind::TimedOut, "HTTP upstream establish timeout");
-        let tcp = tokio::time::timeout_at(deadline, self.outbound
+        let tcp = tokio::time::timeout_at(deadline, outbound
             .connect_tcp(&TargetAddr::from_host(host, port)))
             .await.map_err(timed_out)??;
         let (stream, h2): (oryn_outbound::BoxStream, bool) = if https {

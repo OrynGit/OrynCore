@@ -9,6 +9,12 @@ use std::{
     time::Duration,
 };
 use tokio::sync::Semaphore;
+/// 一次脚本执行的结果。请求脚本可以带出口名；内部策略头已经从消息里去掉。
+pub struct ScriptDone {
+    pub message: Option<Message>,
+    pub policy: Option<String>,
+}
+
 pub struct ScriptHost {
     generation: Arc<std::sync::atomic::AtomicU64>,
     network: std::sync::RwLock<Option<(Arc<oryn_dns::Routing>, Arc<oryn_dns::DnsEngine>)>>,
@@ -70,7 +76,7 @@ impl ScriptHost {
         request: &Message,
         response: Option<&mut Message>,
         outbound: Arc<dyn Outbound>,
-    ) -> io::Result<Option<Message>> {
+    ) -> io::Result<ScriptDone> {
         if spec.requires_body && response.as_deref().unwrap_or(request).body.len() > spec.max_size {
             return Err(io::Error::other("script max-size exceeded"));
         }
@@ -333,13 +339,46 @@ impl ScriptHost {
             m.delete_header("Transfer-Encoding");
             m.set_header("Content-Length", m.body.len().to_string());
         }
+        let policy = if response.is_none() && !local {
+            take_script_policy(&result, &mut m)
+        } else {
+            strip_policy_headers(&mut m);
+            None
+        };
         if let Some(response) = response {
             *response = m;
-            Ok(None)
+            Ok(ScriptDone { message: None, policy: None })
         } else {
-            Ok(Some(m))
+            Ok(ScriptDone { message: Some(m), policy })
         }
     }
+
+    /// 按策略组或节点名选出这条请求的叶子出站。名称必须与 `tag` 完全一致。
+    pub fn policy_outbound(&self, policy: &str, host: &str, port: u16) -> io::Result<Arc<dyn Outbound>> {
+        let guard = self.network.read().unwrap();
+        let routing = guard.as_ref().map(|(routing, _)| routing).ok_or_else(|| io::Error::other("script policy routing is unavailable"))?;
+        let index = routing.outbounds.iter().position(|outbound| outbound.tag() == policy).ok_or_else(|| io::Error::other(format!("unknown script policy {policy}")))?;
+        let target = oryn_config::TargetAddr::from_host(host, port);
+        oryn_outbound::resolve(&routing.outbounds[index], &oryn_outbound::PickMeta { source: None, target: &target, network: oryn_router::Network::Tcp })
+            .map(|resolved| resolved.leaf)
+            .ok_or_else(|| io::Error::other(format!("script policy {policy} rejected the connection")))
+    }
+}
+
+const POLICY_HEADERS: &[&str] = &["X-Surge-Policy", "X-Surge-Proxy", "X-Stash-Selected-Proxy"];
+
+fn strip_policy_headers(message: &mut Message) {
+    for name in POLICY_HEADERS {
+        message.delete_header(name);
+    }
+}
+
+/// 请求脚本用 `policy` / `node`，或 Surge / Stash / Shadowrocket 的策略头指定出口。
+fn take_script_policy(result: &Value, message: &mut Message) -> Option<String> {
+    let named = result.get("policy").and_then(|v| v.as_str()).or_else(|| result.get("node").and_then(|v| v.as_str())).map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned);
+    let header = POLICY_HEADERS.iter().find_map(|name| message.header(name).map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned));
+    strip_policy_headers(message);
+    named.or(header)
 }
 
 /// 网络/定时/手动脚本共用同一 worker 配额，满载时跳过本次触发，不积累待执行队列。
@@ -474,5 +513,33 @@ fn control(
             Ok(json!({"ok":true}))
         }
         _ => Err(format!("unknown script control {name}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_policy_comes_from_field_or_header_and_is_not_forwarded() {
+        let mut message = Message {
+            url: "http://api.bilibili.com/x".into(),
+            method: "GET".into(),
+            status: None,
+            headers: vec![
+                ("Host".into(), "api.bilibili.com".into()),
+                ("X-Surge-Policy".into(), "🇭🇰香港".into()),
+            ],
+            body: vec![],
+        };
+        let from_field = json!({"policy": "DIRECT", "headers": {"X-Surge-Policy": "🇭🇰香港"}});
+        assert_eq!(take_script_policy(&from_field, &mut message).as_deref(), Some("DIRECT"));
+        assert!(message.header("X-Surge-Policy").is_none());
+        assert_eq!(message.header("Host"), Some("api.bilibili.com"));
+
+        message.set_header("X-Stash-Selected-Proxy", "🇹🇼台湾".to_owned());
+        assert_eq!(take_script_policy(&json!({}), &mut message).as_deref(), Some("🇹🇼台湾"));
+        assert!(message.header("X-Stash-Selected-Proxy").is_none());
+        assert!(take_script_policy(&json!({"policy": "  "}), &mut message).is_none());
     }
 }

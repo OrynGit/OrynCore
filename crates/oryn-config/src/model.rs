@@ -1399,19 +1399,17 @@ impl MitmSpec {
         }
         let mut included = false;
         for item in &self.hostnames {
-            let (exclude, p) = item
+            let (exclude, pattern) = item
                 .strip_prefix('-')
                 .map_or((false, item.as_str()), |p| (true, p));
-            let (p, wanted_port) = p
-                .rsplit_once(':')
-                .and_then(|(h, p)| p.parse::<u16>().ok().map(|p| (h, p)))
-                .unwrap_or((p, 443));
-            if port == wanted_port && DomainPattern::parse(p).is_some_and(|p| p.matches(host)) {
-                if exclude {
-                    return false;
-                }
-                included = true;
+            if !crate::listed_host_matches(pattern, Some(host), port, crate::ListedPort::Fixed(443))
+            {
+                continue;
             }
+            if exclude {
+                return false;
+            }
+            included = true;
         }
         included
     }

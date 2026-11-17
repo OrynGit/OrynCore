@@ -662,9 +662,11 @@ fn legacy(
             .map(|s| {
                 s.split('|')
                     .map(|p| {
-                        let (k, v) = p
-                            .split_once(':')
-                            .ok_or_else(|| invalid("invalid Map Local header"))?;
+                        let (k, v) = match p.split_once(':') {
+                            Some((k, v)) => (k.trim(), v.trim()),
+                            None if !p.trim().is_empty() => ("Content-Type", p.trim()),
+                            None => return Err(invalid("invalid Map Local header")),
+                        };
                         if k.is_empty()
                             || !k.bytes().all(|b| {
                                 b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
@@ -1122,7 +1124,7 @@ fn script_rule(
                     "max-size" => {
                         matches!(&v, Expr::Literal(Value::Number(n)) if n.as_u64().is_some_and(|n| n > 0))
                     }
-                    "tag" | "img-url" | "engine" => {
+                    "tag" | "img-url" | "engine" | "ability" => {
                         matches!(&v, Expr::Template(_) | Expr::Literal(Value::String(_)))
                     }
                     _ => false,
@@ -1266,8 +1268,8 @@ fn script_rule(
             | "wake-system" => matches!(v.as_str(), "true" | "false" | "1" | "0"),
             "timeout" => v.parse::<f64>().is_ok_and(|n| n.is_finite() && n > 0.0),
             "max-size" => v.parse::<u64>().is_ok(),
-            "type" | "pattern" | "script-path" | "argument" | "tag" | "engine" | "cronexp"
-            | "event-name" | "img-url" => true,
+            "type" | "pattern" | "script-path" | "argument" | "tag" | "engine" | "ability"
+            | "cronexp" | "event-name" | "img-url" => true,
             _ => false,
         };
         if !valid {
@@ -1284,6 +1286,15 @@ fn script_rule(
     }
     if kind == "cron" && options.get("cronexp").is_some_and(|v| v.contains("${")) {
         return Err(invalid("cron requires a bound string value; unresolved variables are not supported"));
+    }
+    // `ability=http-client-policy` 声明脚本可以指定出口。运行时本来就认 `$httpClient` 的
+    // `policy`，以及请求脚本 `$done` 的 `policy` / `X-Surge-Policy`。
+    if let Some(ability) = options.get("ability") {
+        for part in ability.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            if part != "http-client-policy" {
+                warnings.push(format!("script ability {part} has no effect"));
+            }
+        }
     }
     // `engine=webview` 只是 Surge 的执行引擎偏好；脚本仍按同一 API 在隔离运行时中执行。
     if options
@@ -1357,4 +1368,31 @@ fn script_rule(
         timeout,
         dialect,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn ability_keeps_the_script_and_bare_header_is_content_type() {
+        let text = "\
+[Map Local]
+^http://ad\\.test/ data-type=text data=\"{}\" header=\"application/json\"
+[Script]
+ad = type=http-request, pattern=^http://ad\\.test/, ability=http-client-policy, script-path=a.js
+other = type=http-request, pattern=^http://ad\\.test/x, ability=dns, script-path=a.js
+";
+        let ir = oryn_module::parse(text, Some(ModuleFormat::Surge)).unwrap();
+        let mut resources = Resources::new();
+        resources.insert("a.js".into(), Arc::<[u8]>::from(&b"$done({});"[..]));
+        let plan = compile_module(&ir, &BTreeMap::new(), &resources).unwrap();
+        assert_eq!(plan.scripts.len(), 2, "{:?}", plan.warnings);
+        assert!(plan.warnings.iter().any(|w| w.contains("ability dns")), "{:?}", plan.warnings);
+        assert!(plan.warnings.iter().all(|w| !w.contains("skipped")), "{:?}", plan.warnings);
+        let Action::Mock { headers, body, .. } = &plan.request[0].actions[0] else { panic!("expected map local") };
+        assert_eq!(headers, &[("Content-Type".into(), "application/json".into())]);
+        assert_eq!(body, b"{}");
+    }
 }
