@@ -19,8 +19,11 @@ use russh::keys::{PrivateKey, PrivateKeyWithHashAlg, PublicKey, PublicKeyOrCerti
 use crate::{BoxStream, Dialer, Outbound, PacketConn};
 
 /// 每个通道的接收窗口：并发通道数 × 窗口决定最坏情况的内存占用。
-const CHANNEL_WINDOW: u32 = 512 * 1024;
-const CHANNEL_BUFFER: usize = 32;
+/// 512 KiB 时单流吞吐明显受限（arm64 实测 2 MiB 提升约 85%），故取 2 MiB；
+/// 32 通道 × 2 MiB ≈ 64 MiB 最坏情况，仍受出站级信号量约束。
+const CHANNEL_WINDOW: u32 = 2 * 1024 * 1024;
+/// 通道消息缓冲：32 时多流易反压抖动，100（russh 默认）实测更稳。
+const CHANNEL_BUFFER: usize = 100;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// 未配置 `host-key` 时的 TOFU 记录文件（数据目录下，每行 `host:port 算法 base64`）。
@@ -164,6 +167,17 @@ impl SshOutbound {
             keepalive_interval: Some(Duration::from_secs(30)),
             ..Default::default()
         };
+        // 客户端顺序决定协商结果。默认顺序把 chacha20-poly1305 排在第一，且完全不含
+        // aes128-gcm；在带 AES 加速的 ARM/x86 上 AES-GCM 明显更快，故优先 AES-GCM，
+        // 再退回 chacha20 与本版本默认的 CTR 系列。
+        config.preferred.cipher = std::borrow::Cow::Owned(vec![
+            russh::cipher::AES_128_GCM,
+            russh::cipher::AES_256_GCM,
+            russh::cipher::CHACHA20_POLY1305,
+            russh::cipher::AES_256_CTR,
+            russh::cipher::AES_192_CTR,
+            russh::cipher::AES_128_CTR,
+        ]);
         if !spec.host_key_algorithms.is_empty() {
             let algorithms = spec
                 .host_key_algorithms
