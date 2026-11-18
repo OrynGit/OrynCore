@@ -560,11 +560,17 @@ pub(crate) fn valid_fake_ip_range(cidr: IpCidr) -> bool {
     if !cidr.is_ipv4() || !(8..=20).contains(&cidr.prefix()) {
         return false;
     }
-    let Some((start, end)) = cidr.range_v4() else { return false };
-    ["0.0.0.0/8", "127.0.0.0/8", "169.254.0.0/16", "224.0.0.0/3"].iter().all(|r| {
-        let (rs, re) = IpCidr::parse(r).and_then(|c| c.range_v4()).expect("reserved range");
-        end < rs || start > re
-    })
+    let Some((start, end)) = cidr.range_v4() else {
+        return false;
+    };
+    ["0.0.0.0/8", "127.0.0.0/8", "169.254.0.0/16", "224.0.0.0/3"]
+        .iter()
+        .all(|r| {
+            let (rs, re) = IpCidr::parse(r)
+                .and_then(|c| c.range_v4())
+                .expect("reserved range");
+            end < rs || start > re
+        })
 }
 
 #[cfg(test)]
@@ -592,10 +598,26 @@ mod tests {
     #[test]
     fn fake_ip_range_validation() {
         let ok = |s: &str| valid_fake_ip_range(IpCidr::parse(s).unwrap());
-        for good in ["198.18.0.0/15", "198.18.0.0/20", "10.0.0.0/8", "172.20.0.0/16", "100.64.0.0/10", "28.0.0.0/8"] {
+        for good in [
+            "198.18.0.0/15",
+            "198.18.0.0/20",
+            "10.0.0.0/8",
+            "172.20.0.0/16",
+            "100.64.0.0/10",
+            "28.0.0.0/8",
+        ] {
             assert!(ok(good), "{good}");
         }
-        for bad in ["0.0.0.0/0", "8.0.0.0/7", "198.19.0.0/24", "127.0.0.0/8", "169.254.0.0/16", "224.0.0.0/8", "240.0.0.0/8", "fd00::/8"] {
+        for bad in [
+            "0.0.0.0/0",
+            "8.0.0.0/7",
+            "198.19.0.0/24",
+            "127.0.0.0/8",
+            "169.254.0.0/16",
+            "224.0.0.0/8",
+            "240.0.0.0/8",
+            "fd00::/8",
+        ] {
             assert!(!ok(bad), "{bad}");
         }
     }
@@ -651,4 +673,3 @@ mod tests {
         assert!(parse_server("https://localhost/dns-query", &b).is_err());
     }
 }
-

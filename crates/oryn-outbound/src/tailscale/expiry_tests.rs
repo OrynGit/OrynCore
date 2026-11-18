@@ -44,6 +44,7 @@ fn fixture() -> (Arc<Session>, Arc<Ready>) {
             dns: vec![],
             amnezia: None,
             refresh_secs: None,
+            tcp_buffers: Default::default(),
         },
         datagrams,
     );

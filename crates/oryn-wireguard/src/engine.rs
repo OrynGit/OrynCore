@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use boringtun::noise::{Tunn, TunnResult};
 use boringtun::x25519::{PublicKey, StaticSecret};
-use oryn_config::{IpCidr as Cidr, WireGuardPeerSpec, WireGuardSpec};
+use oryn_config::{IpCidr as Cidr, WireGuardPeerSpec, WireGuardSpec, WireGuardTcpBuffers};
 use oryn_udp::{DatagramFactory, Datagrams, UdpFactory};
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::socket::{tcp, udp};
@@ -37,11 +37,9 @@ use crate::frag::{self, Reassembler};
 
 const TCP_CAP: usize = 64;
 const UDP_CAP: usize = 16;
-/// smoltcp 每个 TCP 套接字的接收缓冲与发送缓冲。单条连接的吞吐上限是 窗口 / RTT，
-/// 本机实测见 docs/protocols/wireguard.md：接收 64 KiB 对应 40 ms RTT 约 2.2 MiB/s，8 KiB 只有 0.29 MiB/s。
-/// 下载比上传常见，所以接收窗口取得更大。缓冲按连接分配，连接关闭即释放。
-const TCP_RX_BUF: usize = 64 * 1024;
-const TCP_TX_BUF: usize = 32 * 1024;
+// smoltcp 每个 TCP 套接字的接收 / 发送缓冲由配置决定（`WireGuardSpec::tcp_buffers`，默认 64 / 32 KiB）。
+// 单条连接的吞吐上限是 窗口 / RTT，见 docs/protocols/wireguard.md「TCP 缓冲配置」。缓冲按连接分配，连接关闭即释放；
+// 全部连接的合计受预算限制，放不下全尺寸时退到最小尺寸，最小尺寸也放不下则拒绝新连接。
 const UDP_PACKETS: usize = 8;
 /// 交给用户 / 从用户取的单块上限与块数：每方向在 smoltcp 之外最多再缓冲 8 KiB。
 const CHUNK: usize = 4 * 1024;
@@ -510,6 +508,8 @@ struct Connect {
 struct TcpFlow {
     handle: SocketHandle,
     port: u16,
+    /// 这条连接 smoltcp 接收 + 发送缓冲的字节数，计入预算。
+    buffers: usize,
     /// 这条连接经由哪个对端（按目的地址选定，之后不变）。
     peer: usize,
     connect: Option<Connect>,
@@ -676,6 +676,19 @@ fn new_tunn(
         index,
         None,
     )
+}
+
+/// 新连接的（接收, 发送）缓冲：`used` 加上全尺寸不超预算就用全尺寸，否则退到最小尺寸，再放不下返回 None。
+fn tcp_buffer_sizes(cfg: &WireGuardTcpBuffers, used: usize) -> Option<(usize, usize)> {
+    let fits = |rx: usize, tx: usize| used.saturating_add(rx + tx) <= cfg.budget;
+    if fits(cfg.rx, cfg.tx) {
+        return Some((cfg.rx, cfg.tx));
+    }
+    let (rx, tx) = (
+        cfg.rx.min(WireGuardTcpBuffers::RX_MIN),
+        cfg.tx.min(WireGuardTcpBuffers::TX_MIN),
+    );
+    fits(rx, tx).then_some((rx, tx))
 }
 
 fn now_smol() -> smoltcp::time::Instant {
@@ -976,14 +989,22 @@ impl Engine {
             return Err(io::Error::other("wireguard tcp socket limit reached"));
         }
         self.family_ok(dest.ip())?;
+        let (rx, tx) = tcp_buffer_sizes(
+            &self.spec.tcp_buffers,
+            self.tcp.iter().map(|f| f.buffers).sum(),
+        )
+        .ok_or_else(|| io::Error::other("wireguard tcp buffer budget exhausted"))?;
         let tcp = &self.tcp;
         let port = next_port(&mut self.next_port, |p| tcp.iter().any(|f| f.port == p))
             .ok_or_else(|| io::Error::other("wireguard tcp ports exhausted"))?;
         let mut socket = tcp::Socket::new(
-            tcp::SocketBuffer::new(vec![0; TCP_RX_BUF]),
-            tcp::SocketBuffer::new(vec![0; TCP_TX_BUF]),
+            tcp::SocketBuffer::new(vec![0; rx]),
+            tcp::SocketBuffer::new(vec![0; tx]),
         );
         socket.set_nagle_enabled(false);
+        // smoltcp 默认延迟 ACK 10 ms：接收缓冲填满后，窗口更新也要等这 10 ms，下行吞吐因此降到原来的约 1/18
+        //（Oryn_dev/docs/oryncore/measurements/wireguard-cpu-2026-11-18.md）。每个数据段立即 ACK。
+        socket.set_ack_delay(None);
         socket
             .connect(
                 self.iface.context(),
@@ -1002,6 +1023,7 @@ impl Engine {
         let flow = TcpFlow {
             handle,
             port,
+            buffers: rx + tx,
             peer,
             connect: None,
             to_user: Some(to_user),

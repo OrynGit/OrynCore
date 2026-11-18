@@ -235,24 +235,52 @@ mod tests {
     /// 回归：首帧必须先进入持久缓冲；flush取消后续发不丢请求首部。
     #[test]
     fn first_request_survives_flush_cancellation() {
-        use std::{future::Future, pin::Pin, sync::{Arc, Mutex as StdMutex}, task::{Context, Poll, Waker}};
+        use std::{
+            future::Future,
+            pin::Pin,
+            sync::{Arc, Mutex as StdMutex},
+            task::{Context, Poll, Waker},
+        };
         use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
         #[derive(Default)]
-        struct State { pending_flush: bool, bytes: Vec<u8> }
+        struct State {
+            pending_flush: bool,
+            bytes: Vec<u8>,
+        }
         struct Stream(Arc<StdMutex<State>>);
         impl AsyncRead for Stream {
-            fn poll_read(self: Pin<&mut Self>, _: &mut Context<'_>, _: &mut ReadBuf<'_>) -> Poll<io::Result<()>> { Poll::Pending }
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                _: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Pending
+            }
         }
         impl AsyncWrite for Stream {
-            fn poll_write(self: Pin<&mut Self>, _: &mut Context<'_>, b: &[u8]) -> Poll<io::Result<usize>> {
-                self.0.lock().unwrap().bytes.extend_from_slice(b); Poll::Ready(Ok(b.len()))
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                b: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                self.0.lock().unwrap().bytes.extend_from_slice(b);
+                Poll::Ready(Ok(b.len()))
             }
             fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
-                if self.0.lock().unwrap().pending_flush { Poll::Pending } else { Poll::Ready(Ok(())) }
+                if self.0.lock().unwrap().pending_flush {
+                    Poll::Pending
+                } else {
+                    Poll::Ready(Ok(()))
+                }
             }
-            fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> { Poll::Ready(Ok(())) }
+            fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
         }
-        let state = Arc::new(StdMutex::new(State { pending_flush: true, bytes: Vec::new() }));
+        let state = Arc::new(StdMutex::new(State {
+            pending_flush: true,
+            bytes: Vec::new(),
+        }));
         let target = TargetAddr::Ip("192.0.2.1:53".parse().unwrap());
         let conn = UotConn::new(Box::new(Stream(state.clone())), 2, &target).unwrap();
         let mut cx = Context::from_waker(Waker::noop());
@@ -270,7 +298,10 @@ mod tests {
         valid.extend_from_slice(&bare);
         let actual = &state.lock().unwrap().bytes;
         assert_eq!(actual, &valid);
-        println!("uot_flush_cancel request_preserved=true two_complete_packets=true bytes={}", actual.len());
+        println!(
+            "uot_flush_cancel request_preserved=true two_complete_packets=true bytes={}",
+            actual.len()
+        );
     }
 
     #[test]

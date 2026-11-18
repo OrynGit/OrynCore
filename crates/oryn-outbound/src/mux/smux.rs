@@ -557,15 +557,23 @@ mod tests {
                 let mut fast = session.open().await.unwrap();
                 let begin = std::time::Instant::now();
                 if stalled {
-                    for _ in 0..33 { frame(&mut peer, 1, &[1; 4096]).await; }
+                    for _ in 0..33 {
+                        frame(&mut peer, 1, &[1; 4096]).await;
+                    }
                 }
                 frame(&mut peer, 3, b"fast").await;
                 let mut b = [0; 4];
-                tokio::time::timeout(Duration::from_secs(2), fast.read_exact(&mut b)).await.unwrap().unwrap();
+                tokio::time::timeout(Duration::from_secs(2), fast.read_exact(&mut b))
+                    .await
+                    .unwrap()
+                    .unwrap();
                 assert_eq!(&b, b"fast");
                 let elapsed = begin.elapsed();
                 if stalled {
-                    assert!(elapsed >= STALL_TIMEOUT, "shared read driver waited for isolation timeout");
+                    assert!(
+                        elapsed >= STALL_TIMEOUT,
+                        "shared read driver waited for isolation timeout"
+                    );
                     assert!(slow.read(&mut b).await.is_err());
                 }
                 samples.push(elapsed.as_micros());

@@ -506,7 +506,9 @@ mod tests {
         b.send_to(b"second", &TargetAddr::Ip(b_addr)).await.unwrap();
         let mut response = [0; 64];
         let (n, from) = tokio::time::timeout(Duration::from_secs(2), b.recv_from(&mut response))
-            .await.unwrap().unwrap();
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(&response[..n], b"reply-b");
         assert_eq!(from, TargetAddr::Ip(b_addr));
         let records = tokio::time::timeout(Duration::from_secs(2), peer)

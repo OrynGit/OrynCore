@@ -55,6 +55,7 @@ fn incoming_allowed_ips(v6: bool, duplicate: bool) {
         dns: vec![],
         amnezia: None,
         refresh_secs: None,
+        tcp_buffers: Default::default(),
     };
     let mut engine = Engine::new(spec, Arc::new(UdpFactory));
     let local_public = PublicKey::from(&StaticSecret::from(local_key)).to_bytes();
@@ -163,6 +164,7 @@ fn control_spec() -> WireGuardSpec {
         dns: vec!["10.0.0.1:53".parse().unwrap()],
         amnezia: None,
         refresh_secs: None,
+        tcp_buffers: Default::default(),
     }
 }
 
@@ -255,4 +257,30 @@ async fn old_flow_dns_does_not_roll_back_endpoint() {
     assert_eq!(engine.peers[0].endpoint, e2[0]);
     assert_eq!(engine.udp.len(), 2);
     drop(old_flow);
+}
+
+#[test]
+fn tcp_buffer_budget_falls_back_then_refuses() {
+    let cfg = WireGuardTcpBuffers {
+        rx: 256 * 1024,
+        tx: 128 * 1024,
+        budget: 2 * 384 * 1024 + 24 * 1024,
+    };
+    let full = 384 * 1024;
+    assert_eq!(tcp_buffer_sizes(&cfg, 0), Some((256 * 1024, 128 * 1024)));
+    assert_eq!(tcp_buffer_sizes(&cfg, full), Some((256 * 1024, 128 * 1024)));
+    // 两条全尺寸之后只剩 24 KiB：退到最小 16 + 8 KiB
+    assert_eq!(
+        tcp_buffer_sizes(&cfg, 2 * full),
+        Some((16 * 1024, 8 * 1024))
+    );
+    assert_eq!(tcp_buffer_sizes(&cfg, 2 * full + 1), None);
+    // 配置本身小于最小值时不会被放大
+    let small = WireGuardTcpBuffers {
+        rx: 16 * 1024,
+        tx: 8 * 1024,
+        budget: 24 * 1024,
+    };
+    assert_eq!(tcp_buffer_sizes(&small, 0), Some((16 * 1024, 8 * 1024)));
+    assert_eq!(tcp_buffer_sizes(&small, 1), None);
 }

@@ -46,12 +46,16 @@ pub fn parse(root: &Yaml, b: &mut Builder) -> Vec<ModuleSpec> {
             .filter(|v| *v > 0)
             .unwrap_or(86_400) as u64;
         // Egern 配置把模块参数写作 `compat_arguments`。
-        let has_arguments = matches!(item, Yaml::Hash(h) if h.contains_key(&Yaml::String("arguments".into())));
-        let arguments = map_values(item, if has_arguments {
-            "arguments"
-        } else {
-            "compat_arguments"
-        });
+        let has_arguments =
+            matches!(item, Yaml::Hash(h) if h.contains_key(&Yaml::String("arguments".into())));
+        let arguments = map_values(
+            item,
+            if has_arguments {
+                "arguments"
+            } else {
+                "compat_arguments"
+            },
+        );
         let policy_map = map_values(item, "policy-map");
         let env = map_values(item, "env").into_iter().collect();
         let inline = inline_text.and_then(|text| {
@@ -255,7 +259,9 @@ pub fn merge(config: &mut crate::RuntimeConfig) -> Result<(), crate::ConfigError
             }
             // URL-REGEX 的拒绝规则由 HTTP 检查编译为 reject 重写：它能看到每个请求（含 MITM），
             // Router 只看到明文连接的第一个请求。`policy-map` 把策略映射成拒绝时同样如此。
-            if ty == "URL-REGEX" && oryn_module::reject_status(&effective_policy(spec, &policy)).is_some() {
+            if ty == "URL-REGEX"
+                && oryn_module::reject_status(&effective_policy(spec, &policy)).is_some()
+            {
                 continue;
             }
             let Some((policy, fallback)) = module_policy(&b, spec, &policy) else {
@@ -308,7 +314,9 @@ pub fn merge(config: &mut crate::RuntimeConfig) -> Result<(), crate::ConfigError
                     .filter(|(_, h)| {
                         let valid = !h.contains(['%', ' ', '/']);
                         if !valid {
-                            b.warn(format!("module {label}: invalid MITM hostname `{h}` ignored"));
+                            b.warn(format!(
+                                "module {label}: invalid MITM hostname `{h}` ignored"
+                            ));
                         }
                         valid
                     })
@@ -347,7 +355,10 @@ pub fn merge(config: &mut crate::RuntimeConfig) -> Result<(), crate::ConfigError
         for line in &m.hosts {
             if let Some((k, v)) = line.split_once('=') {
                 let Some(p) = crate::DomainPattern::parse(k.trim()) else {
-                    b.warn(format!("module {label}: invalid Host pattern `{}` ignored", k.trim()));
+                    b.warn(format!(
+                        "module {label}: invalid Host pattern `{}` ignored",
+                        k.trim()
+                    ));
                     continue;
                 };
                 {
@@ -356,7 +367,10 @@ pub fn merge(config: &mut crate::RuntimeConfig) -> Result<(), crate::ConfigError
                         .filter_map(|x| match x.trim().parse() {
                             Ok(ip) => Some(ip),
                             Err(_) => {
-                                b.warn(format!("module {label}: invalid Host IP `{}` ignored", x.trim()));
+                                b.warn(format!(
+                                    "module {label}: invalid Host IP `{}` ignored",
+                                    x.trim()
+                                ));
                                 None
                             }
                         })

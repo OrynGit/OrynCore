@@ -1016,6 +1016,7 @@ async fn run_once(
             dns: Vec::new(),
             amnezia: None,
             refresh_secs: None,
+            tcp_buffers: Default::default(),
         };
         let tunnel = Tunnel::with_factory(wire, Arc::new(derp::Factory(relay.clone())));
         let endpoints = (0..snapshot.peers.len())
@@ -1081,6 +1082,7 @@ mod tests {
             dns: vec![],
             amnezia: None,
             refresh_secs: None,
+            tcp_buffers: Default::default(),
         };
         let datagrams = Arc::new(oryn_udp::UdpFactory);
         let tunnel = Tunnel::with_factory(wire, datagrams.clone());

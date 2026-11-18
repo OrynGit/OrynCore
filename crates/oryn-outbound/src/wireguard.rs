@@ -260,6 +260,7 @@ mod tests {
             dns: vec![],
             amnezia: None,
             refresh_secs,
+            tcp_buffers: Default::default(),
         }
     }
 
