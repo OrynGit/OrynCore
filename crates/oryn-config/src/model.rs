@@ -686,7 +686,8 @@ pub struct WireGuardSpec {
     pub tcp_buffers: WireGuardTcpBuffers,
 }
 
-/// WireGuard 隧道内 smoltcp TCP 的缓冲：`tcp-rx-buffer`、`tcp-tx-buffer`、`tcp-buffer-budget`（字节）。
+/// WireGuard 隧道内 smoltcp TCP 的动态缓冲：`tcp-rx-buffer`、`tcp-tx-buffer`（每连接上限）、
+/// `tcp-buffer-budget`（全部连接合计），单位字节。连接从 `RX_INITIAL` / `TX_INITIAL` 开始按需扩容。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WireGuardTcpBuffers {
     pub rx: usize,
@@ -696,14 +697,22 @@ pub struct WireGuardTcpBuffers {
 }
 
 impl WireGuardTcpBuffers {
-    pub const RX_DEFAULT: usize = 64 * 1024;
-    pub const TX_DEFAULT: usize = 32 * 1024;
+    pub const RX_DEFAULT: usize = 256 * 1024;
+    pub const TX_DEFAULT: usize = 128 * 1024;
+    /// 配置允许的最小上限，也是新连接的初始大小。
     pub const RX_MIN: usize = 16 * 1024;
     pub const TX_MIN: usize = 8 * 1024;
+    pub const RX_INITIAL: usize = Self::RX_MIN;
+    pub const TX_INITIAL: usize = Self::TX_MIN;
     pub const BUFFER_MAX: usize = 4 * 1024 * 1024;
+    /// 默认预算：与改为动态缓冲之前「64 条 64 + 32 KiB 连接」的最坏内存相同。
+    pub const BUDGET_DEFAULT: usize = 6 * 1024 * 1024;
     pub const BUDGET_MAX: usize = 64 * 1024 * 1024;
-    /// 默认预算容纳的全尺寸连接数（与隧道内 TCP 套接字上限一致）。
-    pub const DEFAULT_CONNECTIONS: usize = 64;
+
+    /// 未写 `tcp-buffer-budget` 时的预算：至少容纳一条用满上限的连接。
+    pub fn default_budget(rx: usize, tx: usize) -> usize {
+        Self::BUDGET_DEFAULT.max(rx + tx).min(Self::BUDGET_MAX)
+    }
 }
 
 impl Default for WireGuardTcpBuffers {
@@ -711,7 +720,7 @@ impl Default for WireGuardTcpBuffers {
         Self {
             rx: Self::RX_DEFAULT,
             tx: Self::TX_DEFAULT,
-            budget: Self::DEFAULT_CONNECTIONS * (Self::RX_DEFAULT + Self::TX_DEFAULT),
+            budget: Self::default_budget(Self::RX_DEFAULT, Self::TX_DEFAULT),
         }
     }
 }

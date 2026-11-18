@@ -613,7 +613,7 @@ fn wireguard(p: &Yaml, name: &str, b: &mut Builder) -> Result<Option<OutboundKin
     })))
 }
 
-/// `tcp-rx-buffer` / `tcp-tx-buffer` / `tcp-buffer-budget`（Oryn 扩展，字节）。超出范围时整份配置失败。
+/// `tcp-rx-buffer` / `tcp-tx-buffer`（每连接上限）/ `tcp-buffer-budget`（合计）：Oryn 扩展，字节。超出范围时整份配置失败。
 fn wg_tcp_buffers(p: &Yaml, name: &str) -> Result<WireGuardTcpBuffers, ConfigError> {
     type B = WireGuardTcpBuffers;
     let size = |key: &str, default: usize, min: usize, max: usize| -> Result<usize, ConfigError> {
@@ -630,7 +630,7 @@ fn wg_tcp_buffers(p: &Yaml, name: &str) -> Result<WireGuardTcpBuffers, ConfigErr
     };
     let rx = size("tcp-rx-buffer", B::RX_DEFAULT, B::RX_MIN, B::BUFFER_MAX)?;
     let tx = size("tcp-tx-buffer", B::TX_DEFAULT, B::TX_MIN, B::BUFFER_MAX)?;
-    let default_budget = (B::DEFAULT_CONNECTIONS * (rx + tx)).min(B::BUDGET_MAX);
+    let default_budget = B::default_budget(rx, tx);
     let budget = size("tcp-buffer-budget", default_budget, rx + tx, B::BUDGET_MAX)?;
     Ok(B { rx, tx, budget })
 }

@@ -260,27 +260,117 @@ async fn old_flow_dns_does_not_roll_back_endpoint() {
 }
 
 #[test]
-fn tcp_buffer_budget_falls_back_then_refuses() {
-    let cfg = WireGuardTcpBuffers {
-        rx: 256 * 1024,
-        tx: 128 * 1024,
-        budget: 2 * 384 * 1024 + 24 * 1024,
-    };
-    let full = 384 * 1024;
-    assert_eq!(tcp_buffer_sizes(&cfg, 0), Some((256 * 1024, 128 * 1024)));
-    assert_eq!(tcp_buffer_sizes(&cfg, full), Some((256 * 1024, 128 * 1024)));
-    // 两条全尺寸之后只剩 24 KiB：退到最小 16 + 8 KiB
+fn buffer_growth_respects_max_and_budget() {
+    assert_eq!(grown(16 << 10, 256 << 10, 0, 6 << 20), Some(32 << 10));
+    // 不超过上限
+    assert_eq!(grown(192 << 10, 256 << 10, 0, 6 << 20), Some(256 << 10));
+    assert_eq!(grown(256 << 10, 256 << 10, 0, 6 << 20), None);
+    // 增量放不下预算就不扩
     assert_eq!(
-        tcp_buffer_sizes(&cfg, 2 * full),
-        Some((16 * 1024, 8 * 1024))
+        grown(16 << 10, 256 << 10, 100, 100 + (16 << 10)),
+        Some(32 << 10)
     );
-    assert_eq!(tcp_buffer_sizes(&cfg, 2 * full + 1), None);
-    // 配置本身小于最小值时不会被放大
-    let small = WireGuardTcpBuffers {
-        rx: 16 * 1024,
-        tx: 8 * 1024,
-        budget: 24 * 1024,
+    assert_eq!(grown(16 << 10, 256 << 10, 101, 100 + (16 << 10)), None);
+    // 初始大小不超过上限
+    let cfg = WireGuardTcpBuffers::default();
+    assert_eq!(initial_buffers(&cfg), (16 << 10, 8 << 10));
+}
+
+#[test]
+fn receive_grows_when_rounds_are_fast_and_drained() {
+    let t0 = Instant::now();
+    let cap = 16 << 10;
+    let ms = Duration::from_millis;
+    // 读得快、5 ms 收满一轮 → 扩容
+    let mut fast = Tune::new(t0);
+    fast.after_read(t0, cap, 0);
+    fast.rx_delivered = cap as u64;
+    fast.after_read(t0 + ms(5), cap, 0);
+    assert!(fast.rx_grow);
+    // 读得快但轮末恰好有一批刚到：这一轮里读空过 → 仍扩容
+    let mut burst = Tune::new(t0);
+    burst.after_read(t0, cap, 0);
+    burst.rx_delivered = (cap / 2) as u64;
+    burst.after_read(t0 + ms(2), cap, 0);
+    burst.after_read(t0 + ms(5), cap, cap / 2);
+    assert!(burst.rx_grow);
+    // 读得慢：整轮缓冲都接近满 → 不扩
+    let mut slow = Tune::new(t0);
+    slow.after_read(t0, cap, cap - 4096);
+    for i in 1..=4u64 {
+        slow.rx_delivered = i * 4096;
+        slow.after_read(t0 + ms(i), cap, cap - 4096);
+    }
+    assert!(!slow.rx_grow);
+    // 流量慢：一轮超过 GROW_ROUND → 不扩
+    let mut light = Tune::new(t0);
+    light.after_read(t0, cap, 0);
+    light.rx_delivered = cap as u64;
+    light.after_read(t0 + GROW_ROUND + ms(1), cap, 0);
+    assert!(!light.rx_grow);
+    // 一轮没收满 → 不判定
+    let mut partial = Tune::new(t0);
+    partial.after_read(t0, cap, 0);
+    partial.rx_delivered = (cap / 2) as u64;
+    partial.after_read(t0 + ms(1), cap, 0);
+    assert!(!partial.rx_grow);
+}
+
+#[test]
+fn send_grows_only_when_window_allows_and_progressing() {
+    let mut t = Tune::new(Instant::now());
+    let cap = 8 << 10;
+    t.tx_blocked = true;
+    assert!(t.tx_should_grow(cap, cap, (cap / 2) as u64));
+    // 对端窗口比缓冲小：瓶颈不在本端缓冲
+    assert!(!t.tx_should_grow(cap, cap - 1, (cap / 2) as u64));
+    // 没有确认进展（对端可能卡住）
+    assert!(!t.tx_should_grow(cap, cap, (cap / 2 - 1) as u64));
+    t.tx_blocked = false;
+    assert!(!t.tx_should_grow(cap, cap, cap as u64));
+}
+
+#[test]
+fn tune_grows_within_budget_and_shrinks_when_idle() {
+    let mut spec = control_spec();
+    let (rx0, tx0) = (16 << 10, 8 << 10);
+    // 预算：两条初始连接 + 一次接收扩容（16 KiB）
+    spec.tcp_buffers = WireGuardTcpBuffers {
+        rx: 64 << 10,
+        tx: 32 << 10,
+        budget: 2 * (rx0 + tx0) + (16 << 10),
     };
-    assert_eq!(tcp_buffer_sizes(&small, 0), Some((16 * 1024, 8 * 1024)));
-    assert_eq!(tcp_buffer_sizes(&small, 1), None);
+    let mut engine = Engine::new(spec, Arc::new(UdpFactory));
+    let dest: SocketAddr = "10.0.0.1:80".parse().unwrap();
+    let mut streams = Vec::new();
+    for _ in 0..2 {
+        let (mut flow, stream) = engine.open_tcp(dest, 0).unwrap();
+        flow.connect = None;
+        engine.tcp.push(flow);
+        streams.push(stream);
+    }
+    // 第三条放不下初始缓冲
+    let err = engine.open_tcp(dest, 0).err().unwrap();
+    assert!(err.to_string().contains("budget"), "{err}");
+    let now = Instant::now();
+    // 两条都想扩：只有第一条放得下预算
+    engine.tcp[0].tune.rx_grow = true;
+    engine.tcp[1].tune.rx_grow = true;
+    assert!(engine.tune(now));
+    assert_eq!(engine.tcp[0].rx_cap, 32 << 10);
+    assert_eq!(engine.tcp[1].rx_cap, rx0);
+    let socket = engine.sockets.get::<tcp::Socket>(engine.tcp[0].handle);
+    assert_eq!(socket.recv_capacity(), 32 << 10);
+    assert_eq!(engine.buffer_used(), engine.spec.tcp_buffers.budget);
+    // 空闲不到 IDLE_SHRINK：不收回
+    assert!(!engine.tune(now + IDLE_SHRINK - Duration::from_millis(1)));
+    assert_eq!(engine.tcp[0].rx_cap, 32 << 10);
+    // 空闲且缓冲为空：收回到初始大小，预算随之释放
+    engine.tune(now + IDLE_SHRINK);
+    assert_eq!(engine.tcp[0].rx_cap, rx0);
+    let socket = engine.sockets.get::<tcp::Socket>(engine.tcp[0].handle);
+    assert_eq!(socket.recv_capacity(), rx0);
+    assert_eq!(engine.buffer_used(), 2 * (rx0 + tx0));
+    assert_eq!(engine.tcp[0].tx_cap, tx0);
+    drop(streams);
 }

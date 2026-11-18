@@ -37,9 +37,13 @@ use crate::frag::{self, Reassembler};
 
 const TCP_CAP: usize = 64;
 const UDP_CAP: usize = 16;
-// smoltcp 每个 TCP 套接字的接收 / 发送缓冲由配置决定（`WireGuardSpec::tcp_buffers`，默认 64 / 32 KiB）。
-// 单条连接的吞吐上限是 窗口 / RTT，见 docs/protocols/wireguard.md「TCP 缓冲配置」。缓冲按连接分配，连接关闭即释放；
-// 全部连接的合计受预算限制，放不下全尺寸时退到最小尺寸，最小尺寸也放不下则拒绝新连接。
+// smoltcp 每个 TCP 套接字的缓冲是动态的（方案见 Oryn_dev/docs/oryncore/plans/plan-wg-dynamic-tcp-buffer.md）：
+// 从 `RX_INITIAL` / `TX_INITIAL` 开始，按吞吐翻倍到配置上限（见 `Tune`），空闲 `IDLE_SHRINK` 后收回；
+// 全部连接的合计受 `tcp-buffer-budget` 限制。单条连接的吞吐上限是 窗口 / RTT。
+/// 连接没有收发、缓冲为空多久之后把缓冲收回到初始大小。
+const IDLE_SHRINK: Duration = Duration::from_secs(5);
+/// 接收一轮（一个缓冲容量的数据）在这个时间内完成且本端读得快时扩接收缓冲。
+const GROW_ROUND: Duration = Duration::from_millis(250);
 const UDP_PACKETS: usize = 8;
 /// 交给用户 / 从用户取的单块上限与块数：每方向在 smoltcp 之外最多再缓冲 8 KiB。
 const CHUNK: usize = 4 * 1024;
@@ -508,8 +512,10 @@ struct Connect {
 struct TcpFlow {
     handle: SocketHandle,
     port: u16,
-    /// 这条连接 smoltcp 接收 + 发送缓冲的字节数，计入预算。
-    buffers: usize,
+    /// 当前 smoltcp 接收 / 发送缓冲容量，计入预算。
+    rx_cap: usize,
+    tx_cap: usize,
+    tune: Tune,
     /// 这条连接经由哪个对端（按目的地址选定，之后不变）。
     peer: usize,
     connect: Option<Connect>,
@@ -678,17 +684,91 @@ fn new_tunn(
     )
 }
 
-/// 新连接的（接收, 发送）缓冲：`used` 加上全尺寸不超预算就用全尺寸，否则退到最小尺寸，再放不下返回 None。
-fn tcp_buffer_sizes(cfg: &WireGuardTcpBuffers, used: usize) -> Option<(usize, usize)> {
-    let fits = |rx: usize, tx: usize| used.saturating_add(rx + tx) <= cfg.budget;
-    if fits(cfg.rx, cfg.tx) {
-        return Some((cfg.rx, cfg.tx));
+/// 动态缓冲的观测状态（每条 TCP 一份，固定大小）。
+///
+/// 接收方向参照 Linux 的接收端自动调优：收满一个缓冲容量的数据算一「轮」。一轮在 `GROW_ROUND` 内完成、
+/// 并且本端读得快（这一轮里缓冲至少有一次降到 1/4 以下）时扩容。读得慢的连接缓冲一直排不空，不扩；
+/// 慢流量一轮要很久，也不扩。接收缓冲最终大约是「吞吐 × GROW_ROUND」，再受上限与预算约束。
+struct Tune {
+    /// 本轮结束时的累计接收字节（交给用户的 + 缓冲中的）；0 表示还没开始。
+    rx_round_end: u64,
+    rx_round_start: Instant,
+    /// 本轮里缓冲降到过 1/4 以下（本端读得上）。
+    rx_round_drained: bool,
+    /// 已交给用户的累计字节。
+    rx_delivered: u64,
+    /// 下一轮 `tune` 扩接收缓冲。
+    rx_grow: bool,
+    /// 有待发数据而发送缓冲已满。
+    tx_blocked: bool,
+    /// 写进 smoltcp 的累计字节；减去 `send_queue` 即累计已确认。
+    tx_enqueued: u64,
+    /// 上次扩发送缓冲时的累计已确认字节。
+    tx_acked_mark: u64,
+    last_active: Instant,
+}
+
+impl Tune {
+    fn new(now: Instant) -> Self {
+        Self {
+            rx_round_end: 0,
+            rx_round_start: now,
+            rx_round_drained: false,
+            rx_delivered: 0,
+            rx_grow: false,
+            tx_blocked: false,
+            tx_enqueued: 0,
+            tx_acked_mark: 0,
+            last_active: now,
+        }
     }
-    let (rx, tx) = (
-        cfg.rx.min(WireGuardTcpBuffers::RX_MIN),
-        cfg.tx.min(WireGuardTcpBuffers::TX_MIN),
-    );
-    fits(rx, tx).then_some((rx, tx))
+
+    /// 本端取走数据之后看接收方向：`cap` 当前接收缓冲容量，`queued` 取完后仍在缓冲里的字节。
+    fn after_read(&mut self, now: Instant, cap: usize, queued: usize) {
+        let received = self.rx_delivered + queued as u64;
+        let drained = queued <= cap / 4;
+        if self.rx_round_end == 0 {
+            self.rx_round_end = received + cap as u64;
+            self.rx_round_start = now;
+            self.rx_round_drained = drained;
+            return;
+        }
+        self.rx_round_drained |= drained;
+        if received < self.rx_round_end {
+            return;
+        }
+        if self.rx_round_drained && now.saturating_duration_since(self.rx_round_start) <= GROW_ROUND
+        {
+            self.rx_grow = true;
+        }
+        self.rx_round_end = received + cap as u64;
+        self.rx_round_start = now;
+        self.rx_round_drained = drained;
+    }
+
+    /// 发送缓冲已满时是否应该扩：对端窗口放得下更多，且上次扩容后已确认至少半个缓冲（连接在前进）。
+    fn tx_should_grow(&self, cap: usize, remote_window: usize, acked: u64) -> bool {
+        self.tx_blocked
+            && remote_window >= cap
+            && acked.saturating_sub(self.tx_acked_mark) >= (cap / 2) as u64
+    }
+}
+
+/// 新连接的初始缓冲（不超过配置上限）。
+fn initial_buffers(cfg: &WireGuardTcpBuffers) -> (usize, usize) {
+    (
+        cfg.rx.min(WireGuardTcpBuffers::RX_INITIAL),
+        cfg.tx.min(WireGuardTcpBuffers::TX_INITIAL),
+    )
+}
+
+/// 扩容后的容量：翻倍且不超过上限，合计 `used` 加上增量不超预算；不能扩时返回 None。
+fn grown(cap: usize, max: usize, used: usize, budget: usize) -> Option<usize> {
+    if cap >= max {
+        return None;
+    }
+    let new = cap.saturating_mul(2).min(max);
+    (used.saturating_add(new - cap) <= budget).then_some(new)
 }
 
 fn now_smol() -> smoltcp::time::Instant {
@@ -989,11 +1069,11 @@ impl Engine {
             return Err(io::Error::other("wireguard tcp socket limit reached"));
         }
         self.family_ok(dest.ip())?;
-        let (rx, tx) = tcp_buffer_sizes(
-            &self.spec.tcp_buffers,
-            self.tcp.iter().map(|f| f.buffers).sum(),
-        )
-        .ok_or_else(|| io::Error::other("wireguard tcp buffer budget exhausted"))?;
+        let cfg = self.spec.tcp_buffers;
+        let (rx, tx) = initial_buffers(&cfg);
+        if self.buffer_used() + rx + tx > cfg.budget {
+            return Err(io::Error::other("wireguard tcp buffer budget exhausted"));
+        }
         let tcp = &self.tcp;
         let port = next_port(&mut self.next_port, |p| tcp.iter().any(|f| f.port == p))
             .ok_or_else(|| io::Error::other("wireguard tcp ports exhausted"))?;
@@ -1001,6 +1081,8 @@ impl Engine {
             tcp::SocketBuffer::new(vec![0; rx]),
             tcp::SocketBuffer::new(vec![0; tx]),
         );
+        // 窗口缩放按上限协商，之后接收缓冲才能扩到上限
+        socket.set_rx_capacity_max(cfg.rx);
         socket.set_nagle_enabled(false);
         // smoltcp 默认延迟 ACK 10 ms：接收缓冲填满后，窗口更新也要等这 10 ms，下行吞吐因此降到原来的约 1/18
         //（Oryn_dev/docs/oryncore/measurements/wireguard-cpu-2026-11-18.md）。每个数据段立即 ACK。
@@ -1023,7 +1105,9 @@ impl Engine {
         let flow = TcpFlow {
             handle,
             port,
-            buffers: rx + tx,
+            rx_cap: rx,
+            tx_cap: tx,
+            tune: Tune::new(Instant::now()),
             peer,
             connect: None,
             to_user: Some(to_user),
@@ -1195,7 +1279,8 @@ impl Engine {
                 .poll(now_smol(), &mut self.device, &mut self.sockets);
             self.flush();
             let delivered = self.service(now);
-            if !changed && !delivered {
+            let resized = self.tune(now);
+            if !changed && !delivered && !resized {
                 break;
             }
         }
@@ -1359,6 +1444,7 @@ impl Engine {
     }
 
     fn feed(&mut self) {
+        let now = Instant::now();
         for flow in &mut self.tcp {
             if flow.connect.is_some() || flow.dead {
                 continue;
@@ -1381,8 +1467,16 @@ impl Engine {
                     break;
                 }
                 match socket.send_slice(&flow.pending[flow.pos..]) {
-                    Ok(n) if n > 0 => flow.pos += n,
-                    _ => break,
+                    Ok(n) if n > 0 => {
+                        flow.pos += n;
+                        flow.tune.tx_enqueued += n as u64;
+                        flow.tune.last_active = now;
+                    }
+                    _ => {
+                        // 发送缓冲满，用户数据还在等
+                        flow.tune.tx_blocked = true;
+                        break;
+                    }
                 }
             }
             if flow.write_done && flow.pos >= flow.pending.len() && !flow.fin_sent {
@@ -1498,6 +1592,7 @@ impl Engine {
             }
             match flow.to_user.as_ref() {
                 Some(tx) => {
+                    let cap = socket.recv_capacity();
                     while socket.can_recv() {
                         let Ok(permit) = tx.try_reserve() else { break };
                         let mut chunk = vec![0; socket.recv_queue().min(CHUNK)];
@@ -1508,7 +1603,10 @@ impl Engine {
                         chunk.truncate(n);
                         permit.send(chunk);
                         delivered = true;
+                        flow.tune.rx_delivered += n as u64;
+                        flow.tune.last_active = now;
                     }
+                    flow.tune.after_read(now, cap, socket.recv_queue());
                     if socket.recv_queue() == 0 && (flow.peer_fin || state == tcp::State::Closed) {
                         if !flow.peer_fin {
                             flow.shared.reset.store(true, Ordering::Release);
@@ -1558,6 +1656,80 @@ impl Engine {
             }
         }
         delivered
+    }
+
+    /// 本出站全部 TCP 当前占用的缓冲容量。
+    fn buffer_used(&self) -> usize {
+        self.tcp.iter().map(|f| f.rx_cap + f.tx_cap).sum()
+    }
+
+    /// 按观测扩容或收回缓冲；返回是否有缓冲变化（接收扩容后需要再推进一轮以发出窗口更新）。
+    fn tune(&mut self, now: Instant) -> bool {
+        let cfg = self.spec.tcp_buffers;
+        let (rx0, tx0) = initial_buffers(&cfg);
+        let mut used = self.buffer_used();
+        let mut changed = false;
+        for flow in &mut self.tcp {
+            if flow.connect.is_some() || flow.dead {
+                continue;
+            }
+            let socket = self.sockets.get_mut::<tcp::Socket>(flow.handle);
+            if std::mem::take(&mut flow.tune.rx_grow) {
+                if let Some(new) = grown(flow.rx_cap, cfg.rx, used, cfg.budget) {
+                    if socket
+                        .replace_rx_buffer(tcp::SocketBuffer::new(vec![0; new]))
+                        .is_ok()
+                    {
+                        used += new - flow.rx_cap;
+                        flow.rx_cap = new;
+                        changed = true;
+                    }
+                }
+            }
+            let acked = flow.tune.tx_enqueued - socket.send_queue() as u64;
+            if flow
+                .tune
+                .tx_should_grow(flow.tx_cap, socket.remote_window(), acked)
+            {
+                if let Some(new) = grown(flow.tx_cap, cfg.tx, used, cfg.budget) {
+                    if socket
+                        .replace_tx_buffer(tcp::SocketBuffer::new(vec![0; new]))
+                        .is_ok()
+                    {
+                        used += new - flow.tx_cap;
+                        flow.tx_cap = new;
+                        flow.tune.tx_acked_mark = acked;
+                        changed = true;
+                    }
+                }
+            }
+            flow.tune.tx_blocked = false;
+            let idle = (flow.rx_cap > rx0 || flow.tx_cap > tx0)
+                && now.saturating_duration_since(flow.tune.last_active) >= IDLE_SHRINK
+                && socket.recv_queue() == 0
+                && socket.send_queue() == 0
+                && flow.pos >= flow.pending.len();
+            if idle {
+                if flow.rx_cap > rx0
+                    && socket
+                        .replace_rx_buffer(tcp::SocketBuffer::new(vec![0; rx0]))
+                        .is_ok()
+                {
+                    used -= flow.rx_cap - rx0;
+                    flow.rx_cap = rx0;
+                }
+                if flow.tx_cap > tx0
+                    && socket
+                        .replace_tx_buffer(tcp::SocketBuffer::new(vec![0; tx0]))
+                        .is_ok()
+                {
+                    used -= flow.tx_cap - tx0;
+                    flow.tx_cap = tx0;
+                }
+                flow.tune.rx_round_end = 0;
+            }
+        }
+        changed
     }
 
     fn next_wait(&mut self) -> Option<Duration> {
