@@ -332,6 +332,15 @@ fn send_grows_only_when_window_allows_and_progressing() {
 
 #[test]
 fn tune_grows_within_budget_and_shrinks_when_idle() {
+    let _g = crate::resources::test_support::SERIAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    crate::resources::configure(crate::resources::Limits {
+        buffer_budget: 64 << 20,
+        workers: 1,
+    });
+    crate::resources::set_pressure(Pressure::Normal);
+    let idle_shrink = Pressure::Normal.idle_shrink();
     let mut spec = control_spec();
     let (rx0, tx0) = (16 << 10, 8 << 10);
     // 预算：两条初始连接 + 一次接收扩容（16 KiB）
@@ -362,15 +371,67 @@ fn tune_grows_within_budget_and_shrinks_when_idle() {
     let socket = engine.sockets.get::<tcp::Socket>(engine.tcp[0].handle);
     assert_eq!(socket.recv_capacity(), 32 << 10);
     assert_eq!(engine.buffer_used(), engine.spec.tcp_buffers.budget);
-    // 空闲不到 IDLE_SHRINK：不收回
-    assert!(!engine.tune(now + IDLE_SHRINK - Duration::from_millis(1)));
+    // 空闲不到收回时长：不收回
+    assert!(!engine.tune(now + idle_shrink - Duration::from_millis(1)));
     assert_eq!(engine.tcp[0].rx_cap, 32 << 10);
     // 空闲且缓冲为空：收回到初始大小，预算随之释放
-    engine.tune(now + IDLE_SHRINK);
+    engine.tune(now + idle_shrink);
     assert_eq!(engine.tcp[0].rx_cap, rx0);
     let socket = engine.sockets.get::<tcp::Socket>(engine.tcp[0].handle);
     assert_eq!(socket.recv_capacity(), rx0);
     assert_eq!(engine.buffer_used(), 2 * (rx0 + tx0));
     assert_eq!(engine.tcp[0].tx_cap, tx0);
     drop(streams);
+}
+
+#[test]
+fn global_budget_is_shared_and_pressure_stops_growth() {
+    let _g = crate::resources::test_support::SERIAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let (rx0, tx0) = (16 << 10, 8 << 10);
+    let base = crate::resources::buffer_usage().0;
+    // 进程级预算：两条初始连接 + 一次 16 KiB 扩容，两个出站共用
+    crate::resources::configure(crate::resources::Limits {
+        buffer_budget: base + 2 * (rx0 + tx0) + (16 << 10),
+        workers: 1,
+    });
+    crate::resources::set_pressure(Pressure::Normal);
+    let dest: SocketAddr = "10.0.0.1:80".parse().unwrap();
+    let mut a = Engine::new(control_spec(), Arc::new(UdpFactory));
+    let mut b = Engine::new(control_spec(), Arc::new(UdpFactory));
+    let mut streams = Vec::new();
+    for engine in [&mut a, &mut b] {
+        let (mut flow, stream) = engine.open_tcp(dest, 0).unwrap();
+        flow.connect = None;
+        engine.tcp.push(flow);
+        streams.push(stream);
+    }
+    // 各出站自己的预算都还宽裕，但进程级预算已不够第三条
+    let err = a.open_tcp(dest, 0).err().unwrap();
+    assert!(err.to_string().contains("budget"), "{err}");
+    let now = Instant::now();
+    // 内存压力：不扩容
+    crate::resources::set_pressure(Pressure::Elevated);
+    a.tcp[0].tune.rx_grow = true;
+    assert!(!a.tune(now));
+    assert_eq!(a.tcp[0].rx_cap, rx0);
+    // 压力解除后，进程级预算只够一个出站扩容
+    crate::resources::set_pressure(Pressure::Normal);
+    a.tcp[0].tune.rx_grow = true;
+    b.tcp[0].tune.rx_grow = true;
+    assert!(a.tune(now));
+    assert!(!b.tune(now));
+    assert_eq!((a.tcp[0].rx_cap, b.tcp[0].rx_cap), (32 << 10, rx0));
+    // critical：扩容过的缓冲一空就收回，不等空闲时长
+    crate::resources::set_pressure(Pressure::Critical);
+    a.tune(now);
+    assert_eq!(a.tcp[0].rx_cap, rx0);
+    // 连接释放后租约归还
+    drop(a);
+    drop(b);
+    drop(streams);
+    assert_eq!(crate::resources::buffer_usage().0, base);
+    crate::resources::set_pressure(Pressure::Normal);
+    crate::resources::configure(crate::resources::Limits::DEFAULT);
 }

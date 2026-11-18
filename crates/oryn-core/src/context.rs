@@ -189,6 +189,11 @@ impl EngineCtx {
         options.network.apply_interface();
         let limits = options.resource_profile.limits();
         log::info!("engine resource profile {:?}: {:?}", options.resource_profile, limits);
+        oryn_outbound::wireguard_resources::configure(oryn_outbound::wireguard_resources::Limits {
+            buffer_budget: limits.wg_buffer_budget,
+            workers: limits.wg_workers,
+        });
+        oryn_outbound::wireguard_resources::set_pressure(oryn_outbound::wireguard_resources::Pressure::Normal);
         let ctx = EngineCtx {
             admission: crate::admission::Admission::new(options.resource_profile),
             iperf: Rc::new(crate::iperf::Manager::default()),

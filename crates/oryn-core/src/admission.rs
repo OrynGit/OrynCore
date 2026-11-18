@@ -34,10 +34,12 @@ const RECHECK: Duration = Duration::from_millis(250);
 /// 内存闸默认值：每条新连接按 64 KiB 计（真机实测空闲连接约 40 KiB，含 TLS 外层相近），保留 8 MiB 余量。
 const DEFAULT_MEM_COST: u64 = 64 * 1024;
 const DEFAULT_MEM_RESERVE: u64 = 8 * 1024 * 1024;
+/// 可用内存高于准入余量这么多以内时，WG 出站停止扩缓冲（见 `wireguard_pressure`）。
+const WG_HEADROOM: u64 = 8 * 1024 * 1024;
 /// 一个等待中的连接（lwIP pcb + 接收缓冲 + 任务）实测约占 16 KiB。
 const WAITER_COST: u64 = 16 * 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
 pub(crate) enum PressureLevel {
     Normal = 0,
@@ -163,6 +165,26 @@ impl Admission {
     pub(crate) fn set_pressure(&self, level: PressureLevel) {
         self.pressure.store(level as u8, Ordering::Relaxed);
         self.notify.notify_waiters();
+    }
+
+    /// 交给 WG 出站的内存压力：宿主报告的等级与按可用内存推出的等级取较高者。
+    /// 可用内存低于 `mem_reserve + WG_HEADROOM` 为 elevated，低于 `mem_reserve` 为 critical；
+    /// 宿主不报告可用内存（非 iOS）时只看宿主等级。
+    pub(crate) fn wireguard_pressure(&self) -> PressureLevel {
+        let host = self.pressure();
+        let available = self.mem_available.load(Ordering::Relaxed);
+        if available == u64::MAX {
+            return host;
+        }
+        let reserve = self.mem_reserve.load(Ordering::Relaxed);
+        let derived = if available < reserve {
+            PressureLevel::Critical
+        } else if available < reserve.saturating_add(WG_HEADROOM) {
+            PressureLevel::Elevated
+        } else {
+            PressureLevel::Normal
+        };
+        host.max(derived)
     }
 
     /// 宿主每秒报告一次扩展进程还能再用多少内存；同时清零「本周期已放行」计数。
@@ -513,6 +535,27 @@ mod tests {
             held.push(permit);
         }
         assert!(budget.active.is_none());
+    }
+
+    #[test]
+    fn wireguard_pressure_combines_host_level_and_available_memory() {
+        let budget = Admission::from_limits(Some(96), 16, 16, 4);
+        // 宿主不报告可用内存（非 iOS）：只看宿主等级
+        assert_eq!(budget.wireguard_pressure(), PressureLevel::Normal);
+        budget.set_pressure(PressureLevel::Elevated);
+        assert_eq!(budget.wireguard_pressure(), PressureLevel::Elevated);
+        budget.set_pressure(PressureLevel::Normal);
+        let reserve = DEFAULT_MEM_RESERVE;
+        budget.report_available(reserve + WG_HEADROOM);
+        assert_eq!(budget.wireguard_pressure(), PressureLevel::Normal);
+        budget.report_available(reserve + WG_HEADROOM - 1);
+        assert_eq!(budget.wireguard_pressure(), PressureLevel::Elevated);
+        budget.report_available(reserve - 1);
+        assert_eq!(budget.wireguard_pressure(), PressureLevel::Critical);
+        // 宿主等级更高时取宿主的
+        budget.report_available(u64::MAX - 1);
+        budget.set_pressure(PressureLevel::Critical);
+        assert_eq!(budget.wireguard_pressure(), PressureLevel::Critical);
     }
 
     #[test]
