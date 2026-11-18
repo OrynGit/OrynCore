@@ -44,7 +44,7 @@ boringtun 封装后，发送前把 UDP 载荷的第 2 到第 4 字节改成这 3
 
 互通：sing-box 1.13.14 的 WireGuard 端点在 peer 里配置 `reserved: [1,2,3]`。它只在知道对端端点之后才在发出的包里写保留字段，所以测试用一个固定端口的 UDP 中继充当 Oryn 的端点，并统计两个方向带保留字段的包：Oryn 发出的包全部带 `[1,2,3]`，sing-box 发出的包也全部带，TCP 与 UDP 往返通过。保留字段与对端不符时握手是否失败，没有单独测试。
 
-事件循环是**一个 Tokio 任务**，不是新线程。它同时驱动 smoltcp、各对端的 `update_timers` 和外层数据报通道，睡到下一计时器或通道可读为止。握手、重试、放弃都是按对端各自进行的：一个对端不可达不影响其它对端。
+事件循环是**一个 Tokio 任务**，跑在进程级的 WG 工作线程上（`resources.rs`），不占用 Core 事件循环线程。工作线程数按资源档位：`desktop_high` 为 min(4, 核数 / 2)，其余为 1。线程常驻进程，各出站的引擎按轮转分配到工作线程。引擎同时驱动 smoltcp、各对端的 `update_timers` 和外层数据报通道，睡到下一计时器或通道可读为止。通道可读时一次最多取 32 个数据报（`try_recv_from`）。握手、重试、放弃都是按对端各自进行的：一个对端不可达不影响其它对端。
 
 - `persistent-keepalive` 单位秒，默认 0（关闭）。非 0 时小于 10 秒钳到 10 秒并警告。
 - 握手发出后 5 秒没有响应，再试，最多 3 次。之后停止。挂起的 Flow 失败。任务休眠，直到下一次 `connect_tcp`、`bind_udp`、`wake` 或 `network_changed`。对端不可达时不空转。实现：重发由 boringtun 按 5 秒计时器完成，15 秒内没有会话就丢掉 boringtun 状态（停止重发）、失败全部 TCP Flow 并休眠。没有会话时，发往该对端的包最多暂存 16 个（`PEER_QUEUE`），再多的丢弃，由隧道内 TCP 重传；不交给 boringtun 自己的 256 包队列。握手完成以握手响应（类型 2）被 boringtun 接受为准，不能比较 `time_since_last_handshake` 与开始时间：boringtun 的「当前时间」只在 `update_timers` 时更新，会话建立时刻可能早于开始时刻，比较永远不成立，15 秒后会误判为握手超时并重置所有连接（已修复的缺陷，见 [changelog-0.7.0.md](../../../docs/apple/changelog/changelog-0.7.0.md)）。
@@ -85,7 +85,17 @@ smoltcp 只开 `medium-ip`、IPv4、IPv6、TCP、UDP。不开以太网、DHCP �
 - 发送缓冲：有待发数据而缓冲已满、对端窗口不小于当前容量、且上次扩容后已确认至少半个缓冲时翻倍。
 - 扩容超出预算就不扩。连接 5 秒没有收发且两个缓冲为空时回到初始大小；对端按旧窗口多发的部分会被丢弃并重传。
 - 窗口缩放在握手时按上限协商（smoltcp 补丁，见 `vendor/smoltcp/ORYN_PATCHES.md`），扩容不需要重新协商。
-- 默认值的最坏内存与动态缓冲之前相同（6 MiB）；平台层不改这些字段。本地配置编辑器不写这些字段，只能在导入的 YAML 中设置。
+- 除了本出站的 `tcp-buffer-budget`，所有 WG / Tailscale 出站还共享一个进程级预算，由 Core 按资源档位设置：
+  - `mobile_plus`（iOS）6 MiB；
+  - `constrained`（Android、macOS / Linux 默认）4 MiB；
+  - `desktop_high` 64 MiB。
+  两者同时生效，任一放不下都会拒绝新连接或停止扩容。
+- 内存压力（只有 iOS 宿主上报可用内存）：
+  - elevated：不扩容，空闲 1 秒即收回；
+  - critical：不扩容，扩容过的缓冲一空就收回。
+  等级取宿主上报值与按可用内存推出的值中较高者（见 `Oryn_for_Apple/docs/development.md` 的 `pressure` 命令）。
+- 用量见 `stats` 的 `wireguard_buffers`。方案见 [plan-wg-worker-and-global-budget.md](../../../docs/oryncore/plans/plan-wg-worker-and-global-budget.md)。
+- 平台层只选资源档位，不改这些字段。本地配置编辑器不写这些字段，只能在导入的 YAML 中设置。
 
 `udp: false`（默认）时 `bind_udp` 返回不支持。TCP 仍可用。
 

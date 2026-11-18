@@ -48,6 +48,10 @@ pub(crate) struct ResourceLimits {
     pub http_upstream_establish: usize,
     pub udp_sessions: usize,
     pub http_bodies: usize,
+    /// 全部 WG / Tailscale 出站隧道内 TCP 缓冲的合计上限（Oryn_dev/docs/oryncore/plans/plan-wg-worker-and-global-budget.md）。
+    pub wg_buffer_budget: usize,
+    /// WG 引擎工作线程数。
+    pub wg_workers: usize,
 }
 
 impl ResourceProfile {
@@ -77,6 +81,19 @@ impl ResourceProfile {
             },
             udp_sessions,
             http_bodies: 2,
+            wg_buffer_budget: match self {
+                Self::Constrained => 4 << 20,
+                #[cfg(target_os = "ios")]
+                Self::MobilePlus => 6 << 20,
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                Self::DesktopHigh => 64 << 20,
+            },
+            wg_workers: match self {
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                Self::DesktopHigh => std::thread::available_parallelism()
+                    .map_or(1, |n| (n.get() / 2).clamp(1, 4)),
+                _ => 1,
+            },
         }
     }
 }

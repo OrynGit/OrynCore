@@ -5,5 +5,6 @@ mod device;
 mod dns;
 mod engine;
 mod frag;
+pub mod resources;
 
 pub use engine::{Endpoints, IoStream, Tunnel, UdpSession};

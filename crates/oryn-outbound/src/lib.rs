@@ -21,6 +21,8 @@ mod mieru;
 mod smart;
 /// Mieru UDP 会话的诊断统计增量，供设备自测使用。
 pub use mieru::counters as mieru_counters;
+/// WG / Tailscale 出站的进程级资源（工作线程、全局缓冲预算、内存压力），由 Core 按资源档位设置。
+pub use oryn_wireguard::resources as wireguard_resources;
 mod mux;
 mod muxcool;
 mod naive;

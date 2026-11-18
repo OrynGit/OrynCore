@@ -815,7 +815,9 @@ fn handle_command(ctx: &Rc<EngineCtx>, req: &Value) -> Value {
                 }
                 ctx.admission.report_available(bytes);
             }
-            json!({"ok": true, "pressure": level.as_str(), "establishing_limit": ctx.admission.establishing_limit()})
+            let wg = wireguard_pressure(ctx.admission.wireguard_pressure());
+            oryn_outbound::wireguard_resources::set_pressure(wg);
+            json!({"ok": true, "pressure": level.as_str(), "establishing_limit": ctx.admission.establishing_limit(), "wireguard_pressure": wg.as_str()})
         }
         "admission_tune" => {
             let num = |key: &str| req.get(key).and_then(Value::as_u64);
@@ -855,6 +857,12 @@ fn handle_command(ctx: &Rc<EngineCtx>, req: &Value) -> Value {
                 "tuning": ctx.admission.tuning(),
                 "peak_active": ctx.admission.counters.peak_active.load(Relaxed),
                 "peak_establishing": ctx.admission.counters.peak_establishing.load(Relaxed),
+            },
+            "wireguard_buffers": {
+                "used": oryn_outbound::wireguard_resources::buffer_usage().0,
+                "budget": oryn_outbound::wireguard_resources::buffer_usage().1,
+                "pressure": oryn_outbound::wireguard_resources::pressure().as_str(),
+                "workers": oryn_outbound::wireguard_resources::workers_started(),
             },
             "udp_active": ctx.conns.count(Network::Udp),
             "udp_sessions": ctx.udp.count(),
@@ -1570,5 +1578,16 @@ mod utun_tests {
         }
         engine.stop();
         assert!(worst < Duration::from_millis(100), "worst SYN-ACK latency {worst:?}");
+    }
+}
+
+/// Core 的压力等级换成 WG 出站的等级（两者含义一致，分别定义以免 oryn-wireguard 依赖 Core）。
+fn wireguard_pressure(level: crate::admission::PressureLevel) -> oryn_outbound::wireguard_resources::Pressure {
+    use crate::admission::PressureLevel as P;
+    use oryn_outbound::wireguard_resources::Pressure as W;
+    match level {
+        P::Normal => W::Normal,
+        P::Elevated => W::Elevated,
+        P::Critical => W::Critical,
     }
 }

@@ -34,14 +34,15 @@ use crate::amnezia::Amnezia;
 use crate::device::VirtDevice;
 use crate::dns;
 use crate::frag::{self, Reassembler};
+use crate::resources::{self, Lease, Pressure};
 
 const TCP_CAP: usize = 64;
 const UDP_CAP: usize = 16;
 // smoltcp 每个 TCP 套接字的缓冲是动态的（方案见 Oryn_dev/docs/oryncore/plans/plan-wg-dynamic-tcp-buffer.md）：
-// 从 `RX_INITIAL` / `TX_INITIAL` 开始，按吞吐翻倍到配置上限（见 `Tune`），空闲 `IDLE_SHRINK` 后收回；
-// 全部连接的合计受 `tcp-buffer-budget` 限制。单条连接的吞吐上限是 窗口 / RTT。
-/// 连接没有收发、缓冲为空多久之后把缓冲收回到初始大小。
-const IDLE_SHRINK: Duration = Duration::from_secs(5);
+// 从 `RX_INITIAL` / `TX_INITIAL` 开始，按吞吐翻倍到配置上限（见 `Tune`），空闲后收回（时长随内存压力，见
+// `resources::Pressure`）；合计受本出站 `tcp-buffer-budget` 与进程级预算（`resources`）双重限制。单条连接的吞吐上限是 窗口 / RTT。
+/// 外层通道一次唤醒最多取的数据报数（低于设备接收队列 64）。
+const RECV_BATCH: usize = 32;
 /// 接收一轮（一个缓冲容量的数据）在这个时间内完成且本端读得快时扩接收缓冲。
 const GROW_ROUND: Duration = Duration::from_millis(250);
 const UDP_PACKETS: usize = 8;
@@ -331,7 +332,8 @@ impl Tunnel {
             }),
             notify: Notify::new(),
         });
-        let task = tokio::spawn(run(Engine::new(spec, factory), rx, control.clone()));
+        // 引擎跑在 WG 工作线程上，不占用 Core 事件循环线程（resources.rs）
+        let task = resources::spawn(run(Engine::new(spec, factory), rx, control.clone()));
         Arc::new(Self {
             commands: tx,
             control,
@@ -516,6 +518,8 @@ struct TcpFlow {
     rx_cap: usize,
     tx_cap: usize,
     tune: Tune,
+    /// 全局缓冲预算里的份额，始终等于 `rx_cap + tx_cap`；连接释放时归还。
+    lease: Lease,
     /// 这条连接经由哪个对端（按目的地址选定，之后不变）。
     peer: usize,
     connect: Option<Connect>,
@@ -1074,6 +1078,9 @@ impl Engine {
         if self.buffer_used() + rx + tx > cfg.budget {
             return Err(io::Error::other("wireguard tcp buffer budget exhausted"));
         }
+        // 全部 WG / Tailscale 出站共享的进程级预算（按资源档位区分平台）
+        let lease = Lease::acquire(rx + tx)
+            .ok_or_else(|| io::Error::other("wireguard tcp buffer budget exhausted"))?;
         let tcp = &self.tcp;
         let port = next_port(&mut self.next_port, |p| tcp.iter().any(|f| f.port == p))
             .ok_or_else(|| io::Error::other("wireguard tcp ports exhausted"))?;
@@ -1108,6 +1115,7 @@ impl Engine {
             rx_cap: rx,
             tx_cap: tx,
             tune: Tune::new(Instant::now()),
+            lease,
             peer,
             connect: None,
             to_user: Some(to_user),
@@ -1664,9 +1672,15 @@ impl Engine {
     }
 
     /// 按观测扩容或收回缓冲；返回是否有缓冲变化（接收扩容后需要再推进一轮以发出窗口更新）。
+    ///
+    /// 扩容同时受本出站的 `tcp-buffer-budget` 与进程级预算（[`resources`]）约束；内存压力不为
+    /// normal 时不扩容，并按压力等级提前收回空闲的缓冲。
     fn tune(&mut self, now: Instant) -> bool {
         let cfg = self.spec.tcp_buffers;
         let (rx0, tx0) = initial_buffers(&cfg);
+        let pressure = resources::pressure();
+        let may_grow = pressure == Pressure::Normal;
+        let idle_after = pressure.idle_shrink();
         let mut used = self.buffer_used();
         let mut changed = false;
         for flow in &mut self.tcp {
@@ -1674,38 +1688,47 @@ impl Engine {
                 continue;
             }
             let socket = self.sockets.get_mut::<tcp::Socket>(flow.handle);
-            if std::mem::take(&mut flow.tune.rx_grow) {
+            if std::mem::take(&mut flow.tune.rx_grow) && may_grow {
                 if let Some(new) = grown(flow.rx_cap, cfg.rx, used, cfg.budget) {
-                    if socket
-                        .replace_rx_buffer(tcp::SocketBuffer::new(vec![0; new]))
-                        .is_ok()
-                    {
-                        used += new - flow.rx_cap;
-                        flow.rx_cap = new;
-                        changed = true;
+                    if flow.lease.resize(new + flow.tx_cap) {
+                        if socket
+                            .replace_rx_buffer(tcp::SocketBuffer::new(vec![0; new]))
+                            .is_ok()
+                        {
+                            used += new - flow.rx_cap;
+                            flow.rx_cap = new;
+                            changed = true;
+                        } else {
+                            flow.lease.resize(flow.rx_cap + flow.tx_cap);
+                        }
                     }
                 }
             }
             let acked = flow.tune.tx_enqueued - socket.send_queue() as u64;
-            if flow
-                .tune
-                .tx_should_grow(flow.tx_cap, socket.remote_window(), acked)
+            if may_grow
+                && flow
+                    .tune
+                    .tx_should_grow(flow.tx_cap, socket.remote_window(), acked)
             {
                 if let Some(new) = grown(flow.tx_cap, cfg.tx, used, cfg.budget) {
-                    if socket
-                        .replace_tx_buffer(tcp::SocketBuffer::new(vec![0; new]))
-                        .is_ok()
-                    {
-                        used += new - flow.tx_cap;
-                        flow.tx_cap = new;
-                        flow.tune.tx_acked_mark = acked;
-                        changed = true;
+                    if flow.lease.resize(flow.rx_cap + new) {
+                        if socket
+                            .replace_tx_buffer(tcp::SocketBuffer::new(vec![0; new]))
+                            .is_ok()
+                        {
+                            used += new - flow.tx_cap;
+                            flow.tx_cap = new;
+                            flow.tune.tx_acked_mark = acked;
+                            changed = true;
+                        } else {
+                            flow.lease.resize(flow.rx_cap + flow.tx_cap);
+                        }
                     }
                 }
             }
             flow.tune.tx_blocked = false;
             let idle = (flow.rx_cap > rx0 || flow.tx_cap > tx0)
-                && now.saturating_duration_since(flow.tune.last_active) >= IDLE_SHRINK
+                && now.saturating_duration_since(flow.tune.last_active) >= idle_after
                 && socket.recv_queue() == 0
                 && socket.send_queue() == 0
                 && flow.pos >= flow.pending.len();
@@ -1726,6 +1749,8 @@ impl Engine {
                     used -= flow.tx_cap - tx0;
                     flow.tx_cap = tx0;
                 }
+                // 缩小必定成功
+                flow.lease.resize(flow.rx_cap + flow.tx_cap);
                 flow.tune.rx_round_end = 0;
             }
         }
@@ -1745,6 +1770,23 @@ impl Engine {
             wait = Some(wait.map_or(TICK, |w| w.min(TICK)));
         }
         wait
+    }
+}
+
+/// 一次唤醒里把通道上已到达的数据报再取最多 `RECV_BATCH - 1` 个，省掉每个包一次的循环与唤醒。
+/// 不支持 `try_recv_from` 的通道（默认实现返回 None）照旧逐个处理。
+fn drain(engine: &mut Engine, channel: Option<&dyn Datagrams>, buf: &mut [u8]) {
+    let Some(channel) = channel else { return };
+    for _ in 1..RECV_BATCH {
+        match channel.try_recv_from(buf) {
+            Ok(Some((n, from))) => engine.incoming(&mut buf[..n], from),
+            Ok(None) => break,
+            Err(err) => {
+                // 错误留给下一次 recv_from 处理（会丢弃通道）
+                log::debug!("wireguard: channel try_recv error: {err}");
+                break;
+            }
+        }
     }
 }
 
@@ -1787,14 +1829,20 @@ async fn run(
                 None => return,
             },
             got = recv(v4.as_deref(), &mut buf4) => match got {
-                Ok((n, from)) => engine.incoming(&mut buf4[..n], from),
+                Ok((n, from)) => {
+                    engine.incoming(&mut buf4[..n], from);
+                    drain(&mut engine, v4.as_deref(), &mut buf4);
+                }
                 Err(err) => {
                     log::debug!("wireguard: channel error: {err}");
                     engine.wires.v4 = None;
                 }
             },
             got = recv(v6.as_deref(), &mut buf6) => match got {
-                Ok((n, from)) => engine.incoming(&mut buf6[..n], from),
+                Ok((n, from)) => {
+                    engine.incoming(&mut buf6[..n], from);
+                    drain(&mut engine, v6.as_deref(), &mut buf6);
+                }
                 Err(err) => {
                     log::debug!("wireguard: channel error: {err}");
                     engine.wires.v6 = None;
