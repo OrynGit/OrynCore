@@ -175,7 +175,7 @@ pub fn handle_datagram(ctx: &Rc<EngineCtx>, dg: UdpDatagram) {
         crate::perf::add(&crate::perf::SYNTH_UDP_BYTES, dg.payload.len() as u64);
         return;
     }
-    if ctx.is_dns_target(dg.dst.ip(), dg.dst.port()) {
+    if ctx.is_dns_target(false, dg.dst.ip(), dg.dst.port()) {
         handle_dns(ctx, dg);
         return;
     }

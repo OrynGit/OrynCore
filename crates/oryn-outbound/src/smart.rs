@@ -559,7 +559,7 @@ impl Dialer for FamilyDialer {
         })?;
         let start = Instant::now();
         let result =
-            tokio::time::timeout(Duration::from_secs(3), tokio::net::TcpStream::connect(addr))
+            tokio::time::timeout(Duration::from_secs(3), oryn_udp::iface::connect_tcp(addr))
                 .await
                 .unwrap_or_else(|_| {
                     Err(io::Error::new(

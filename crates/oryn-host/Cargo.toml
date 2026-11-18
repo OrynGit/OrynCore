@@ -1,0 +1,13 @@
+[package]
+name = "oryn-host"
+description = "桌面独立核心的平台宿主层：TUN 创建、地址 / 路由设置与还原、默认接口监测（不被数据面依赖）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+oryn-config.workspace = true
+oryn-udp.workspace = true
+libc.workspace = true
+log.workspace = true

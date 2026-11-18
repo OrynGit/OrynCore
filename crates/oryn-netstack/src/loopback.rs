@@ -110,7 +110,7 @@ mod tests {
     fn verify(bytes: &[u8], pseudo: &[u8]) {
         let mut all = pseudo.to_vec();
         all.extend_from_slice(bytes);
-        if all.len() % 2 != 0 {
+        if !all.len().is_multiple_of(2) {
             all.push(0);
         }
         let mut value: u64 = all

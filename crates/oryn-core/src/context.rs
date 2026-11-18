@@ -138,9 +138,9 @@ const MAX_MITM_BYPASS: usize = 256;
 
 impl EngineCtx {
     pub fn desktop_reload_compile(&self) -> bool {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         { self.options.resource_profile == crate::options::ResourceProfile::DesktopHigh }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         { false }
     }
 
@@ -285,12 +285,14 @@ impl EngineCtx {
         id
     }
 
-    pub fn is_dns_target(&self, ip: IpAddr, port: u16) -> bool {
-        port == 53
+    /// 发往隧道内 DNS 地址的 53 端口，或命中宿主设置的 `dns-hijack`，交给内置 DNS。
+    pub fn is_dns_target(&self, tcp: bool, ip: IpAddr, port: u16) -> bool {
+        let builtin = port == 53
             && match ip {
                 IpAddr::V4(v4) => v4 == self.options.dns_address,
                 IpAddr::V6(v6) => v6.to_ipv4_mapped() == Some(self.options.dns_address),
-            }
+            };
+        builtin || self.options.dns_hijack().iter().any(|h| h.matches(tcp, ip, port))
     }
 
     pub fn validate_virtual_interface(&self, config: &RuntimeConfig) -> Result<(), String> {

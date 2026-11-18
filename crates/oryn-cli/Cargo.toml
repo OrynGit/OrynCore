@@ -1,0 +1,28 @@
+[package]
+name = "oryn-cli"
+description = "桌面独立核心 oryn：读取配置、启动 Engine、处理信号，Linux 上创建 TUN"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "oryn"
+path = "src/main.rs"
+
+[dependencies]
+oryn-core.workspace = true
+oryn-config.workspace = true
+oryn-host.workspace = true
+oryn-udp.workspace = true
+libc.workspace = true
+log.workspace = true
+serde_json.workspace = true
+
+[features]
+# 全部协议默认编入，与 oryn-ffi 一致
+default = ["hysteria2", "tuic", "wireguard", "quic"]
+quic = ["oryn-core/quic"]
+hysteria2 = ["oryn-core/hysteria2"]
+tuic = ["oryn-core/tuic"]
+wireguard = ["oryn-core/wireguard"]

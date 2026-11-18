@@ -23,7 +23,7 @@ const DNS_TCP_IDLE: Duration = Duration::from_secs(30);
 /// 额度不足时连接（lwIP 已完成握手）进入有界等待队列，等额度释放后继续；队列满或等待超时才 RST。
 pub fn admit(ctx: Rc<EngineCtx>, stream: LwipTcpStream) -> Option<impl std::future::Future<Output = ()>> {
     let destination = stream.destination();
-    let dns = ctx.is_dns_target(destination.ip(), destination.port());
+    let dns = ctx.is_dns_target(true, destination.ip(), destination.port());
     let mut tcp_permit = if dns { None } else { ctx.admission.try_tcp() };
     let dns_permit = if dns { ctx.admission.try_dns() } else { None };
     let wait_slot = if !dns && tcp_permit.is_none() { ctx.admission.try_wait_slot() } else { None };
