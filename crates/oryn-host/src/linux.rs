@@ -8,6 +8,7 @@ use std::ffi::CString;
 use std::io;
 use std::net::IpAddr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -282,7 +283,8 @@ pub struct Tunnel {
 }
 
 impl Tunnel {
-    pub fn open(settings: &TunSettings, routing_mark: Option<u32>) -> io::Result<Tunnel> {
+    /// `_state_dir` 在 Linux 上不用：规则按优先级、路由按表号即可找回并清理。
+    pub fn open(settings: &TunSettings, routing_mark: Option<u32>, _state_dir: &Path) -> io::Result<Tunnel> {
         let requested = settings.device.as_deref().unwrap_or(DEFAULT_DEVICE);
         // 先建设备：同名设备被另一个实例占用时在这里失败，不会误删它的规则
         let (fd, name) = create_tun(requested)?;
