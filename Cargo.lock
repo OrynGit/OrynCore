@@ -2779,6 +2779,7 @@ name = "oryn-wireguard"
 version = "0.0.1"
 dependencies = [
  "boringtun",
+ "libc",
  "log",
  "oryn-config",
  "oryn-udp",
