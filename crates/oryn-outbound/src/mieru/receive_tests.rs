@@ -27,8 +27,11 @@ impl Peer {
         let (input, rx) = mpsc::channel(RECV_WINDOW);
         // 小桥接使慢应用的额外容量可精确核算；直接驱动产品 run。
         let (app, mut bridge) = tokio::io::duplex(64);
+        let slots = Arc::new(Semaphore::new(1));
+        let permit = slots.clone().try_acquire_owned().unwrap();
+        // limit=32 复现旧「满节点」窗口预算（active = 32 − 0），保持这些用例的预算语义。
         let task = tokio::spawn(async move {
-            run(&carrier, 1, vec![], &mut bridge, rx, &Semaphore::new(0)).await
+            run(&carrier, 1, vec![], &mut bridge, rx, &slots, 32, permit).await
         });
         let mut peer = Self {
             input,

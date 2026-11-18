@@ -30,8 +30,6 @@ pub const RECV_WINDOW: usize = 1024;
 /// 所以一个节点缓存的乱序数据不超过约 2 MiB。
 pub const MIN_RECV_WINDOW: usize = 64;
 pub const RECV_BUDGET: usize = 2048;
-/// 每个节点同时活跃的会话上限（与 `slots` 信号量一致）。
-pub const MAX_SESSIONS: usize = 32;
 pub fn bad(s: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, s)
 }

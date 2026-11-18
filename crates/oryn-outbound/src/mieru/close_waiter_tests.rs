@@ -39,7 +39,7 @@ async fn repeated_cancel_open_cannot_accumulate_unbounded_waiters() {
     let slots = Arc::new(Semaphore::new(1));
     for id in 1..=33 {
         let permit = slots.clone().try_acquire_owned().unwrap();
-        drop(open(carrier.clone(), id, vec![], permit, slots.clone()));
+        drop(open(carrier.clone(), id, vec![], permit, slots.clone(), 1));
         for _ in 0..4 {
             tokio::task::yield_now().await;
         }

@@ -58,6 +58,7 @@ async fn tcp_slow_session_blocks_peer_until_drop() {
             vec![],
             slots.clone().acquire_owned().await.unwrap(),
             slots.clone(),
+            2,
         );
         let mut b = super::super::session::open(
             carrier.clone(),
@@ -65,6 +66,7 @@ async fn tcp_slow_session_blocks_peer_until_drop() {
             vec![],
             slots.clone().acquire_owned().await.unwrap(),
             slots.clone(),
+            2,
         );
         // 先确认 B 的完整解码/交付路径可用，排除启动未调度造成的假阻塞。
         peer.write_all(&codec.encode(&Frame::new(7, 2, 0, vec![0x42])).unwrap())

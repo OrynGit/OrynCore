@@ -861,6 +861,7 @@ pub fn build(
         direct_resolver: ctx.direct_resolver.clone(),
         direct_dialer: Arc::new(crate::DirectDialer::new(ctx.direct_resolver.clone())),
         data_dir: None,
+        mieru_sessions: ctx.mieru_sessions,
     };
     let mut candidates = Vec::new();
     for (&index, outbound) in group.members.iter().zip(members) {
@@ -1915,6 +1916,7 @@ mod integration {
             direct_resolver: Arc::new(LocalDns),
             health: Arc::new(crate::HealthStore::default()),
             selections: HashMap::new(),
+            mieru_sessions: 64,
         };
         let built = crate::build_outbounds(&config, &ctx);
         let group = built.iter().find(|o| o.tag() == "Auto").unwrap();
@@ -1937,6 +1939,7 @@ mod integration {
             direct_resolver: Arc::new(LocalDns),
             health: Arc::new(crate::HealthStore::default()),
             selections: HashMap::new(),
+            mieru_sessions: 64,
         }
     }
     fn smart_of(built: &[Arc<dyn Outbound>]) -> Arc<Smart> {
@@ -2103,6 +2106,7 @@ rules: ['MATCH,Auto']",
             direct_resolver: Arc::new(LocalDns),
             health: Arc::new(crate::HealthStore::default()),
             selections: HashMap::new(),
+            mieru_sessions: 64,
         };
         let first = crate::build_outbounds(&config("Before", port), &ctx);
         let group = first.iter().find(|o| o.tag() == "Auto").unwrap();
@@ -2144,6 +2148,7 @@ rules: ['MATCH,Auto']",
             direct_resolver: Arc::new(LocalDns),
             health: Arc::new(crate::HealthStore::default()),
             selections: HashMap::new(),
+            mieru_sessions: 64,
         };
         let config=oryn_config::parse_config("proxy-groups:\n - name: Auto\n   type: smart\n   proxies: [DIRECT]\n   smart:\n     services:\n      - id: account\n        domains: [login.example, api.example]\n").unwrap();
         let built = crate::build_outbounds(&config, &ctx);

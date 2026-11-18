@@ -139,9 +139,13 @@ const MAX_MITM_BYPASS: usize = 256;
 impl EngineCtx {
     pub fn desktop_reload_compile(&self) -> bool {
         #[cfg(any(target_os = "macos", target_os = "linux"))]
-        { self.options.resource_profile == crate::options::ResourceProfile::DesktopHigh }
+        {
+            self.options.resource_profile == crate::options::ResourceProfile::DesktopHigh
+        }
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        { false }
+        {
+            false
+        }
     }
 
     pub fn mitm_bypassed(&self, host: &str, port: u16) -> bool {
@@ -162,7 +166,11 @@ impl EngineCtx {
         if map.len() >= MAX_MITM_BYPASS {
             map.retain(|_, at| at.elapsed() < MITM_BYPASS_TTL);
             if map.len() >= MAX_MITM_BYPASS {
-                if let Some(oldest) = map.iter().min_by_key(|(_, at)| **at).map(|(k, _)| k.clone()) {
+                if let Some(oldest) = map
+                    .iter()
+                    .min_by_key(|(_, at)| **at)
+                    .map(|(k, _)| k.clone())
+                {
                     map.remove(&oldest);
                 }
             }
@@ -183,17 +191,24 @@ impl EngineCtx {
         ));
         dns.set_target_ipv6(options.ipv6_support, options.prefer_ipv6);
         dns.set_proxy_prefer_ipv6(options.proxy_prefer_ipv6);
-        dns.set_real_ip_domains(&options.real_ip_domains).expect("validated real IP domains");
+        dns.set_real_ip_domains(&options.real_ip_domains)
+            .expect("validated real IP domains");
         dns.set_data_dir(options.data_dir.as_deref());
         dns.set_network(options.network.to_info());
         options.network.apply_interface();
         let limits = options.resource_profile.limits();
-        log::info!("engine resource profile {:?}: {:?}", options.resource_profile, limits);
+        log::info!(
+            "engine resource profile {:?}: {:?}",
+            options.resource_profile,
+            limits
+        );
         oryn_outbound::wireguard_resources::configure(oryn_outbound::wireguard_resources::Limits {
             buffer_budget: limits.wg_buffer_budget,
             workers: limits.wg_workers,
         });
-        oryn_outbound::wireguard_resources::set_pressure(oryn_outbound::wireguard_resources::Pressure::Normal);
+        oryn_outbound::wireguard_resources::set_pressure(
+            oryn_outbound::wireguard_resources::Pressure::Normal,
+        );
         let ctx = EngineCtx {
             admission: crate::admission::Admission::new(options.resource_profile),
             iperf: Rc::new(crate::iperf::Manager::default()),
@@ -206,10 +221,18 @@ impl EngineCtx {
             selection_revision: Cell::new(0),
             mode_revision: Cell::new(0),
             script_host: Arc::new(crate::scripts::ScriptHost::new(options.data_dir.as_deref())),
-            http_transactions: limits.http_transactions.map(tokio::sync::Semaphore::new).map(Arc::new),
+            http_transactions: limits
+                .http_transactions
+                .map(tokio::sync::Semaphore::new)
+                .map(Arc::new),
             http_bodies: Arc::new(tokio::sync::Semaphore::new(limits.http_bodies)),
-            http_connections: limits.http_connections.map(tokio::sync::Semaphore::new).map(Arc::new),
-            http_upstream_establish: Arc::new(tokio::sync::Semaphore::new(limits.http_upstream_establish)),
+            http_connections: limits
+                .http_connections
+                .map(tokio::sync::Semaphore::new)
+                .map(Arc::new),
+            http_upstream_establish: Arc::new(tokio::sync::Semaphore::new(
+                limits.http_upstream_establish,
+            )),
             mitm_bypass: RefCell::new(HashMap::new()),
             stack,
             dns,
@@ -297,13 +320,28 @@ impl EngineCtx {
                 IpAddr::V4(v4) => v4 == self.options.dns_address,
                 IpAddr::V6(v6) => v6.to_ipv4_mapped() == Some(self.options.dns_address),
             };
-        builtin || self.options.dns_hijack().iter().any(|h| h.matches(tcp, ip, port))
+        builtin
+            || self
+                .options
+                .dns_hijack()
+                .iter()
+                .any(|h| h.matches(tcp, ip, port))
     }
 
     pub fn validate_virtual_interface(&self, config: &RuntimeConfig) -> Result<(), String> {
-        let next = self.options.virtual_interface.compile(config.dns.fake_ip_range, self.options.dns_address)?;
-        let current = self.options.virtual_interface.compile(self.state().config.dns.fake_ip_range, self.options.dns_address)?;
-        if next != current { return Err("virtual interface routes changed; reconnect to apply this configuration".into()); }
+        let next = self
+            .options
+            .virtual_interface
+            .compile(config.dns.fake_ip_range, self.options.dns_address)?;
+        let current = self.options.virtual_interface.compile(
+            self.state().config.dns.fake_ip_range,
+            self.options.dns_address,
+        )?;
+        if next != current {
+            return Err(
+                "virtual interface routes changed; reconnect to apply this configuration".into(),
+            );
+        }
         Ok(())
     }
 
@@ -360,7 +398,12 @@ impl EngineCtx {
         }
         let mut plans = plans.into_iter().peekable();
         let mut plan = HttpPlan::default();
-        for (index, spec) in config.modules.iter_mut().enumerate().filter(|(_, m)| m.enabled) {
+        for (index, spec) in config
+            .modules
+            .iter_mut()
+            .enumerate()
+            .filter(|(_, m)| m.enabled)
+        {
             if let Some(ir) = &spec.inline {
                 // allowed 已执行；只有 prepare 接受的同一份 spec 才能携带 Plan。
                 while plans.peek().is_some_and(|(i, _)| *i < index) {
@@ -477,6 +520,7 @@ impl EngineCtx {
             direct_resolver: Arc::new(DirectTargetResolver(self.dns.clone())),
             health: health.clone(),
             selections: self.selections.borrow().clone(),
+            mieru_sessions: self.options.resource_profile.limits().mieru_sessions,
         };
         // 配置切换前终止旧身份的数据面，不让旧 Flow 跨身份继续运行。
         for session in &self.state().sessions {
@@ -541,8 +585,8 @@ impl EngineCtx {
 fn empty_state(config: &RuntimeConfig) -> RuntimeState {
     // 占位状态只供首次 apply_config 校验接口计划及继承空 health/session 使用；
     // 不为尚未生效的用户规则构造 Router，也不复制整份节点/规则两次。
-    let mut placeholder = oryn_config::parse_config("rules: ['MATCH,REJECT']")
-        .expect("static placeholder config");
+    let mut placeholder =
+        oryn_config::parse_config("rules: ['MATCH,REJECT']").expect("static placeholder config");
     placeholder.dns.fake_ip_range = config.dns.fake_ip_range;
     let store = Arc::new(RuleSetStore::new(&[]));
     let router = Router::new(&placeholder, store.clone(), Arc::new(GeoIp::default()));

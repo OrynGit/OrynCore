@@ -291,6 +291,7 @@ fn attach_routing(e: &Arc<DnsEngine>, cfg: &RuntimeConfig) -> Arc<Routing> {
         direct_resolver: Arc::new(DirectTargetResolver(e.clone())),
         health: Arc::new(HealthStore::default()),
         selections: Default::default(),
+        mieru_sessions: 64,
     };
     let routing = Arc::new(Routing {
         outbounds: build_outbounds(cfg, &ctx),

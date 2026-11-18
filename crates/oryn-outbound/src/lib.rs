@@ -170,6 +170,8 @@ pub struct BuildContext {
     pub health: Arc<HealthStore>,
     /// select 策略组的已保存选择：策略组名称 → 成员名称。
     pub selections: HashMap<String, String>,
+    /// 单个 Mieru 节点的活跃会话上限（资源档位化，见 issue #5）。
+    pub mieru_sessions: usize,
 }
 
 /// 创建叶子出站所需的依赖。Smart 为每个服务器地址族传入受限的拨号器与解析器，
@@ -179,6 +181,7 @@ pub(crate) struct LeafDeps<'a> {
     pub direct_resolver: Arc<dyn Resolver>,
     pub direct_dialer: Arc<DirectDialer>,
     pub data_dir: Option<&'a std::path::Path>,
+    pub mieru_sessions: usize,
 }
 
 /// 创建一个非策略组出站（含 SS / Trojan / VLESS / VMess 的多路复用包装）；策略组返回 `None`。
@@ -312,6 +315,7 @@ pub(crate) fn build_leaf(
             deps.proxy_resolver.clone(),
             deps.direct_resolver.clone(),
             datagrams.clone(),
+            deps.mieru_sessions,
         ),
         OutboundKind::Snell(spec) => snell::SnellOutbound::new(
             name,
@@ -469,6 +473,7 @@ pub fn build_outbounds_with_data_dir(
             direct_resolver: ctx.direct_resolver.clone(),
             direct_dialer: direct_dialer.clone(),
             data_dir,
+            mieru_sessions: ctx.mieru_sessions,
         };
         let o: Arc<dyn Outbound> = match &spec.kind {
             OutboundKind::Group(g) => {

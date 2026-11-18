@@ -28,11 +28,17 @@ pub enum ResourceProfile {
 impl Default for ResourceProfile {
     fn default() -> Self {
         #[cfg(target_os = "macos")]
-        { Self::Constrained }
+        {
+            Self::Constrained
+        }
         #[cfg(target_os = "ios")]
-        { Self::MobilePlus }
+        {
+            Self::MobilePlus
+        }
         #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-        { Self::Constrained }
+        {
+            Self::Constrained
+        }
     }
 }
 
@@ -52,6 +58,9 @@ pub(crate) struct ResourceLimits {
     pub wg_buffer_budget: usize,
     /// WG 引擎工作线程数。
     pub wg_workers: usize,
+    /// 单个 Mieru 节点同时活跃的会话上限（官方实现无上限；每会话净内存 ~0.1 MB，
+    /// 档位只按引擎准入额度对齐，见 issue #5）。
+    pub mieru_sessions: usize,
 }
 
 impl ResourceProfile {
@@ -90,9 +99,18 @@ impl ResourceProfile {
             },
             wg_workers: match self {
                 #[cfg(any(target_os = "macos", target_os = "linux"))]
-                Self::DesktopHigh => std::thread::available_parallelism()
-                    .map_or(1, |n| (n.get() / 2).clamp(1, 4)),
+                Self::DesktopHigh => {
+                    std::thread::available_parallelism().map_or(1, |n| (n.get() / 2).clamp(1, 4))
+                }
                 _ => 1,
+            },
+            // Constrained 与引擎 active=Some(64) 对齐：会话提到 64 以上才不会被引擎准入挡住。
+            mieru_sessions: match self {
+                Self::Constrained => 64,
+                #[cfg(target_os = "ios")]
+                Self::MobilePlus => 256,
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                Self::DesktopHigh => 512,
             },
         }
     }
