@@ -1,6 +1,6 @@
 //! `oryn`：不依赖 App 的桌面独立核心。
 //!
-//! - `oryn run -c config.yaml [-d 数据目录]`：启动 Engine。`tun.enable` 为 true 时（目前仅 Linux）
+//! - `oryn run -c config.yaml [-d 数据目录]`：启动 Engine。`tun.enable` 为 true 时（Linux / macOS）
 //!   由 `oryn-host` 创建 TUN 并设置路由，Core 直接收发 TUN 上的 IP 包；否则只开本地 HTTP /
 //!   SOCKS5 入站（与 `oryn_engine_start_proxy` 相同）。`SIGINT` / `SIGTERM` 退出并还原路由，
 //!   `SIGHUP` 重新读取配置并用控制命令 `reload` 热重载。
@@ -238,10 +238,11 @@ fn block_signals() -> mpsc::Receiver<Signal> {
 
 fn run(args: &Args, signals: mpsc::Receiver<Signal>) -> Result<(), String> {
     let (_, desktop, mut engine) = load(args)?;
+    let state_dir = data_dir(args)?;
     // 先建 TUN 与路由，再设出站防回环，最后启动 Engine：Core 启动期间的下载已经带标记 / 绑定
     let tunnel = match &desktop.tun {
         Some(tun) => Some(
-            oryn_host::Tunnel::open(tun, desktop.effective_routing_mark())
+            oryn_host::Tunnel::open(tun, desktop.effective_routing_mark(), &state_dir)
                 .map_err(|e| format!("TUN setup failed: {e}"))?,
         ),
         None => None,
