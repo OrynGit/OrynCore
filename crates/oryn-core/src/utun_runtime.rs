@@ -1,6 +1,7 @@
 //! Engine 事件循环中的可选 utun I/O 驱动。
 
-#[cfg(test)]
+// 用 utun 帧格式测试，只在 utun 平台运行。
+#[cfg(all(test, not(any(target_os = "android", target_os = "linux"))))]
 #[path = "utun_runtime_tests.rs"]
 mod tests;
 
@@ -13,7 +14,9 @@ use tokio::io::unix::AsyncFd;
 
 #[cfg(target_os = "android")]
 type PlatformPacketIo = oryn_netstack::AndroidTunPacketIo;
-#[cfg(not(target_os = "android"))]
+#[cfg(target_os = "linux")]
+type PlatformPacketIo = oryn_netstack::LinuxTunPacketIo;
+#[cfg(not(any(target_os = "android", target_os = "linux")))]
 type PlatformPacketIo = oryn_netstack::UtunPacketIo;
 
 const MAX_PENDING_PACKETS: usize = 4096;

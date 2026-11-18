@@ -1282,7 +1282,8 @@ pub(crate) fn apply_inspection_overlay(
 #[path = "compile_offload_tests.rs"]
 mod compile_offload_tests;
 
-#[cfg(test)]
+// 用 utun 帧格式测试，只在 utun 平台运行。
+#[cfg(all(test, not(any(target_os = "android", target_os = "linux"))))]
 mod utun_tests {
     include!("utun_direct_measurement.rs");
     use super::*;

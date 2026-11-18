@@ -29,6 +29,7 @@ oryn-mitm = { path = "crates/oryn-mitm" }
 oryn-jq = { path = "crates/oryn-jq" }
 oryn-script = { path = "crates/oryn-script" }
 oryn-http-inspect = { path = "crates/oryn-http-inspect" }
+oryn-host = { path = "crates/oryn-host" }
 
 async-trait = "0.1"
 libc = "0.2"

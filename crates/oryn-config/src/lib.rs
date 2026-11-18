@@ -9,6 +9,7 @@ pub mod links;
 pub mod singbox;
 pub use encryption::{EncryptionMode, EncryptionPadding, VlessEncryptionSpec};
 mod cidr;
+pub mod desktop;
 pub mod domain;
 mod mieru_pattern;
 mod model;

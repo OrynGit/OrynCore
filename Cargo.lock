@@ -2428,6 +2428,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
+name = "oryn-cli"
+version = "0.0.1"
+dependencies = [
+ "libc",
+ "log",
+ "oryn-config",
+ "oryn-core",
+ "oryn-host",
+ "oryn-udp",
+ "serde_json",
+]
+
+[[package]]
 name = "oryn-config"
 version = "0.0.1"
 dependencies = [
@@ -2522,6 +2535,16 @@ dependencies = [
  "oryn-mitm",
  "oryn-udp",
  "serde_json",
+]
+
+[[package]]
+name = "oryn-host"
+version = "0.0.1"
+dependencies = [
+ "libc",
+ "log",
+ "oryn-config",
+ "oryn-udp",
 ]
 
 [[package]]

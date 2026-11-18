@@ -8,7 +8,7 @@ use oryn_config::Mode;
 use oryn_dns::{NetworkInfo, NetworkKind};
 use serde::Deserialize;
 
-/// 创建时固定的资源政策；桌面额度只能由 macOS 宿主显式选择。
+/// 创建时固定的资源政策；桌面额度只能由 macOS 宿主或 Linux 桌面核心 `oryn` 显式选择。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResourceProfile {
@@ -17,7 +17,7 @@ pub enum ResourceProfile {
     #[cfg(target_os = "ios")]
     #[serde(rename = "mobile_plus")]
     MobilePlus,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[serde(rename = "desktop_high")]
     DesktopHigh,
 }
@@ -56,7 +56,7 @@ impl ResourceProfile {
             Self::Constrained => (Some(64), 8, Some(32), 512),
             #[cfg(target_os = "ios")]
             Self::MobilePlus => (Some(640), 64, Some(256), 512),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             Self::DesktopHigh => (None, 48, None, 2048),
         };
         ResourceLimits {
@@ -116,6 +116,11 @@ pub struct EngineOptions {
     pub virtual_interface: crate::virtual_interface::VirtualInterfaceOptions,
     /// App 开启诊断日志时指定的级别，覆盖配置文件里的 `log-level`。
     pub log_level: Option<String>,
+    /// 桌面核心 `tun.dns-hijack`（mihomo 写法，如 `any:53`）：命中的流量交给内置 DNS。
+    /// App 宿主不传。
+    pub dns_hijack: Vec<String>,
+    #[serde(skip)]
+    pub(crate) dns_hijack_compiled: Vec<oryn_config::desktop::DnsHijack>,
 }
 
 impl Default for EngineOptions {
@@ -143,6 +148,8 @@ impl Default for EngineOptions {
             local_proxy: LocalProxyOptions::default(),
             virtual_interface: Default::default(),
             log_level: None,
+            dns_hijack: Vec::new(),
+            dns_hijack_compiled: Vec::new(),
         }
     }
 }
@@ -158,7 +165,19 @@ impl EngineOptions {
             maxmind.validate()?;
         }
         options.real_ip_domains = oryn_dns::normalize_real_ip_domains(&options.real_ip_domains)?;
+        if options.dns_hijack.len() > 256 {
+            return Err("invalid engine options: more than 256 dns_hijack entries".into());
+        }
+        options.dns_hijack_compiled = options
+            .dns_hijack
+            .iter()
+            .map(|h| oryn_config::desktop::parse_dns_hijack(h))
+            .collect::<Result<_, _>>()?;
         Ok(options)
+    }
+
+    pub fn dns_hijack(&self) -> &[oryn_config::desktop::DnsHijack] {
+        &self.dns_hijack_compiled
     }
 
     pub fn mode(&self) -> Option<Mode> {
@@ -286,5 +305,8 @@ mod tests {
         );
         assert_eq!(info.ipv6, Some(false));
         assert!(EngineOptions::parse(b"{bad").is_err());
+        let o = EngineOptions::parse(br#"{"dns_hijack":["any:53","tcp://1.1.1.1:5353"]}"#).unwrap();
+        assert_eq!(o.dns_hijack().len(), 2);
+        assert!(EngineOptions::parse(br#"{"dns_hijack":["quic://any:53"]}"#).is_err());
     }
 }

@@ -1,7 +1,7 @@
-//! Android `VpnService` 的普通 TUN packet I/O。
+//! 纯 IP 包的 TUN packet I/O：Android `VpnService` 与 Linux `/dev/net/tun`（`IFF_NO_PI`）。
 //!
-//! Android TUN fd 的每次读写都是一个纯 IPv4/IPv6 packet，不带 Apple utun 的
-//! 4 字节 address-family 头。本模块不负责 VPN 授权、socket protect 或 JNI。
+//! 这两种 TUN fd 的每次读写都是一个纯 IPv4/IPv6 packet，不带 Apple utun 的
+//! 4 字节 address-family 头。本模块不负责 TUN 创建、VPN 授权、socket protect 或 JNI。
 
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};

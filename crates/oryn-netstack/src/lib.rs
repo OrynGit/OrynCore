@@ -14,6 +14,8 @@ mod tcp;
 pub mod utun;
 
 pub use android_tun::AndroidTunPacketIo;
+/// Linux `/dev/net/tun`（`IFF_TUN | IFF_NO_PI`）每次读写也是一个纯 IP 包，与 Android 共用实现。
+pub type LinuxTunPacketIo = AndroidTunPacketIo;
 pub use packet_io::PacketIo;
 pub use utun::{IpVersion, UtunPacketIo};
 
