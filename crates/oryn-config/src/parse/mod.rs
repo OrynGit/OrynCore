@@ -204,7 +204,9 @@ fn parse_hosts(root: &Yaml, b: &mut Builder) -> Vec<HostEntry> {
     const MAX_HOSTS: usize = 4096;
     for (key, value) in crate::yaml::entries(hosts) {
         if out.len() >= MAX_HOSTS {
-            b.warn(format!("hosts: more than {MAX_HOSTS} entries; the rest are ignored"));
+            b.warn(format!(
+                "hosts: more than {MAX_HOSTS} entries; the rest are ignored"
+            ));
             break;
         }
         let Some(pattern) = DomainPattern::parse(&key) else {

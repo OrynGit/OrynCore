@@ -318,7 +318,9 @@ impl Gateway {
                     }
                     // 只是这个目标的数据报转发失败（如目标不可达），按 UDP 语义丢弃，
                     // 不能把整个网关通道（最多 64 个目标）一起报废
-                    log::debug!("ssh udpgw: gateway could not forward a datagram for connection {id}");
+                    log::debug!(
+                        "ssh udpgw: gateway could not forward a datagram for connection {id}"
+                    );
                 }
                 Frame::Data(id, target, payload) => {
                     let peers = self.shared.peers.lock().unwrap();
@@ -413,7 +415,10 @@ impl PacketConn for Gateway {
         // 写超时不致命：Writer 保留了已发送进度，下一次发送先补完这一帧，帧边界不会错位；
         // 真正卡死的通道由保活任务的超时判定。参数错误同样只影响这一个数据报。
         if result.as_ref().is_err_and(|e| {
-            !matches!(e.kind(), io::ErrorKind::InvalidInput | io::ErrorKind::TimedOut)
+            !matches!(
+                e.kind(),
+                io::ErrorKind::InvalidInput | io::ErrorKind::TimedOut
+            )
         }) {
             self.shared.fail();
         }

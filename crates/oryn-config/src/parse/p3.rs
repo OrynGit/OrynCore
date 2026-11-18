@@ -596,6 +596,7 @@ fn wireguard(p: &Yaml, name: &str, b: &mut Builder) -> Result<Option<OutboundKin
             }
         }
     };
+    let tcp_buffers = wg_tcp_buffers(p, name)?;
     Ok(Some(OutboundKind::WireGuard(WireGuardSpec {
         peers,
         private_key,
@@ -608,7 +609,30 @@ fn wireguard(p: &Yaml, name: &str, b: &mut Builder) -> Result<Option<OutboundKin
         dns,
         amnezia: amnezia(p, name, b)?,
         refresh_secs,
+        tcp_buffers,
     })))
+}
+
+/// `tcp-rx-buffer` / `tcp-tx-buffer` / `tcp-buffer-budget`（Oryn 扩展，字节）。超出范围时整份配置失败。
+fn wg_tcp_buffers(p: &Yaml, name: &str) -> Result<WireGuardTcpBuffers, ConfigError> {
+    type B = WireGuardTcpBuffers;
+    let size = |key: &str, default: usize, min: usize, max: usize| -> Result<usize, ConfigError> {
+        match get(p, key) {
+            None => Ok(default),
+            Some(_) => match int_of(p, key) {
+                Some(n) if n >= min as i64 && n <= max as i64 => Ok(n as usize),
+                _ => Err(error(
+                    name,
+                    &format!("{key} must be an integer from {min} to {max}"),
+                )),
+            },
+        }
+    };
+    let rx = size("tcp-rx-buffer", B::RX_DEFAULT, B::RX_MIN, B::BUFFER_MAX)?;
+    let tx = size("tcp-tx-buffer", B::TX_DEFAULT, B::TX_MIN, B::BUFFER_MAX)?;
+    let default_budget = (B::DEFAULT_CONNECTIONS * (rx + tx)).min(B::BUDGET_MAX);
+    let budget = size("tcp-buffer-budget", default_budget, rx + tx, B::BUDGET_MAX)?;
+    Ok(B { rx, tx, budget })
 }
 
 /// AmneziaWG 1.0 的 `jc/jmin/jmax/s1/s2/h1..h4`。1.5 / 2.0 的 `i1`–`i5` 等字段忽略并警告。

@@ -1230,6 +1230,52 @@ fn wireguard_peers_amnezia_and_refresh() {
     assert!(wg(&format!("{single}, refresh-server-ip-interval: 86401")).is_err());
 }
 
+#[test]
+fn wireguard_tcp_buffers() {
+    let single = format!(
+        "server: a.example, port: 51820, public-key: {WG_KEY_A}, allowed-ips: ['10.0.0.0/24']"
+    );
+    // 缺省：64 / 32 KiB，预算为 64 条全尺寸连接
+    assert_eq!(
+        wg(&single).unwrap().tcp_buffers,
+        WireGuardTcpBuffers {
+            rx: 65536,
+            tx: 32768,
+            budget: 64 * 98304
+        }
+    );
+    // 只改单连接大小时，缺省预算随之放大，但不超过 64 MiB
+    let b = wg(&format!(
+        "{single}, tcp-rx-buffer: 262144, tcp-tx-buffer: 131072"
+    ))
+    .unwrap()
+    .tcp_buffers;
+    assert_eq!((b.rx, b.tx, b.budget), (262144, 131072, 64 * 393216));
+    let b = wg(&format!(
+        "{single}, tcp-rx-buffer: 4194304, tcp-tx-buffer: 4194304"
+    ))
+    .unwrap()
+    .tcp_buffers;
+    assert_eq!(b.budget, 64 * 1024 * 1024);
+    let b = wg(&format!(
+        "{single}, tcp-rx-buffer: 262144, tcp-buffer-budget: 8388608"
+    ))
+    .unwrap()
+    .tcp_buffers;
+    assert_eq!((b.rx, b.tx, b.budget), (262144, 32768, 8388608));
+    for bad in [
+        "tcp-rx-buffer: 16383",
+        "tcp-rx-buffer: 4194305",
+        "tcp-tx-buffer: 8191",
+        "tcp-tx-buffer: '64K'",
+        "tcp-buffer-budget: 98303",
+        "tcp-buffer-budget: 67108865",
+        "tcp-rx-buffer: 262144, tcp-buffer-budget: 200000",
+    ] {
+        assert!(wg(&format!("{single}, {bad}")).is_err(), "{bad}");
+    }
+}
+
 fn kind_of(proxy: &str) -> Result<OutboundKind, ConfigError> {
     let c = parse_config(&format!("proxies: [{{name: P, {proxy}}}]"))?;
     let index = c.outbound_index("P").ok_or(ConfigError("ignored".into()))?;
@@ -1565,14 +1611,28 @@ fn naive_and_ssh() {
 #[test]
 fn ech_rejects_silently_ignored_security_combinations() {
     let base = "type: vless, server: e.example, port: 443, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, tls: true";
-    for ech in ["ech-config: AQIDBA==", "ech-opts: {enable: true, config: AQIDBA==}"] {
+    for ech in [
+        "ech-config: AQIDBA==",
+        "ech-opts: {enable: true, config: AQIDBA==}",
+    ] {
         for skip in [false, true] {
             let pin = "11".repeat(32);
-            let result = kind_of(&format!("{base}, {ech}, fingerprint: '{pin}', skip-cert-verify: {skip}"));
-            assert!(result.is_err(), "ECH must not silently ignore certificate fingerprint");
+            let result = kind_of(&format!(
+                "{base}, {ech}, fingerprint: '{pin}', skip-cert-verify: {skip}"
+            ));
+            assert!(
+                result.is_err(),
+                "ECH must not silently ignore certificate fingerprint"
+            );
         }
-        assert!(kind_of(&format!("{base}, {ech}, network: quic")).is_err(), "QUIC must not silently ignore ECH");
-        assert!(kind_of(&format!("{base}, {ech}")).is_ok(), "ordinary ECH remains accepted");
+        assert!(
+            kind_of(&format!("{base}, {ech}, network: quic")).is_err(),
+            "QUIC must not silently ignore ECH"
+        );
+        assert!(
+            kind_of(&format!("{base}, {ech}")).is_ok(),
+            "ordinary ECH remains accepted"
+        );
     }
     assert!(kind_of(&format!("{base}, network: quic")).is_ok());
 }
@@ -1622,7 +1682,13 @@ proxies:
 fn xhttp_payload_placement_matches_mihomo_separately_from_metadata() {
     let base = "type: vless, server: example.test, port: 443, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, tls: true, network: xhttp";
     for placement in ["query", "path"] {
-        assert!(kind_of(&format!("{base}, xhttp-opts: {{mode: packet-up, uplink-data-placement: {placement}}}")).is_err(), "unsupported payload placement {placement} must be rejected");
+        assert!(
+            kind_of(&format!(
+                "{base}, xhttp-opts: {{mode: packet-up, uplink-data-placement: {placement}}}"
+            ))
+            .is_err(),
+            "unsupported payload placement {placement} must be rejected"
+        );
     }
     for placement in ["body", "auto", "header", "cookie"] {
         assert!(kind_of(&format!("{base}, xhttp-opts: {{mode: packet-up, uplink-data-placement: {placement}, session-placement: query, seq-placement: query}}")).is_ok(), "valid payload {placement} and metadata query remain supported");
@@ -2179,7 +2245,10 @@ modules:
     assert!(warned("policy PROXY is not defined"), "{:?}", c.warnings);
     assert!(warned("MATCH/FINAL rule ignored"), "{:?}", c.warnings);
     assert!(warned("invalid Host pattern"), "{:?}", c.warnings);
-    assert_eq!(c.mitm.hostnames, ["a.test", "c.test", "main.test", "b.test"]);
+    assert_eq!(
+        c.mitm.hostnames,
+        ["a.test", "c.test", "main.test", "b.test"]
+    );
     assert_eq!(c.force_http_hosts, ["x.test"]);
 }
 

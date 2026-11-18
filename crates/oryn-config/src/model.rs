@@ -682,6 +682,38 @@ pub struct WireGuardSpec {
     pub amnezia: Option<AmneziaSpec>,
     /// 定期重新解析对端域名的间隔（秒）。
     pub refresh_secs: Option<u64>,
+    /// 隧道内 TCP 的缓冲与合计预算（Oryn 扩展）。
+    pub tcp_buffers: WireGuardTcpBuffers,
+}
+
+/// WireGuard 隧道内 smoltcp TCP 的缓冲：`tcp-rx-buffer`、`tcp-tx-buffer`、`tcp-buffer-budget`（字节）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WireGuardTcpBuffers {
+    pub rx: usize,
+    pub tx: usize,
+    /// 本出站全部 TCP 连接的接收 + 发送缓冲合计上限。
+    pub budget: usize,
+}
+
+impl WireGuardTcpBuffers {
+    pub const RX_DEFAULT: usize = 64 * 1024;
+    pub const TX_DEFAULT: usize = 32 * 1024;
+    pub const RX_MIN: usize = 16 * 1024;
+    pub const TX_MIN: usize = 8 * 1024;
+    pub const BUFFER_MAX: usize = 4 * 1024 * 1024;
+    pub const BUDGET_MAX: usize = 64 * 1024 * 1024;
+    /// 默认预算容纳的全尺寸连接数（与隧道内 TCP 套接字上限一致）。
+    pub const DEFAULT_CONNECTIONS: usize = 64;
+}
+
+impl Default for WireGuardTcpBuffers {
+    fn default() -> Self {
+        Self {
+            rx: Self::RX_DEFAULT,
+            tx: Self::TX_DEFAULT,
+            budget: Self::DEFAULT_CONNECTIONS * (Self::RX_DEFAULT + Self::TX_DEFAULT),
+        }
+    }
 }
 
 /// mihomo Tailscale 节点；enabled 是默认关闭的 Oryn 扩展。

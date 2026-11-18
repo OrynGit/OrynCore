@@ -749,11 +749,7 @@ impl VisionStream {
 impl VisionStream {
     // 写侧状态（is_padding / direct_write / write_uuid）在出错前可能已推进、部分字节已上线，
     // 出错后重试会重复发送，所以任何写错误都把整条流置为失败（与 VMess 编码失败的语义一致）。
-    fn write_inner(
-        &mut self,
-        cx: &mut Context<'_>,
-        data: &[u8],
-    ) -> Poll<io::Result<usize>> {
+    fn write_inner(&mut self, cx: &mut Context<'_>, data: &[u8]) -> Poll<io::Result<usize>> {
         let this = self;
         ready!(this.poll_drain(cx))?;
         if data.is_empty() {

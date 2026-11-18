@@ -442,9 +442,18 @@ pub fn build_outbounds_with_data_dir(
         }
         visiting[i] = true;
         // dialer-proxy：TCP 经另一个出站的 connect_tcp，UDP 经它的 bind_udp
-        let chain: Option<Arc<dyn Outbound>> = spec
-            .dialer
-            .map(|d| build_one(d, config, ctx, proxy_dialer, direct_dialer, built, visiting, data_dir));
+        let chain: Option<Arc<dyn Outbound>> = spec.dialer.map(|d| {
+            build_one(
+                d,
+                config,
+                ctx,
+                proxy_dialer,
+                direct_dialer,
+                built,
+                visiting,
+                data_dir,
+            )
+        });
         let dialer: Arc<dyn Dialer> = match &chain {
             Some(outbound) => Arc::new(chain::ChainDialer(outbound.clone())),
             None => proxy_dialer.clone(),
@@ -465,7 +474,16 @@ pub fn build_outbounds_with_data_dir(
                     .members
                     .iter()
                     .map(|&m| {
-                        build_one(m, config, ctx, proxy_dialer, direct_dialer, built, visiting, data_dir)
+                        build_one(
+                            m,
+                            config,
+                            ctx,
+                            proxy_dialer,
+                            direct_dialer,
+                            built,
+                            visiting,
+                            data_dir,
+                        )
                     })
                     .collect();
                 let smart = if g.kind == oryn_config::GroupKind::Smart {

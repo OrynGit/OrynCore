@@ -496,7 +496,8 @@ impl Snapshot {
             }
             if next["HomeParams"].is_null() {
                 next["HomeParams"] = self.derp["HomeParams"].clone();
-            } else if next["HomeParams"].is_object() && next["HomeParams"]["RegionScore"].is_null() {
+            } else if next["HomeParams"].is_object() && next["HomeParams"]["RegionScore"].is_null()
+            {
                 next["HomeParams"]["RegionScore"] = self.derp["HomeParams"]["RegionScore"].clone();
             }
             self.derp = next;
@@ -716,14 +717,23 @@ mod tests {
     #[test]
     fn peer_derp_region_patch_updates_compiled_route_and_zero_is_noop() {
         let mut s = Snapshot::default();
-        s.apply(json!({"Node":node(1,"own.test"),"Peers":[node(2,"peer.test")]})).unwrap();
+        s.apply(json!({"Node":node(1,"own.test"),"Peers":[node(2,"peer.test")]}))
+            .unwrap();
         assert_eq!(s.peers[0].derp, 1);
         let generation = s.generation;
-        assert_eq!(s.apply(json!({"PeersChangedPatch":[{"NodeID":2,"DERPRegion":7}]})).unwrap(), Change::Hard);
+        assert_eq!(
+            s.apply(json!({"PeersChangedPatch":[{"NodeID":2,"DERPRegion":7}]}))
+                .unwrap(),
+            Change::Hard
+        );
         assert_eq!(s.peers[0].derp, 7);
         assert_eq!(s.generation, generation + 1);
         assert_eq!(s.raw[&2]["HomeDERP"], 7);
-        assert_eq!(s.apply(json!({"PeersChangedPatch":[{"NodeID":2,"DERPRegion":0}]})).unwrap(), Change::None);
+        assert_eq!(
+            s.apply(json!({"PeersChangedPatch":[{"NodeID":2,"DERPRegion":0}]}))
+                .unwrap(),
+            Change::None
+        );
         assert_eq!(s.peers[0].derp, 7);
     }
 
@@ -733,12 +743,17 @@ mod tests {
         let mut peer = node(2, "peer.test");
         peer["KeyExpiry"] = json!("2099-01-01T00:00:00Z");
         peer["Endpoints"] = json!(["192.0.2.1:1234"]);
-        s.apply(json!({"Node":node(1,"own.test"),"Peers":[peer]})).unwrap();
+        s.apply(json!({"Node":node(1,"own.test"),"Peers":[peer]}))
+            .unwrap();
         let before = s.peers[0].clone();
         assert_eq!(s.apply(json!({"PeersChangedPatch":[{"NodeID":2,"KeyExpiry":null,"Endpoints":null,"Key":null}]})).unwrap(), Change::None);
         assert_eq!(s.peers[0].expiry, before.expiry);
         assert_eq!(s.peers[0].endpoints, before.endpoints);
-        assert_eq!(s.apply(json!({"PeersChangedPatch":[{"NodeID":2,"Endpoints":[]}]})).unwrap(), Change::Hard);
+        assert_eq!(
+            s.apply(json!({"PeersChangedPatch":[{"NodeID":2,"Endpoints":[]}]}))
+                .unwrap(),
+            Change::Hard
+        );
         assert!(s.peers[0].endpoints.is_empty());
     }
 
@@ -748,19 +763,27 @@ mod tests {
         s.apply(json!({"Node":node(1,"own.test"),"DERPMap":{
             "Regions":{"1":{"Nodes":[{"HostName":"derp.example"}]}},
             "OmitDefaultRegions":true,"HomeParams":{"RegionScore":{"1":0.5}}
-        }})).unwrap();
+        }}))
+        .unwrap();
         let generation = s.generation;
         assert!(s.regions.contains_key(&1));
         s.apply(json!({"DERPMap":{"HomeParams":{}}})).unwrap();
-        assert!(s.regions.contains_key(&1), "partial update must retain DERP endpoints");
+        assert!(
+            s.regions.contains_key(&1),
+            "partial update must retain DERP endpoints"
+        );
         assert_eq!(s.derp["HomeParams"]["RegionScore"]["1"], 0.5);
         assert_eq!(s.derp["OmitDefaultRegions"], true);
         assert_eq!(s.generation, generation);
-        s.apply(json!({"DERPMap":{"Regions":null,"HomeParams":null}})).unwrap();
+        s.apply(json!({"DERPMap":{"Regions":null,"HomeParams":null}}))
+            .unwrap();
         assert!(s.regions.contains_key(&1));
         assert_eq!(s.derp["HomeParams"]["RegionScore"]["1"], 0.5);
         s.apply(json!({"DERPMap":{"Regions":{}}})).unwrap();
-        assert!(s.regions.is_empty(), "explicit empty map must replace old regions");
+        assert!(
+            s.regions.is_empty(),
+            "explicit empty map must replace old regions"
+        );
         assert_eq!(s.derp["HomeParams"]["RegionScore"]["1"], 0.5);
         assert_eq!(s.generation, generation + 1);
     }
@@ -782,16 +805,21 @@ mod tests {
     #[test]
     fn online_and_dns_changes_are_soft_routes_and_acl_are_hard() {
         let mut s = Snapshot::default();
-        let allow_all = json!([{"SrcIPs":["*"],"DstPorts":[{"IP":"*","Ports":{"First":0,"Last":65535}}]}]);
+        let allow_all =
+            json!([{"SrcIPs":["*"],"DstPorts":[{"IP":"*","Ports":{"First":0,"Last":65535}}]}]);
         assert_eq!(
             s.apply(json!({"Node":node(1,"oryn.example.ts.net."),"Peers":[node(2,"peer.example.ts.net.")],"PacketFilter":allow_all})).unwrap(),
             Change::Hard
         );
         let generation = s.generation;
         // 对端上下线与 DNS 配置变化只是软变化，不换代
-        assert_eq!(s.apply(json!({"OnlineChange":{"2":false}})).unwrap(), Change::Soft);
         assert_eq!(
-            s.apply(json!({"DNSConfig":{"Resolvers":[{"Addr":"100.64.0.2"}]}})).unwrap(),
+            s.apply(json!({"OnlineChange":{"2":false}})).unwrap(),
+            Change::Soft
+        );
+        assert_eq!(
+            s.apply(json!({"DNSConfig":{"Resolvers":[{"Addr":"100.64.0.2"}]}}))
+                .unwrap(),
             Change::Soft
         );
         assert_eq!(s.apply(json!({"KeepAlive":true})).unwrap(), Change::None);

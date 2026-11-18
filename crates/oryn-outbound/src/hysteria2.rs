@@ -283,7 +283,10 @@ impl Hysteria2Outbound {
             let _ = self.quic.disable_brutal();
             return;
         }
-        let configured = self.spec.up_bps.expect("Brutal requires configured upload rate");
+        let configured = self
+            .spec
+            .up_bps
+            .expect("Brutal requires configured upload rate");
         let server = value.parse::<u64>().unwrap_or(0);
         let negotiated = if server == 0 {
             configured

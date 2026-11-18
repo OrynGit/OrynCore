@@ -523,7 +523,10 @@ pub(super) fn tls(p: &Yaml, name: &str, required: bool) -> Result<Option<TlsSpec
     }
     let ech = parse_ech(p, name)?;
     if ech.is_some() && fingerprint.is_some() {
-        return Err(error(name, "ECH cannot be combined with a certificate fingerprint"));
+        return Err(error(
+            name,
+            "ECH cannot be combined with a certificate fingerprint",
+        ));
     }
     if ech.is_some() && client_fingerprint.is_some() {
         return Err(error(
@@ -1118,10 +1121,7 @@ fn xhttp_spec(p: &Yaml, name: &str) -> Result<XHttpSpec, ConfigError> {
     };
     let placement = |key: &str, default: &str| -> Result<String, ConfigError> {
         let value = text_opt(key, default)?.to_ascii_lowercase();
-        if !matches!(
-            value.as_str(),
-            "header" | "cookie" | "body" | "auto"
-        ) {
+        if !matches!(value.as_str(), "header" | "cookie" | "body" | "auto") {
             return Err(error(name, "unsupported XHTTP uplink data placement"));
         }
         Ok(value)

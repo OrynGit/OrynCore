@@ -20,7 +20,10 @@ mod yaml;
 
 pub use addr::TargetAddr;
 pub use cidr::IpCidr;
-pub use domain::{glob_match, hostname_matches, listed_host_matches, normalize_domain, suffix_match, DomainPattern, ListedPort};
+pub use domain::{
+    glob_match, hostname_matches, listed_host_matches, normalize_domain, suffix_match,
+    DomainPattern, ListedPort,
+};
 pub use model::*;
 pub use parse::{
     parse_config, parse_config_with, parse_rule_body, parse_rule_item, proxy_provider_nodes,
@@ -42,6 +45,6 @@ impl std::error::Error for ConfigError {}
 #[cfg(test)]
 mod tests;
 
-pub use parse::modules::merge as merge_module_patches;
 /// Router / DNS 编译正则前用：`\d` / `\w` 换成 ASCII 类（见 `oryn_module::regex_ascii_classes`）。
 pub use oryn_module::{compile_regex, regex_ascii_classes, CompactRegex};
+pub use parse::modules::merge as merge_module_patches;

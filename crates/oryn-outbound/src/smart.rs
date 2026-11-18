@@ -266,10 +266,7 @@ impl Smart {
                                 self.spec.server_strategy,
                                 ServerStrategy::V4Only | ServerStrategy::V6Only
                             )))
-                    && state
-                        .paths
-                        .get(&keys[*i].0)
-                        .is_none_or(|p| p.eligible(now))
+                    && state.paths.get(&keys[*i].0).is_none_or(|p| p.eligible(now))
             })
             .map(|(i, c)| {
                 let path = &keys[i].0;
@@ -298,9 +295,7 @@ impl Smart {
                     };
                 let d = carrier
                     .and_then(|s| s.delay)
-                    .or_else(|| {
-                        state.probes.get(path).and_then(|p| p.delay)
-                    })
+                    .or_else(|| state.probes.get(path).and_then(|p| p.delay))
                     .unwrap_or(300.0);
                 let j = carrier.map_or(0.0, |s| s.jitter);
                 let preferred = matches!(
@@ -360,13 +355,10 @@ impl Smart {
                     .iter()
                     .min_by(|(a, _), (b, _)| {
                         let evidence = |i: usize| {
-                            state
-                                .targets
-                                .get(&keys[i].1)
-                                .map_or(0.0, |s| {
-                                    let (a, b) = s.values(now, &t);
-                                    a + b
-                                })
+                            state.targets.get(&keys[i].1).map_or(0.0, |s| {
+                                let (a, b) = s.values(now, &t);
+                                a + b
+                            })
                         };
                         evidence(*a).total_cmp(&evidence(*b))
                     })
@@ -559,12 +551,12 @@ impl Dialer for FamilyDialer {
                     .map(|(_, _, addr)| addr)
             }
         }
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::AddrNotAvailable,
-                    "no eligible server address for requested family",
-                )
-            })?;
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "no eligible server address for requested family",
+            )
+        })?;
         let start = Instant::now();
         let result =
             tokio::time::timeout(Duration::from_secs(3), tokio::net::TcpStream::connect(addr))
@@ -1557,7 +1549,11 @@ mod tests {
                     assert!(picked.is_some());
                     nanos.push(elapsed);
                 }
-                let expected = if case == 0 { prefill + SAMPLES } else { MAX_LEASES };
+                let expected = if case == 0 {
+                    prefill + SAMPLES
+                } else {
+                    MAX_LEASES
+                };
                 assert_eq!(smart.state.lock().unwrap().leases.len(), expected);
                 assert_eq!(calls.load(Ordering::SeqCst), 0);
                 nanos.sort_unstable();
@@ -1572,8 +1568,13 @@ mod tests {
         for case in 0..3 {
             medians[case].sort_unstable();
             tails[case].sort_unstable();
-            println!("smart summary case={} rounds={} median_of_medians_ns={} median_of_p99_ns={}",
-                labels[case], ROUNDS, medians[case][ROUNDS / 2], tails[case][ROUNDS / 2]);
+            println!(
+                "smart summary case={} rounds={} median_of_medians_ns={} median_of_p99_ns={}",
+                labels[case],
+                ROUNDS,
+                medians[case][ROUNDS / 2],
+                tails[case][ROUNDS / 2]
+            );
         }
     }
 

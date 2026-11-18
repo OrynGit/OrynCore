@@ -670,10 +670,10 @@ impl Outbound for StreamProxyOutbound {
         Ok(
             if matches!(self.spec.packet_encoding, PacketEncoding::PacketAddr) {
                 Box::new(crate::packet_encoding::PacketAddrConn {
-                        inner: conn,
-                        magic,
-                        scratch: crate::RecvScratch::new(),
-                    })
+                    inner: conn,
+                    magic,
+                    scratch: crate::RecvScratch::new(),
+                })
             } else {
                 conn
             },
@@ -731,7 +731,11 @@ impl PacketReader {
                     ));
                 }
                 if self.pending.len() >= header + len {
-                    let n = crate::copy_datagram(&self.pending[header..header + len], buf, "Trojan/VLESS");
+                    let n = crate::copy_datagram(
+                        &self.pending[header..header + len],
+                        buf,
+                        "Trojan/VLESS",
+                    );
                     self.pending.drain(..header + len);
                     return Ok((n, addr));
                 }
@@ -857,18 +861,34 @@ mod tests {
             }
         }
         let config = oryn_config::parse_config("proxies:\n  - {name: test, type: vless, server: example.test, port: 443, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, tls: true, network: quic}").unwrap();
-        let (mut spec, uuid) = config.outbounds.iter().find_map(|o| match &o.kind {
-            oryn_config::OutboundKind::Vless { stream, uuid } => Some((stream.clone(), *uuid)),
-            _ => None,
-        }).unwrap();
-        let SecuritySpec::Tls(tls) = &mut spec.security else { panic!() };
+        let (mut spec, uuid) = config
+            .outbounds
+            .iter()
+            .find_map(|o| match &o.kind {
+                oryn_config::OutboundKind::Vless { stream, uuid } => Some((stream.clone(), *uuid)),
+                _ => None,
+            })
+            .unwrap();
+        let SecuritySpec::Tls(tls) = &mut spec.security else {
+            panic!()
+        };
         // 模拟绕过 YAML 解析、直接构造 RuntimeConfig 的调用方。
-        tls.ech = Some(oryn_config::EchSpec { config: vec![1, 2, 3, 4] });
-        let out = StreamProxyOutbound::new("test".into(), spec, StreamProtocol::Vless(uuid),
+        tls.ech = Some(oryn_config::EchSpec {
+            config: vec![1, 2, 3, 4],
+        });
+        let out = StreamProxyOutbound::new(
+            "test".into(),
+            spec,
+            StreamProtocol::Vless(uuid),
             Arc::new(crate::DirectDialer::new(Arc::new(NoDns))),
-            Arc::new(oryn_udp::UdpFactory), Arc::new(NoDns));
+            Arc::new(oryn_udp::UdpFactory),
+            Arc::new(NoDns),
+        );
         let result = out.open_quic(out.quic.as_ref().unwrap(), b"initial").await;
-        let err = match result { Err(e) => e, Ok(_) => panic!("ECH ignored") };
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("ECH ignored"),
+        };
         assert_eq!(err.kind(), io::ErrorKind::Unsupported);
         assert!(err.to_string().contains("ECH"));
     }
@@ -921,9 +941,15 @@ mod tests {
                 )
             })
             .await;
-            assert!(result.is_ok(), "trojan={trojan}: cancelled frame tail was lost");
+            assert!(
+                result.is_ok(),
+                "trojan={trojan}: cancelled frame tail was lost"
+            );
             result.unwrap().unwrap();
-            assert_eq!(received, expected, "trojan={trojan}: frame boundary corrupted");
+            assert_eq!(
+                received, expected,
+                "trojan={trojan}: frame boundary corrupted"
+            );
         }
     }
 
