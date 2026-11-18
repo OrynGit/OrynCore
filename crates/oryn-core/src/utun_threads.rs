@@ -78,13 +78,17 @@ fn lookup_batch(name: &str) -> Option<BatchFn> {
 fn batch_unsupported(errno: i32) -> bool {
     matches!(
         errno,
-        libc::ENOTSUP | libc::EOPNOTSUPP | libc::ENOSYS | libc::EINVAL | libc::ENOTSOCK
+        // ENOTSUP 与 EOPNOTSUPP 同值，列一个即可
+        libc::ENOTSUP | libc::ENOSYS | libc::EINVAL | libc::ENOTSOCK
     )
 }
 
 /// 描述符本身失效、必须结束数据面的错误；其余错误（缓冲不足、瞬时失败等）只计数并继续。
 fn fatal_errno(code: i32) -> bool {
-    matches!(code, libc::EBADF | libc::ENOTCONN | libc::ENXIO | libc::ENODEV | libc::ENOTSOCK)
+    matches!(
+        code,
+        libc::EBADF | libc::ENOTCONN | libc::ENXIO | libc::ENODEV | libc::ENOTSOCK
+    )
 }
 
 fn note_error(code: i32) {
@@ -181,7 +185,11 @@ impl UtunThreads {
             rx_ready: Notify::new(),
             rx_space: Condvar::new(),
             rx_pool: Mutex::new(Vec::new()),
-            tx: Mutex::new(TxQueue { packets: VecDeque::new(), bytes: 0, idle: false }),
+            tx: Mutex::new(TxQueue {
+                packets: VecDeque::new(),
+                bytes: 0,
+                idle: false,
+            }),
             tx_ready: Condvar::new(),
             tx_done: Mutex::new(Vec::new()),
             frame_cap: (mtu as usize + 64).clamp(2048, 65_535 + 64),
@@ -208,7 +216,11 @@ impl UtunThreads {
                     .map_err(|e| io::Error::other(format!("failed to spawn {name}: {e}")))?,
             );
         }
-        Ok(Self { shared, current: Vec::new(), threads })
+        Ok(Self {
+            shared,
+            current: Vec::new(),
+            threads,
+        })
     }
 
     /// 等待读线程交来一批包，返回包数。读线程出错时返回该错误。
@@ -227,7 +239,12 @@ impl UtunThreads {
             {
                 let mut queue = self.shared.rx.lock().unwrap();
                 if !queue.frames.is_empty() {
-                    perf::sample_depth(&perf::UQ_SUM, &perf::UQ_N, &perf::UQ_MAX, queue.frames.len() as u64);
+                    perf::sample_depth(
+                        &perf::UQ_SUM,
+                        &perf::UQ_N,
+                        &perf::UQ_MAX,
+                        queue.frames.len() as u64,
+                    );
                     std::mem::swap(&mut self.current, &mut queue.frames);
                     drop(queue);
                     self.shared.rx_space.notify_one();
@@ -294,7 +311,13 @@ impl Drop for UtunThreads {
         self.shared.stop.store(true, Relaxed);
         // 叫醒 poll 中的读 / 写线程以及等待条件变量的线程
         let byte = 1u8;
-        unsafe { libc::write(self.shared.wake_write.as_raw_fd(), (&byte as *const u8).cast(), 1) };
+        unsafe {
+            libc::write(
+                self.shared.wake_write.as_raw_fd(),
+                (&byte as *const u8).cast(),
+                1,
+            )
+        };
         self.shared.rx_space.notify_all();
         {
             let _guard = self.shared.tx.lock().unwrap();
@@ -309,8 +332,16 @@ impl Drop for UtunThreads {
 /// 在 `fd` 上等待事件，同时监听停止管道。返回 false 表示应当退出。
 fn wait_fd(shared: &Shared, events: libc::c_short, timeout_ms: libc::c_int) -> io::Result<bool> {
     let mut fds = [
-        libc::pollfd { fd: shared.fd.as_raw_fd(), events, revents: 0 },
-        libc::pollfd { fd: shared.wake_read.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+        libc::pollfd {
+            fd: shared.fd.as_raw_fd(),
+            events,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: shared.wake_read.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
     ];
     loop {
         let rc = unsafe { libc::poll(fds.as_mut_ptr(), 2, timeout_ms) };
@@ -325,7 +356,10 @@ fn wait_fd(shared: &Shared, events: libc::c_short, timeout_ms: libc::c_int) -> i
 }
 
 fn thread_cpu() -> u64 {
-    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
     if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) } != 0 {
         return 0;
     }
@@ -348,12 +382,22 @@ fn read_frames(
         let mut iov: [libc::iovec; BATCH] = unsafe { std::mem::zeroed() };
         let mut hdrs: [MsgHdrX; BATCH] = unsafe { std::mem::zeroed() };
         for i in 0..want {
-            iov[i] = libc::iovec { iov_base: bufs[i].as_mut_ptr().cast(), iov_len: cap };
+            iov[i] = libc::iovec {
+                iov_base: bufs[i].as_mut_ptr().cast(),
+                iov_len: cap,
+            };
             hdrs[i].msg_iov = &mut iov[i];
             hdrs[i].msg_iovlen = 1;
         }
         let start = Instant::now();
-        let n = unsafe { call(fd, hdrs.as_mut_ptr(), want as libc::c_uint, libc::MSG_DONTWAIT) };
+        let n = unsafe {
+            call(
+                fd,
+                hdrs.as_mut_ptr(),
+                want as libc::c_uint,
+                libc::MSG_DONTWAIT,
+            )
+        };
         perf::add(&perf::RX_NS, perf::since(start));
         perf::add(&perf::RX_CALLS, 1);
         if n >= 0 {
@@ -393,7 +437,10 @@ fn read_frames(
     let mut count = 0;
     while count < want {
         let buf = &mut bufs[count];
-        let mut iov = libc::iovec { iov_base: buf.as_mut_ptr().cast(), iov_len: cap };
+        let mut iov = libc::iovec {
+            iov_base: buf.as_mut_ptr().cast(),
+            iov_len: cap,
+        };
         let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
         msg.msg_iov = &mut iov;
         msg.msg_iovlen = 1;
@@ -415,7 +462,11 @@ fn read_frames(
             note_error(code);
             break;
         }
-        let len = if msg.msg_flags & libc::MSG_TRUNC != 0 { 0 } else { n as usize };
+        let len = if msg.msg_flags & libc::MSG_TRUNC != 0 {
+            0
+        } else {
+            n as usize
+        };
         unsafe { buf.set_len(len) };
         count += 1;
     }
@@ -448,15 +499,33 @@ fn reader(shared: Arc<Shared>) {
             {
                 let mut queue = shared.rx.lock().unwrap();
                 while queue.frames.len() >= RX_QUEUE_MAX && !shared.stopped() {
-                    queue = shared.rx_space.wait_timeout(queue, Duration::from_millis(20)).unwrap().0;
+                    queue = shared
+                        .rx_space
+                        .wait_timeout(queue, Duration::from_millis(20))
+                        .unwrap()
+                        .0;
                 }
             }
             if perf::debug_enabled() {
                 // 内核 utun 控制套接字接收缓冲里等着我们取走的包数（SO_NUMRCVPKT = 0x1112）
                 let mut pending: libc::c_int = 0;
                 let mut len = std::mem::size_of_val(&pending) as libc::socklen_t;
-                if unsafe { libc::getsockopt(fd, libc::SOL_SOCKET, 0x1112, (&mut pending as *mut libc::c_int).cast(), &mut len) } == 0 {
-                    perf::sample_depth(&perf::KQ_SUM, &perf::KQ_N, &perf::KQ_MAX, pending.max(0) as u64);
+                if unsafe {
+                    libc::getsockopt(
+                        fd,
+                        libc::SOL_SOCKET,
+                        0x1112,
+                        (&mut pending as *mut libc::c_int).cast(),
+                        &mut len,
+                    )
+                } == 0
+                {
+                    perf::sample_depth(
+                        &perf::KQ_SUM,
+                        &perf::KQ_N,
+                        &perf::KQ_MAX,
+                        pending.max(0) as u64,
+                    );
                 }
             }
             let received = match read_frames(fd, &mut bufs, cap, &mut batch_fn) {
@@ -519,7 +588,12 @@ fn writer(shared: Arc<Shared>) {
             if shared.stopped() {
                 break;
             }
-            perf::sample_depth(&perf::TQ_SUM, &perf::TQ_N, &perf::TQ_MAX, queue.packets.len() as u64);
+            perf::sample_depth(
+                &perf::TQ_SUM,
+                &perf::TQ_N,
+                &perf::TQ_MAX,
+                queue.packets.len() as u64,
+            );
             let take = queue.packets.len().min(BATCH);
             for _ in 0..take {
                 let packet = queue.packets.pop_front().unwrap();
@@ -547,27 +621,48 @@ fn heartbeat(shared: Arc<Shared>) {
     while !shared.stopped() {
         let _ = wait_fd_timeout(&shared, 250);
         seq += 1;
-        let rx_len = shared.rx.try_lock().map(|q| q.frames.len() as i64).unwrap_or(-1);
-        let (tx_len, tx_idle) = shared.tx.try_lock().map(|q| (q.packets.len() as i64, q.idle)).unwrap_or((-1, false));
+        let rx_len = shared
+            .rx
+            .try_lock()
+            .map(|q| q.frames.len() as i64)
+            .unwrap_or(-1);
+        let (tx_len, tx_idle) = shared
+            .tx
+            .try_lock()
+            .map(|q| (q.packets.len() as i64, q.idle))
+            .unwrap_or((-1, false));
         let mut value = perf::snapshot();
         value["seq"] = seq.into();
         value["rx_queue"] = rx_len.into();
         value["tx_queue"] = tx_len.into();
         value["tx_idle"] = tx_idle.into();
-        value["error"] = shared.error.try_lock().map(|e| e.as_ref().map(|e| e.to_string())).unwrap_or(None).into();
+        value["error"] = shared
+            .error
+            .try_lock()
+            .map(|e| e.as_ref().map(|e| e.to_string()))
+            .unwrap_or(None)
+            .into();
         let _ = std::fs::write(&path, value.to_string());
     }
 }
 
 /// 只睡眠，被停止管道叫醒时提前返回。
 fn wait_fd_timeout(shared: &Shared, ms: libc::c_int) -> io::Result<()> {
-    let mut fds = [libc::pollfd { fd: shared.wake_read.as_raw_fd(), events: libc::POLLIN, revents: 0 }];
+    let mut fds = [libc::pollfd {
+        fd: shared.wake_read.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    }];
     unsafe { libc::poll(fds.as_mut_ptr(), 1, ms) };
     Ok(())
 }
 
 fn af_header(packet: &[u8]) -> [u8; AF_HEADER_LEN] {
-    let af = if packet[0] >> 4 == 6 { libc::AF_INET6 } else { libc::AF_INET };
+    let af = if packet[0] >> 4 == 6 {
+        libc::AF_INET6
+    } else {
+        libc::AF_INET
+    };
     (af as u32).to_be_bytes()
 }
 
@@ -585,20 +680,35 @@ fn send_batch(
         }
         if let Some(call) = *batch_fn {
             let count = (batch.len() - index).min(BATCH);
-            let headers: Vec<[u8; AF_HEADER_LEN]> =
-                batch[index..index + count].iter().map(|p| af_header(p)).collect();
+            let headers: Vec<[u8; AF_HEADER_LEN]> = batch[index..index + count]
+                .iter()
+                .map(|p| af_header(p))
+                .collect();
             let mut iov: [libc::iovec; BATCH * 2] = unsafe { std::mem::zeroed() };
             let mut hdrs: [MsgHdrX; BATCH] = unsafe { std::mem::zeroed() };
             for i in 0..count {
                 let packet = &batch[index + i];
-                iov[2 * i] = libc::iovec { iov_base: headers[i].as_ptr().cast_mut().cast(), iov_len: AF_HEADER_LEN };
-                iov[2 * i + 1] = libc::iovec { iov_base: packet.as_ptr().cast_mut().cast(), iov_len: packet.len() };
+                iov[2 * i] = libc::iovec {
+                    iov_base: headers[i].as_ptr().cast_mut().cast(),
+                    iov_len: AF_HEADER_LEN,
+                };
+                iov[2 * i + 1] = libc::iovec {
+                    iov_base: packet.as_ptr().cast_mut().cast(),
+                    iov_len: packet.len(),
+                };
                 hdrs[i].msg_iov = &mut iov[2 * i];
                 hdrs[i].msg_iovlen = 2;
                 hdrs[i].msg_datalen = AF_HEADER_LEN + packet.len();
             }
             let start = Instant::now();
-            let n = unsafe { call(fd, hdrs.as_mut_ptr(), count as libc::c_uint, libc::MSG_DONTWAIT) };
+            let n = unsafe {
+                call(
+                    fd,
+                    hdrs.as_mut_ptr(),
+                    count as libc::c_uint,
+                    libc::MSG_DONTWAIT,
+                )
+            };
             perf::add(&perf::TX_NS, perf::since(start));
             perf::add(&perf::TX_CALLS, 1);
             if n > 0 {
@@ -653,8 +763,14 @@ fn send_batch(
 fn send_one(shared: &Shared, fd: RawFd, packet: &[u8]) -> io::Result<Sent> {
     let header = af_header(packet);
     let mut iov = [
-        libc::iovec { iov_base: header.as_ptr().cast_mut().cast(), iov_len: AF_HEADER_LEN },
-        libc::iovec { iov_base: packet.as_ptr().cast_mut().cast(), iov_len: packet.len() },
+        libc::iovec {
+            iov_base: header.as_ptr().cast_mut().cast(),
+            iov_len: AF_HEADER_LEN,
+        },
+        libc::iovec {
+            iov_base: packet.as_ptr().cast_mut().cast(),
+            iov_len: packet.len(),
+        },
     ];
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_iov = iov.as_mut_ptr();
