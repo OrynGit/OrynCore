@@ -1235,42 +1235,36 @@ fn wireguard_tcp_buffers() {
     let single = format!(
         "server: a.example, port: 51820, public-key: {WG_KEY_A}, allowed-ips: ['10.0.0.0/24']"
     );
-    // 缺省：64 / 32 KiB，预算为 64 条全尺寸连接
+    // 缺省：上限 256 / 128 KiB，预算 6 MiB
     assert_eq!(
         wg(&single).unwrap().tcp_buffers,
         WireGuardTcpBuffers {
-            rx: 65536,
-            tx: 32768,
-            budget: 64 * 98304
+            rx: 262144,
+            tx: 131072,
+            budget: 6 * 1024 * 1024
         }
     );
-    // 只改单连接大小时，缺省预算随之放大，但不超过 64 MiB
-    let b = wg(&format!(
-        "{single}, tcp-rx-buffer: 262144, tcp-tx-buffer: 131072"
-    ))
-    .unwrap()
-    .tcp_buffers;
-    assert_eq!((b.rx, b.tx, b.budget), (262144, 131072, 64 * 393216));
+    // 上限之和超过 6 MiB 时，缺省预算至少容纳一条用满上限的连接
     let b = wg(&format!(
         "{single}, tcp-rx-buffer: 4194304, tcp-tx-buffer: 4194304"
     ))
     .unwrap()
     .tcp_buffers;
-    assert_eq!(b.budget, 64 * 1024 * 1024);
+    assert_eq!(b.budget, 8 * 1024 * 1024);
     let b = wg(&format!(
-        "{single}, tcp-rx-buffer: 262144, tcp-buffer-budget: 8388608"
+        "{single}, tcp-rx-buffer: 65536, tcp-buffer-budget: 1048576"
     ))
     .unwrap()
     .tcp_buffers;
-    assert_eq!((b.rx, b.tx, b.budget), (262144, 32768, 8388608));
+    assert_eq!((b.rx, b.tx, b.budget), (65536, 131072, 1048576));
     for bad in [
         "tcp-rx-buffer: 16383",
         "tcp-rx-buffer: 4194305",
         "tcp-tx-buffer: 8191",
         "tcp-tx-buffer: '64K'",
-        "tcp-buffer-budget: 98303",
+        "tcp-buffer-budget: 393215",
         "tcp-buffer-budget: 67108865",
-        "tcp-rx-buffer: 262144, tcp-buffer-budget: 200000",
+        "tcp-rx-buffer: 1048576, tcp-buffer-budget: 1000000",
     ] {
         assert!(wg(&format!("{single}, {bad}")).is_err(), "{bad}");
     }

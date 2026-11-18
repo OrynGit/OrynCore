@@ -93,3 +93,4 @@ shadowsocks = { path = "vendor/shadowsocks" }
 shadowsocks-crypto = { path = "vendor/shadowsocks-crypto" }
 tungstenite = { path = "vendor/tungstenite" }
 rustls = { path = "vendor/rustls" }
+smoltcp = { path = "vendor/smoltcp" }
