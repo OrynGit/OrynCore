@@ -23,4 +23,4 @@ tokio = { workspace = true, features = ["net", "time", "sync", "macros", "rt"] }
 [dev-dependencies]
 rcgen.workspace = true
 rustls.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "io-util"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "io-util", "test-util"] }
