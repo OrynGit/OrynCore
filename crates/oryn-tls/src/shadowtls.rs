@@ -175,8 +175,11 @@ pub async fn connect<S: AsyncRead + AsyncWrite + Unpin>(
     spec: &oryn_config::ShadowTlsSpec,
 ) -> io::Result<Verified<S>> {
     let alpn: Vec<&[u8]> = spec.alpn.iter().map(|a| a.as_bytes()).collect();
-    let mut config = (*cached(&alpn, spec.skip_cert_verify, Versions::Tls13)?).clone();
-    config.resumption = rustls::client::Resumption::disabled();
+    // 允许 TLS 1.3 + TLS 1.2（与 ihciah/shadow-tls 客户端及 sing-shadowtls 一致）：
+    // TLS 1.3 启用时 rustls 总是发送 32 字节 session_id；若握手服务端仅支持 TLS 1.2
+    // （ihciah --v3 默认 lossy 模式），仍可完成认证握手并进入 HMAC 保护的数据中继；
+    // 若协商出 TLS 1.3，则严格校验握手期间服务端修改后的 ApplicationData 标签。
+    let mut config = shadowtls_config(&alpn, spec.skip_cert_verify, Versions::Default)?;
     config.oryn_client_hello = Some(Arc::new(Hello {
         password: spec.password.clone(),
     }));
@@ -196,10 +199,8 @@ pub async fn connect<S: AsyncRead + AsyncWrite + Unpin>(
         .await?;
     tls.flush().await?;
     let (wire, connection) = tls.into_inner();
-    if connection.protocol_version() != Some(rustls::ProtocolVersion::TLSv1_3)
-        || !wire.authorized
-        || wire.position != wire.out.len()
-    {
+    let is_tls13 = connection.protocol_version() == Some(rustls::ProtocolVersion::TLSv1_3);
+    if wire.position != wire.out.len() || (is_tls13 && !wire.authorized) {
         return Err(invalid("ShadowTLS handshake was not authenticated"));
     }
     let random = wire
@@ -209,12 +210,13 @@ pub async fn connect<S: AsyncRead + AsyncWrite + Unpin>(
         stream: wire.stream,
         read: context(&spec.password, &[random.as_slice(), b"S"].concat()),
         write: context(&spec.password, &[random.as_slice(), b"C"].concat()),
-        ignore: wire.hash,
+        ignore: if is_tls13 { wire.hash } else { None },
         wire: Vec::new(),
         payload: Vec::new(),
         position: 0,
         pending: Vec::new(),
         written: 0,
+        eof: false,
         failed: false,
     })
 }
@@ -228,6 +230,7 @@ pub struct Verified<S> {
     position: usize,
     pending: Vec<u8>,
     written: usize,
+    eof: bool,
     failed: bool,
 }
 impl<S: AsyncRead + AsyncWrite + Unpin> Verified<S> {
@@ -267,7 +270,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for Verified<S> {
         self.pending.extend(((n + 4) as u16).to_be_bytes());
         self.pending.extend(mac);
         self.pending.extend_from_slice(&data[..n]);
-        Poll::Ready(Ok(n))
+        // 尽量立刻写出；未写完的留在 pending，下一次写入或 flush 继续，避免调用方不立即 flush 时停滞。
+        match self.drain(cx) {
+            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+            _ => Poll::Ready(Ok(n)),
+        }
     }
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         ready!(self.drain(cx))?;
@@ -284,7 +291,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for Verified<S> {
         cx: &mut Context<'_>,
         out: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        if out.remaining() == 0 {
+        if out.remaining() == 0 || self.eof {
             return Poll::Ready(Ok(()));
         }
         if self.failed {
@@ -301,7 +308,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for Verified<S> {
                 5
             } else {
                 let n = u16::from_be_bytes(self.wire[3..5].try_into().unwrap()) as usize;
-                if !(4..=18436).contains(&n) || self.wire[..3] != [23, 3, 3] {
+                let is_alert = self.wire[0] == 21 && self.wire[1..3] == [3, 3] && n <= 18436;
+                let is_app =
+                    self.wire[..3] == [23, 3, 3] && (4..=18436).contains(&n);
+                if !is_alert && !is_app {
                     self.failed = true;
                     return Poll::Ready(Err(invalid("invalid ShadowTLS record")));
                 }
@@ -309,6 +319,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for Verified<S> {
             };
             if self.wire.len() == need {
                 let wire = std::mem::take(&mut self.wire);
+                // ihciah/shadow-tls 在 TLS 1.2 lossy 模式下关闭连接时会发送 TLS Alert 记录（类型 21），
+                // 按干净 EOF 处理（与 ihciah util.rs / sing-shadowtls v3_conn.go 一致）。
+                if wire[0] == 21 {
+                    self.eof = true;
+                    return Poll::Ready(Ok(()));
+                }
                 if let Some(ignore) = &mut self.ignore {
                     ignore.update(&wire[9..]);
                     if equal(&wire[5..9], &tag(ignore)) {
@@ -347,27 +363,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for Verified<S> {
 // v1 / v2
 // ---------------------------------------------------------------------------
 
-/// v1 / v2 的握手服务端按 TLS 1.2 工作；握手使用真实的证书校验（除非 skip-cert-verify）。
-async fn tls12_handshake<S: AsyncRead + AsyncWrite + Unpin>(
-    stream: S,
-    spec: &oryn_config::ShadowTlsSpec,
-) -> io::Result<S> {
-    let alpn: Vec<&[u8]> = spec.alpn.iter().map(|a| a.as_bytes()).collect();
-    let mut config = (*cached(&alpn, spec.skip_cert_verify, Versions::Tls12)?).clone();
-    config.resumption = rustls::client::Resumption::disabled();
-    let tls = tokio_rustls::TlsConnector::from(Arc::new(config))
-        .connect(server_name(&spec.host)?, stream)
-        .await?;
-    let (stream, _) = tls.into_inner();
-    Ok(stream)
-}
-
-/// v1：TLS 握手完成后，底层连接就是裸的代理流（没有任何记录封装）。
+/// v1 的握手服务端按 TLS 1.2 的 ChangeCipherSpec + Handshake Finished 判断握手结束，固定用 TLS 1.2。
 pub async fn connect_v1<S: AsyncRead + AsyncWrite + Unpin>(
     stream: S,
     spec: &oryn_config::ShadowTlsSpec,
 ) -> io::Result<S> {
-    tls12_handshake(stream, spec).await
+    let alpn: Vec<&[u8]> = spec.alpn.iter().map(|a| a.as_bytes()).collect();
+    let config = shadowtls_config(&alpn, spec.skip_cert_verify, Versions::Tls12)?;
+    let mut tls = tokio_rustls::TlsConnector::from(Arc::new(config))
+        .connect(server_name(&spec.host)?, stream)
+        .await?;
+    tls.flush().await?;
+    let (stream, _) = tls.into_inner();
+    Ok(stream)
 }
 
 /// 对读到的全部字节做 HMAC-SHA1（密钥为密码）。
@@ -406,12 +414,16 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for HashRead<S> {
     }
 }
 
-/// v2：握手期间读到的全部字节的 HMAC 前 8 字节随第一次写出发给服务端作为认证；
-/// 之后双向都是 TLS 应用数据记录（类型 23、版本 TLS 1.2）。
+/// v2：允许 TLS 1.2 与 TLS 1.3（与 ihciah/shadow-tls 客户端一致）；
+/// 握手期间读到的全部字节的 HMAC 前 8 字节随第一次写出发给服务端作为认证；
+/// 之后双向都是 TLS 应用数据记录（类型 23、版本 TLS 1.2），同时过滤握手服务端
+/// 在切换前可能发出的残余 TLS 记录（例如 TLS 1.3 NewSessionTicket）。
 pub async fn connect_v2<S: AsyncRead + AsyncWrite + Unpin>(
     stream: S,
     spec: &oryn_config::ShadowTlsSpec,
 ) -> io::Result<V2Stream<S>> {
+    let alpn: Vec<&[u8]> = spec.alpn.iter().map(|a| a.as_bytes()).collect();
+    let config = shadowtls_config(&alpn, spec.skip_cert_verify, Versions::Default)?;
     let hashed = HashRead {
         stream,
         hmac: hmac::Context::with_key(&hmac::Key::new(
@@ -419,11 +431,19 @@ pub async fn connect_v2<S: AsyncRead + AsyncWrite + Unpin>(
             spec.password.as_bytes(),
         )),
     };
-    let hashed = tls12_handshake(hashed, spec).await?;
+    let mut tls = tokio_rustls::TlsConnector::from(Arc::new(config))
+        .connect(server_name(&spec.host)?, hashed)
+        .await?;
+    tls.flush().await?;
+    let (hashed, connection) = tls.into_inner();
     let sum: [u8; 8] = hashed.hmac.sign().as_ref()[..8].try_into().unwrap();
     Ok(V2Stream {
         stream: hashed.stream,
         sum: Some(sum),
+        session: Some(connection),
+        filter_wire: Vec::new(),
+        filter_payload: Vec::new(),
+        filter_pos: 0,
         header: [0; 5],
         header_len: 0,
         remaining: 0,
@@ -437,6 +457,12 @@ pub struct V2Stream<S> {
     stream: S,
     /// 还没发出的认证摘要，随第一条记录发送。
     sum: Option<[u8; 8]>,
+    /// 握手会话：用于过滤服务端切换前转发的残余 TLS 记录（如 TLS 1.3 NewSessionTicket）；
+    /// 收到第一条非握手 TLS 会话的记录后丢弃，后续直接走零拷贝流式路径。
+    session: Option<rustls::ClientConnection>,
+    filter_wire: Vec<u8>,
+    filter_payload: Vec<u8>,
+    filter_pos: usize,
     header: [u8; 5],
     header_len: usize,
     /// 当前记录还剩多少载荷没读。
@@ -457,6 +483,71 @@ impl<S: AsyncRead + Unpin> AsyncRead for V2Stream<S> {
             return Poll::Ready(Ok(()));
         }
         loop {
+            if self.filter_pos < self.filter_payload.len() {
+                let n = out
+                    .remaining()
+                    .min(self.filter_payload.len() - self.filter_pos);
+                out.put_slice(&self.filter_payload[self.filter_pos..self.filter_pos + n]);
+                self.filter_pos += n;
+                if self.filter_pos == self.filter_payload.len() {
+                    self.filter_payload.clear();
+                    self.filter_pos = 0;
+                }
+                return Poll::Ready(Ok(()));
+            }
+            if self.session.is_some() {
+                let need = if self.filter_wire.len() < 5 {
+                    5
+                } else {
+                    let n = u16::from_be_bytes([self.filter_wire[3], self.filter_wire[4]]) as usize;
+                    if n > 18436 {
+                        return Poll::Ready(Err(invalid("ShadowTLS v2 record exceeds limit")));
+                    }
+                    5 + n
+                };
+                if self.filter_wire.len() == need {
+                    let wire = std::mem::take(&mut self.filter_wire);
+                    let session = self.session.as_mut().unwrap();
+                    let mut cursor = io::Cursor::new(&wire);
+                    let state = session
+                        .read_tls(&mut cursor)
+                        .ok()
+                        .and_then(|_| session.process_new_packets().ok());
+                    if let Some(state) = state {
+                        // 丢弃握手服务端发来的残余明文/会话票据
+                        let mut sink = [0u8; 512];
+                        while matches!(io::Read::read(&mut session.reader(), &mut sink), Ok(n) if n > 0)
+                        {
+                        }
+                        if state.peer_has_closed() {
+                            self.session = None;
+                        }
+                        continue;
+                    }
+                    // 无法被握手 TLS 会话解密：说明已切换为代理数据流
+                    self.session = None;
+                    if wire[0] != 23 {
+                        return Poll::Ready(Err(invalid("unexpected ShadowTLS v2 record type")));
+                    }
+                    self.filter_payload = wire[5..].to_vec();
+                    self.filter_pos = 0;
+                    continue;
+                }
+                let mut scratch = [0u8; 4096];
+                let n = (need - self.filter_wire.len()).min(scratch.len());
+                let mut window = ReadBuf::new(&mut scratch[..n]);
+                ready!(Pin::new(&mut self.stream).poll_read(cx, &mut window))?;
+                let got = window.filled().len();
+                if got == 0 {
+                    return if self.filter_wire.is_empty() {
+                        Poll::Ready(Ok(()))
+                    } else {
+                        Poll::Ready(Err(io::ErrorKind::UnexpectedEof.into()))
+                    };
+                }
+                self.filter_wire.extend_from_slice(window.filled());
+                continue;
+            }
             if self.remaining > 0 {
                 let limit = out.remaining().min(self.remaining);
                 let before = out.filled().len();
@@ -567,6 +658,7 @@ mod tests {
             position: 0,
             pending: Vec::new(),
             written: 0,
+            eof: false,
             failed: false,
         }
     }
@@ -603,6 +695,10 @@ mod tests {
         V2Stream {
             stream,
             sum: Some([1, 2, 3, 4, 5, 6, 7, 8]),
+            session: None,
+            filter_wire: Vec::new(),
+            filter_payload: Vec::new(),
+            filter_pos: 0,
             header: [0; 5],
             header_len: 0,
             remaining: 0,
@@ -689,5 +785,187 @@ mod tests {
             hashed.hmac.sign().as_ref(),
             hmac::sign(&key, b"server flight one and two").as_ref()
         );
+    }
+
+    #[tokio::test]
+    async fn verified_poll_write_drains_without_explicit_flush() {
+        let (a, mut b) = tokio::io::duplex(4096);
+        let mut client = reader(a);
+        // 仅 write_all，不调用 flush，对端也必须能直接读到完整记录
+        client.write_all(b"hello").await.unwrap();
+        let mut hdr = [0u8; 5];
+        b.read_exact(&mut hdr).await.unwrap();
+        assert_eq!(&hdr[..3], &[23, 3, 3]);
+        let len = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
+        assert_eq!(len, 4 + 5);
+        let mut body = vec![0u8; len];
+        b.read_exact(&mut body).await.unwrap();
+        assert_eq!(&body[4..], b"hello");
+    }
+
+    #[tokio::test]
+    async fn verified_treats_tls_alert_record_as_clean_eof() {
+        let (a, mut b) = tokio::io::duplex(4096);
+        let mut client = reader(a);
+        let mut h = context("secret", b"seedS");
+        h.update(b"ok");
+        let mac = tag(&h);
+        let mut wire = vec![23, 3, 3, 0, 6];
+        wire.extend(mac);
+        wire.extend_from_slice(b"ok");
+        // ihciah/shadow-tls 在 TLS 1.2 lossy 模式下关闭连接时会发送 31 字节 TLS Alert（类型 21）
+        wire.extend_from_slice(&[21, 3, 3, 0, 26]);
+        wire.extend_from_slice(&[0xaa; 26]);
+        b.write_all(&wire).await.unwrap();
+        let mut out = Vec::new();
+        client.read_to_end(&mut out).await.unwrap();
+        assert_eq!(out, b"ok");
+        // EOF 已锁存，再读仍返回 0
+        let mut extra = [0u8; 4];
+        assert_eq!(client.read(&mut extra).await.unwrap(), 0);
+    }
+
+    fn self_signed_server_config(
+        versions: &[&'static rustls::SupportedProtocolVersion],
+    ) -> Arc<rustls::ServerConfig> {
+        let cert = rcgen::generate_simple_self_signed(vec!["cover.example".into()]).unwrap();
+        let cert_der = rustls::pki_types::CertificateDer::from(cert.cert.der().to_vec());
+        let key_der =
+            rustls::pki_types::PrivateKeyDer::try_from(cert.signing_key.serialize_der()).unwrap();
+        Arc::new(
+            rustls::ServerConfig::builder_with_provider(provider())
+                .with_protocol_versions(versions)
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(vec![cert_der], key_der)
+                .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn v2_supports_tls13_and_filters_post_handshake_tickets() {
+        let srv_cfg = self_signed_server_config(&[&rustls::version::TLS13]);
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (switched_tx, switched_rx) = tokio::sync::oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            let acceptor = tokio_rustls::TlsAcceptor::from(srv_cfg);
+            let mut tls = acceptor.accept(server_io).await.unwrap();
+            // 模拟握手服务端在切换前发出 TLS 1.3 NewSessionTicket + 残余应用数据
+            tls.write_all(b"handshake-server-noise").await.unwrap();
+            tls.flush().await.unwrap();
+            let (mut raw, _) = tls.into_inner();
+            let _ = switched_tx.send(());
+            // 读出客户端第一条 v2 记录（包含 8 字节摘要 + "req"）
+            let mut hdr = [0u8; 5];
+            raw.read_exact(&mut hdr).await.unwrap();
+            assert_eq!(hdr[0], 23);
+            let len = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
+            let mut body = vec![0u8; len];
+            raw.read_exact(&mut body).await.unwrap();
+            assert_eq!(&body[8..], b"req");
+            // 切换为代理响应记录
+            let mut resp = vec![23, 3, 3, 0, 4];
+            resp.extend_from_slice(b"pong");
+            raw.write_all(&resp).await.unwrap();
+            raw.flush().await.unwrap();
+            raw.shutdown().await.unwrap();
+        });
+        let spec = oryn_config::ShadowTlsSpec {
+            version: 2,
+            host: "cover.example".into(),
+            password: "pw".into(),
+            alpn: vec![],
+            skip_cert_verify: true,
+        };
+        let mut st = connect_v2(client_io, &spec).await.unwrap();
+        switched_rx.await.unwrap();
+        st.write_all(b"req").await.unwrap();
+        let mut got = Vec::new();
+        st.read_to_end(&mut got).await.unwrap();
+        // 握手服务端发来的 TLS 1.3 票据与密文噪声被 SessionFilter 过滤，只收到代理载荷
+        assert_eq!(got, b"pong");
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn v3_supports_tls12_lossy_and_rejects_unauthenticated_tls13() {
+        let spec = oryn_config::ShadowTlsSpec {
+            version: 3,
+            host: "cover.example".into(),
+            password: "pw".into(),
+            alpn: vec![],
+            skip_cert_verify: true,
+        };
+
+        // 1. 面对未改写 ApplicationData 的裸 TLS 1.3 服务端（相当于劫持或密码错），必须拒绝
+        let srv13 = self_signed_server_config(&[&rustls::version::TLS13]);
+        let (c13, s13) = tokio::io::duplex(64 * 1024);
+        let t13 = tokio::spawn(async move {
+            let _ = tokio_rustls::TlsAcceptor::from(srv13).accept(s13).await;
+        });
+        assert!(connect(c13, &spec).await.is_err());
+        let _ = t13.await;
+
+        // 2. 面对 TLS 1.2-only 握手服务端（ihciah --v3 lossy 模式），能完成握手并建立 Verified 流；
+        //    同时校验 ClientHello 为紧凑单包（不含后量子大 key_share）
+        struct PrefixIo<S> {
+            prefix: Vec<u8>,
+            pos: usize,
+            inner: S,
+        }
+        impl<S: AsyncRead + Unpin> AsyncRead for PrefixIo<S> {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                if self.pos < self.prefix.len() {
+                    let n = buf.remaining().min(self.prefix.len() - self.pos);
+                    buf.put_slice(&self.prefix[self.pos..self.pos + n]);
+                    self.pos += n;
+                    return Poll::Ready(Ok(()));
+                }
+                Pin::new(&mut self.inner).poll_read(cx, buf)
+            }
+        }
+        impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixIo<S> {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                Pin::new(&mut self.inner).poll_write(cx, buf)
+            }
+            fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Pin::new(&mut self.inner).poll_flush(cx)
+            }
+            fn poll_shutdown(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<io::Result<()>> {
+                Pin::new(&mut self.inner).poll_shutdown(cx)
+            }
+        }
+
+        let srv12 = self_signed_server_config(&[&rustls::version::TLS12]);
+        let (c12, mut s12) = tokio::io::duplex(64 * 1024);
+        let t12 = tokio::spawn(async move {
+            let mut hdr = [0u8; 5];
+            s12.read_exact(&mut hdr).await.unwrap();
+            let ch_len = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
+            assert!(ch_len < 512, "ClientHello should stay compact, got {ch_len}");
+            let mut ch = vec![0u8; ch_len];
+            s12.read_exact(&mut ch).await.unwrap();
+            let full = [hdr.as_slice(), ch.as_slice()].concat();
+            let io = PrefixIo {
+                prefix: full,
+                pos: 0,
+                inner: s12,
+            };
+            let _ = tokio_rustls::TlsAcceptor::from(srv12).accept(io).await.unwrap();
+        });
+        let st = connect(c12, &spec).await.unwrap();
+        drop(st);
+        t12.await.unwrap();
     }
 }
