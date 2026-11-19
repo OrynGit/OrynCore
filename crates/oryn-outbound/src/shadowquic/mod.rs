@@ -118,6 +118,7 @@ impl ShadowQuicOutbound {
                 hop: None,
                 rendezvous: None,
                 zero_rtt: spec.zero_rtt,
+                keep_alive: None,
             },
             tls,
             Arc::new(transport),

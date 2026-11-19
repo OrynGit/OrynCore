@@ -37,5 +37,7 @@ pub const MAX_BIDI: usize = 128;
 /// 并发会话多时回包会同时到达；sing-box（quic-go）在额度用尽时直接丢包而不是排队，
 /// 所以不能太小。额度只有流读完才归还，也因此天然限制了同时读取的任务数。
 pub const MAX_UNI: usize = 128;
+/// Hysteria 系协议的 QUIC 保活间隔，与官方客户端默认值相同（10 s，小于两端 30 s 的空闲超时）。
+pub const KEEP_ALIVE: std::time::Duration = std::time::Duration::from_secs(10);
 /// quinn 看到的 UDP 负载上限。Salamander 另外加 8 字节盐。
 pub const MAX_UDP_PAYLOAD: u16 = 1200;
