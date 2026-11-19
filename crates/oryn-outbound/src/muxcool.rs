@@ -49,7 +49,10 @@ pub(crate) struct MuxCool<S> {
     // 外层 poll_read 统一锁存 EOF / 错误，避免部分首部失败后继续解帧。
     read_terminal: Option<Option<io::ErrorKind>>,
     discard_payload: bool,
+    /// 当前帧为带数据的 End 帧：交完该帧载荷后立即结束读端。
+    end_after_payload: bool,
     wrote_new: bool,
+    wrote_end: bool,
     pending: Vec<u8>,
     written: usize,
 }
@@ -61,7 +64,9 @@ impl<S> MuxCool<S> {
             read: Read::Header([0; 6], 0),
             read_terminal: None,
             discard_payload: false,
+            end_after_payload: false,
             wrote_new: false,
+            wrote_end: false,
             pending: Vec::new(),
             written: 0,
         }
@@ -141,7 +146,10 @@ impl<S: AsyncRead + Unpin> MuxCool<S> {
                                 "Mux.Cool peer ended the session with an error",
                             )))
                         }
-                        STATUS_END => return Poll::Ready(Ok(())),
+                        STATUS_END if option & OPTION_DATA == 0 => return Poll::Ready(Ok(())),
+                        STATUS_END => {
+                            self.end_after_payload = true;
+                        }
                         STATUS_KEEP | STATUS_KEEP_ALIVE => {}
                         _ => return Poll::Ready(Err(invalid("unexpected Mux.Cool frame"))),
                     }
@@ -191,16 +199,17 @@ impl<S: AsyncRead + Unpin> MuxCool<S> {
                         return Poll::Ready(Err(io::ErrorKind::UnexpectedEof.into()));
                     }
                     let have = start + got;
-                    self.read = if have == 2 {
+                    if have == 2 {
                         match u16::from_be_bytes(length) as usize {
-                            0 => Read::Header([0; 6], 0),
+                            0 if self.end_after_payload => return Poll::Ready(Ok(())),
+                            0 => self.read = Read::Header([0; 6], 0),
                             // 复用固定 256 字节 scratch，最大帧也不分配载荷缓冲。
-                            n if self.discard_payload => Read::Discard(n, false),
-                            n => Read::Payload(n),
+                            n if self.discard_payload => self.read = Read::Discard(n, false),
+                            n => self.read = Read::Payload(n),
                         }
                     } else {
-                        Read::DataLength(length, have)
-                    };
+                        self.read = Read::DataLength(length, have);
+                    }
                 }
                 Read::Payload(left) => {
                     let left = *left;
@@ -213,11 +222,14 @@ impl<S: AsyncRead + Unpin> MuxCool<S> {
                         return Poll::Ready(Err(io::ErrorKind::UnexpectedEof.into()));
                     }
                     out.set_filled(before + got);
-                    self.read = if got == left {
-                        Read::Header([0; 6], 0)
+                    if got == left {
+                        self.read = Read::Header([0; 6], 0);
+                        if self.end_after_payload {
+                            self.read_terminal = Some(None);
+                        }
                     } else {
-                        Read::Payload(left - got)
-                    };
+                        self.read = Read::Payload(left - got);
+                    }
                     return Poll::Ready(Ok(()));
                 }
             }
@@ -247,6 +259,9 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for MuxCool<S> {
         cx: &mut Context<'_>,
         data: &[u8],
     ) -> Poll<io::Result<usize>> {
+        if self.wrote_end {
+            return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+        }
         ready!(self.drain(cx))?;
         if data.is_empty() {
             return Poll::Ready(Ok(0));
@@ -284,11 +299,18 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for MuxCool<S> {
         Pin::new(&mut self.stream).poll_flush(cx)
     }
 
-    /// 不发 End 帧：Xray / v2ray 收到 End 会关闭会话的两个方向，半关闭后对端的回复会被丢掉。
-    /// 底层连接（WebSocket）的关闭就是这个单会话的结束信号。
+    /// 写半关闭：向对端发送干净的 End 帧（不带 Error 选项），使 v2ray-plugin / v2ray-core
+    /// 只关闭会话的上行写端（`pipe.Writer.Close()`）而不中断下行读端（`pipe.Reader`），
+    /// 并保持底层 WebSocket 打开以继续接收服务端回传的剩余 Keep 帧和服务端 End 帧。
+    /// 若调用底层 WebSocket 的 `poll_shutdown`，RFC 6455 Close 握手会双向拆断连接并丢失回应。
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         ready!(self.drain(cx))?;
-        Pin::new(&mut self.stream).poll_shutdown(cx)
+        if self.wrote_new && !self.wrote_end {
+            self.wrote_end = true;
+            self.pending = vec![0, 4, 0, 0, STATUS_END, 0];
+            ready!(self.drain(cx))?;
+        }
+        Pin::new(&mut self.stream).poll_flush(cx)
     }
 }
 
@@ -451,5 +473,106 @@ mod tests {
             let mut b = [0u8; 4];
             assert!(c.read(&mut b).await.is_err(), "{wire:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn halfclose_over_websocket_propagates_end_and_reads_reply_to_eof() {
+        use bytes::Bytes;
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let (client_io, server_io) = duplex(64 * 1024);
+        let server_task = tokio::spawn(async move {
+            let mut ws = tokio_tungstenite::accept_async(server_io).await.unwrap();
+            let mut received = Vec::new();
+            let mut buf = Vec::new();
+            let mut saw_end = false;
+            while !saw_end {
+                match ws.next().await.unwrap().unwrap() {
+                    Message::Binary(chunk) => {
+                        buf.extend_from_slice(&chunk);
+                        while buf.len() >= 6 {
+                            let meta_len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
+                            if buf.len() < 2 + meta_len {
+                                break;
+                            }
+                            let status = buf[4];
+                            let option = buf[5];
+                            let mut pos = 2 + meta_len;
+                            if option & OPTION_DATA != 0 {
+                                if buf.len() < pos + 2 {
+                                    break;
+                                }
+                                let data_len =
+                                    u16::from_be_bytes([buf[pos], buf[pos + 1]]) as usize;
+                                if buf.len() < pos + 2 + data_len {
+                                    break;
+                                }
+                                received.extend_from_slice(&buf[pos + 2..pos + 2 + data_len]);
+                                pos += 2 + data_len;
+                            }
+                            buf.drain(..pos);
+                            if status == STATUS_END {
+                                assert_eq!(option & OPTION_ERROR, 0);
+                                saw_end = true;
+                                break;
+                            }
+                        }
+                    }
+                    // 若客户端错误调用了 WebSocket Close，这里会提前失败。
+                    other => panic!("unexpected ws frame before peer End: {other:?}"),
+                }
+            }
+            // 收到客户端 End 帧（半关闭）后才回发完整回应与服务端 End 帧
+            let mut reply = vec![0, 4, 0, 0, STATUS_KEEP, OPTION_DATA];
+            reply.extend_from_slice(&(received.len() as u16).to_be_bytes());
+            reply.extend_from_slice(&received);
+            reply.extend_from_slice(&[0, 4, 0, 0, STATUS_END, 0]);
+            ws.send(Message::Binary(Bytes::from(reply))).await.unwrap();
+        });
+
+        let ws = oryn_transport::connect(
+            client_io,
+            "proxy.test",
+            &oryn_config::WsSpec {
+                path: "/ws".into(),
+                headers: vec![],
+                max_early_data: 0,
+                early_data_header: "Sec-WebSocket-Protocol".into(),
+            },
+            &[],
+        )
+        .await
+        .unwrap();
+        let mut c = MuxCool::new(ws);
+        c.write_all(b"halfclose-echo-payload").await.unwrap();
+        c.shutdown().await.unwrap();
+        // 关闭写端后再次写入必须返回 BrokenPipe
+        assert_eq!(
+            c.write_all(b"late").await.unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        let mut got = Vec::new();
+        c.read_to_end(&mut got).await.unwrap();
+        assert_eq!(got, b"halfclose-echo-payload");
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn end_frame_with_data_delivers_payload_then_eof() {
+        let (client, mut server) = duplex(1024);
+        let mut c = MuxCool::new(client);
+        // End + Data（附带最后 3 字节载荷），随后哪怕还有多余字节也不再读取
+        server
+            .write_all(&[0, 4, 0, 0, STATUS_END, OPTION_DATA, 0, 3, b'f', b'i', b'n'])
+            .await
+            .unwrap();
+        server
+            .write_all(&[0, 4, 0, 0, STATUS_KEEP, OPTION_DATA, 0, 1, b'!'])
+            .await
+            .unwrap();
+        let mut got = Vec::new();
+        c.read_to_end(&mut got).await.unwrap();
+        assert_eq!(got, b"fin");
     }
 }
