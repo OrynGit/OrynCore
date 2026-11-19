@@ -55,7 +55,10 @@ pub(crate) fn state_drop(config: &RuntimeConfig) {
 }
 fn sample(phase: &str) {
     let (live, peak) = crate::alloc::heap_usage().unwrap();
+    #[cfg(target_os = "macos")]
     let mut footprint = 0;
+    #[cfg(not(target_os = "macos"))]
+    let footprint = 0;
     #[cfg(target_os = "macos")]
     unsafe {
         let mut info: libc::rusage_info_v4 = std::mem::zeroed();
@@ -102,7 +105,9 @@ fn continuous_reload_lifecycle_heap() {
     let _stack = crate::udp::performance_survey::STACK_LOCK.lock().unwrap();
     struct ResetProbe;
     impl Drop for ResetProbe {
-        fn drop(&mut self) { ACTIVE.store(false, SeqCst); }
+        fn drop(&mut self) {
+            ACTIVE.store(false, SeqCst);
+        }
     }
     let _reset = ResetProbe;
     PREPARE_STARTED.store(0, SeqCst);
