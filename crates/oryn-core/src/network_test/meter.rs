@@ -213,7 +213,7 @@ mod tests {
         let mut meter = Meter::new(1, false, 0.5);
         // 慢启动 2 片、一个偏快的片，其余稳定在 100
         let mut rates = vec![10.0, 40.0, 150.0];
-        rates.extend(std::iter::repeat(100.0).take(9));
+        rates.extend(std::iter::repeat_n(100.0, 9));
         for rate in rates {
             meter.tick_bytes(bytes(rate));
         }
@@ -228,7 +228,7 @@ mod tests {
         // 一个大尖峰让全程平均高于 MST：与 Speedtest 相同，读数取平均
         let mut meter = Meter::new(1, false, 0.5);
         let mut rates = vec![10.0, 40.0, 400.0];
-        rates.extend(std::iter::repeat(100.0).take(9));
+        rates.extend(std::iter::repeat_n(100.0, 9));
         for rate in rates {
             meter.tick_bytes(bytes(rate));
         }
@@ -258,7 +258,10 @@ mod tests {
         for _ in 0..SCALE_TICKS {
             late.tick_bytes(bytes(6.0));
         }
-        assert_eq!(late.tick_bytes(bytes(10_000.0)).connections, START_CONNECTIONS);
+        assert_eq!(
+            late.tick_bytes(bytes(10_000.0)).connections,
+            START_CONNECTIONS
+        );
     }
 
     #[test]
