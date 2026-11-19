@@ -222,6 +222,38 @@ fn cached(alpn: &[&[u8]], skip_verify: bool, versions: Versions) -> io::Result<A
     Ok(config)
 }
 
+/// ShadowTLS 客户端配置：使用 ring provider（不含后量子 X25519MLKEM768，单包 ClientHello，
+/// 与 ihciah/shadow-tls 客户端一致，避免超大 ClientHello 或中间盒/握手服务端异常）。
+fn shadowtls_config(
+    alpn: &[&[u8]],
+    skip_verify: bool,
+    versions: Versions,
+) -> io::Result<ClientConfig> {
+    let provider = provider();
+    let versions: &[&rustls::SupportedProtocolVersion] = match versions {
+        Versions::Tls13 => &[&rustls::version::TLS13],
+        Versions::Tls12 => &[&rustls::version::TLS12],
+        Versions::Default => rustls::DEFAULT_VERSIONS,
+    };
+    let builder = ClientConfig::builder_with_provider(provider.clone())
+        .with_protocol_versions(versions)
+        .map_err(io::Error::other)?;
+    let verifier: Arc<dyn ServerCertVerifier> = if skip_verify {
+        Arc::new(NoVerify(provider))
+    } else {
+        system_verifier(provider).map_err(io::Error::other)?
+    };
+    let mut config = builder
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth();
+    config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+    config.cert_decompressors.clear();
+    config.cert_compressors.clear();
+    config.resumption = rustls::client::Resumption::disabled();
+    Ok(config)
+}
+
 /// TCP 上使用的 TLS 客户端配置（带缓存）。
 pub fn client_config(alpn: &[&[u8]], skip_verify: bool) -> io::Result<Arc<ClientConfig>> {
     cached(alpn, skip_verify, Versions::Default)
