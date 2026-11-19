@@ -206,6 +206,9 @@ struct Pending {
 const ACK_DELAY: Duration = Duration::from_millis(1);
 /// 按序数据攒到这么多段时不等延迟、立即确认，让高速下发送端的窗口及时前移（这时确认点名的序号每次都不同）。
 const ACK_EVERY: u32 = 32;
+/// 窗口外丢弃触发补发确认的合并间隔：第一个丢弃立即回，之后这段时间内的丢弃合并成一次，
+/// 避免丢弃风暴时每个数据报都回确认。
+const DROP_NACK_MERGE: Duration = Duration::from_millis(20);
 /// UDP 会话发送端的拥塞与重传状态（Reno 式）：
 /// 慢启动按被确认的段数增长，拥塞避免每个窗口加一段；一次丢包事件（一个恢复周期内）只减半一次；
 /// 重复确认点名的缺口段若已发出超过约一个往返就立即重传（对端确认最多合并 1 ms，窗口小时等不到三次重复确认）；
@@ -309,6 +312,8 @@ async fn run(
     // 已收到但还没确认的数据段数，以及最迟何时发出这次确认
     let mut unacked = 0u32;
     let mut ack_at = Instant::now();
+    // 上次因窗口外丢弃而补发确认的时刻；None 表示还没有过
+    let mut last_drop_ack: Option<Instant> = None;
     let open = Frame::new(2, id, 0, request);
     carrier.write(open.clone()).await?;
     if carrier.packet {
@@ -331,7 +336,7 @@ async fn run(
         () => {{
             let mut ack = Frame::new(8, id, next_send, vec![]);
             ack.ack = next_recv;
-            ack.window = receive_window(&output, &reorder, recv_limit(slots, limit));
+            ack.window = receive_window(output.len(), reorder_bytes, recv_limit(slots, limit));
             carrier.write(ack).await?;
             last_ack = Instant::now();
             unacked = 0;
@@ -362,12 +367,12 @@ async fn run(
                 if n == 0 {
                     return Ok(());
                 }
-                let high = receive_high(recv_limit(slots, limit));
-                let blocked = output.len() > high;
+                let limit = recv_limit(slots, limit);
+                let was_zero = receive_window(output.len(), reorder_bytes, limit) == 0;
                 output.drain(..n);
-                // 缓冲超过上限时通告窗口为 0，对端会停发；读空到上限以下必须马上通告新窗口，
+                // 窗口随缓存收缩到 0 后，应用排空必须马上通告新窗口，
                 // 否则对端要等空闲确认才继续，下载被卡成「一阵一停」。
-                if carrier.packet && blocked && output.len() <= high {
+                if carrier.packet && was_zero && receive_window(output.len(), reorder_bytes, limit) > 0 {
                     count(4);
                     send_ack!();
                 }
@@ -388,7 +393,7 @@ async fn run(
                     .ok_or_else(|| bad("Mieru sequence exhausted"))?;
                 // 数据段顺带确认，攒着的确认随之清零
                 frame.ack = next_recv;
-                frame.window = receive_window(&output, &reorder, recv_limit(slots, limit));
+                frame.window = receive_window(output.len(), reorder_bytes, recv_limit(slots, limit));
                 carrier.write(frame.clone()).await?;
                 unacked = 0;
                 if carrier.packet {
@@ -437,7 +442,7 @@ async fn run(
                             if now.duration_since(p.sent) >= loss_delay {
                                 p.frame.ack = next_recv;
                                 p.frame.window =
-                                    receive_window(&output, &reorder, recv_limit(slots, limit));
+                                    receive_window(output.len(), reorder_bytes, recv_limit(slots, limit));
                                 carrier.write(p.frame.clone()).await?;
                                 count(3);
                                 p.tries = p.tries.saturating_add(1);
@@ -461,16 +466,21 @@ async fn run(
                     if frame.seq < next_recv {
                         count(2);
                     }
-                    let limit = recv_limit(slots, limit);
                     // 按序包也必须收费：已认证对端可能无视零窗口，不能让 output 持续增长。
-                    // 乱序准入额外留出一段给 next_recv，避免重排缓存挤满后无法补缺口。
-                    // 拒收不推进累计序号，应用排空恢复窗口后由对端重传。
+                    // 乱序段不做「距 next_recv 的距离」限制：官方接收端只看缓存有没有空位
+                    // （receiveWindowSize = 容量 − 已缓存，与序号距离无关），窗口字段只是对
+                    // 新增发送的节流。距离限制会在接收窗口随会话数收缩时，把对端按旧窗口
+                    // 合法发出的在途段成串丢掉：缺口后面全部落窗，只能逐段重传，而对端应用
+                    // 发完就关闭会话（closeWithError 直接清空 sendBuf），没补上的缺口就成了
+                    // 永久截断。内存仍由字节上限约束。
                     let reserve = if in_order { 0 } else { MAX_SEGMENT };
-                    if (in_order
-                        || (frame.seq > next_recv
-                            && frame.seq - next_recv < limit as u32))
-                        && output.len() + reorder_bytes + frame.payload.len()
-                            <= receive_bytes(limit).saturating_sub(reserve)
+                    // 缺口段一到就解锁整个重排缓存（净效果是把重排搬去待读，总量几乎不变）。
+                    // 缓存满时把它丢掉，重排缓存里的后继段会全部卡住，直到应用排空为止。
+                    let unblock = in_order && !reorder.is_empty();
+                    if frame.seq >= next_recv
+                        && (unblock
+                            || output.len() + reorder_bytes + frame.payload.len()
+                                <= receive_capacity().saturating_sub(reserve))
                     {
                         if let std::collections::btree_map::Entry::Vacant(slot) = reorder.entry(frame.seq) {
                             reorder_bytes += frame.payload.len();
@@ -478,6 +488,15 @@ async fn run(
                         }
                     } else if frame.seq >= next_recv {
                         count(1);
+                        // 窗口外的丢弃不产生重复确认：对端在途量超出我们刚收缩的接收窗口
+                        // （会话数跳变时预算被平分），它只持有旧窗口继续发，这些段被静默丢掉后
+                        // 只能等超时逐段恢复，流会卡死。立即补发一次确认（累计序号 + 当前窗口），
+                        // 把丢弃变成快速反馈：对端马上停发新段，并对点名的缺口段提前重传。
+                        // 节流：DROP_NACK_MERGE 内的丢弃合并成一次，避免丢弃风暴时确认泛滥。
+                        if last_drop_ack.is_none_or(|t| t.elapsed() >= DROP_NACK_MERGE) {
+                            last_drop_ack = Some(Instant::now());
+                            send_ack!();
+                        }
                     }
                     while let Some(frame) = reorder.remove(&next_recv) {
                         reorder_bytes -= frame.payload.len();
@@ -524,7 +543,7 @@ async fn run(
                             return Err(io::Error::new(io::ErrorKind::TimedOut, "Mieru retransmission limit reached"));
                         }
                         p.frame.ack = next_recv;
-                        p.frame.window = receive_window(&output, &reorder, recv_limit(slots, limit));
+                        p.frame.window = receive_window(output.len(), reorder_bytes, recv_limit(slots, limit));
                         carrier.write(p.frame.clone()).await?;
                         count(3);
                         p.tries += 1;
@@ -539,15 +558,15 @@ async fn run(
         }
     }
 }
-/// 待交给应用的数据超过它就通告窗口 0；随接收窗口缩放，会话多时缓存也更小。
-fn receive_high(limit: usize) -> usize {
-    (limit * 128).max(32 * 1024)
+/// 一个 UDP 会话缓存的乱序与待读数据上限。固定按最大接收窗口计，不随活跃会话数收缩：
+/// 会话数跳变时对端还持着旧的大窗口在途（最多 1024 段 ≈ 1.5 MB），已收下的数据也不会
+/// 因为预算缩小而被丢弃。官方实现每会话可缓存 4096 段（约 5.3 MB），这里已收紧到 1/3。
+fn receive_capacity() -> usize {
+    RECV_WINDOW * MAX_SEGMENT + 128 * 1024
 }
-/// 一个 UDP 会话缓存的乱序与待读数据上限：接收窗口 × 单个数据报的最大载荷再留余量。
-/// 对端的分段不一定是我们发送用的 1 KiB（官方服务端约 1.3 KiB），按 1 KiB 算会在窗口没满时先撞上字节上限。
-fn receive_bytes(limit: usize) -> usize {
-    limit * MAX_SEGMENT + 64 * 1024
-}
+/// 窗口空位的安全边际：确认最多延迟 1 ms 合并，期间对端按旧窗口发出的超额
+/// （单流千兆级约 150 KB）落在边际里，不会把缓存顶到容量上限而开始丢段。
+const WINDOW_SAFETY: usize = 256 * 1024;
 /// 单个 UDP 数据报能承载的最大载荷（线上数据报不超过 1500 字节）。
 const MAX_SEGMENT: usize = 1500;
 fn active_sessions(slots: &Semaphore, limit: usize) -> usize {
@@ -562,10 +581,12 @@ fn window_limit(slots: &Semaphore, limit: usize) -> usize {
 fn recv_limit(slots: &Semaphore, limit: usize) -> usize {
     (RECV_BUDGET / active_sessions(slots, limit)).clamp(MIN_RECV_WINDOW, RECV_WINDOW)
 }
-fn receive_window(output: &VecDeque<u8>, reorder: &BTreeMap<u32, Frame>, limit: usize) -> u16 {
-    if output.len() > receive_high(limit) {
-        0
-    } else {
-        limit.saturating_sub(reorder.len()).min(u16::MAX as usize) as u16
-    }
+/// 通告的接收窗口（段数）：会话的窗口份额与缓存空位取较小者。空位按
+/// 容量 − 安全边际 −（重排字节 + 待读字节）折算，与官方实现一致把待读数据也算进窗口
+/// （receiveWindowSize = 容量 − recvBuf − recvQueue）：应用读得慢时窗口平滑收缩，
+/// 而不是在高水位处从满跳到 0、把已在途的一整窗段放进来冲垮缓存。
+fn receive_window(output_len: usize, reorder_bytes: usize, limit: usize) -> u16 {
+    let free =
+        receive_capacity().saturating_sub(WINDOW_SAFETY + output_len + reorder_bytes) / MAX_SEGMENT;
+    limit.min(free).min(u16::MAX as usize) as u16
 }
