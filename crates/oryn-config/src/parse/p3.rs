@@ -271,6 +271,13 @@ fn hysteria(p: &Yaml, name: &str, b: &mut Builder) -> Result<Option<OutboundKind
     ) {
         return Err(error(name, "invalid hysteria protocol"));
     }
+    if protocol == "faketcp" {
+        // FakeTCP 需要原始套接字与防火墙规则（参考实现仅 Linux），Oryn 没有实现；
+        // 配置照常加载，经该节点的连接在运行时失败，不退回 UDP
+        b.warn(format!(
+            "proxy {name}: hysteria protocol faketcp is not implemented; connections through this proxy will fail"
+        ));
+    }
     if protocol == "wechat" {
         b.warn(format!(
             "proxy {name}: hysteria protocol wechat is accepted as wechat-video"

@@ -26,6 +26,10 @@ use oryn_config::{HysteriaSpec, TargetAddr};
 use oryn_quic::{Congestion, Hop, Obfs, QuicClient, QuicParams, MAX_BIDI};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 
+/// FakeTCP 承载未实现（与平台无关）。不退回普通 UDP：那会改变线上特征且服务端未必监听。
+const FAKETCP_UNSUPPORTED: &str =
+    "hysteria faketcp transport is not implemented; use protocol udp or wechat-video";
+
 use crate::{
     inbox::{self, Inbox},
     reassembly::Reassembly,
@@ -163,7 +167,7 @@ impl HysteriaOutbound {
         if self.spec.protocol == "faketcp" {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "hysteria faketcp is unavailable in the iOS Packet Tunnel",
+                FAKETCP_UNSUPPORTED,
             ));
         }
         let addrs = resolve_target(self.resolver.as_ref(), &self.spec.server).await?;
@@ -732,5 +736,48 @@ mod tests {
         assert_eq!(a, TargetAddr::Ip("1.2.3.4:53".parse().unwrap()));
         assert_eq!(payload, b"hi");
         assert!(parse_datagram(&d[..d.len() - 1]).is_none());
+    }
+
+    struct NoDns;
+    #[async_trait]
+    impl Resolver for NoDns {
+        async fn resolve(&self, _: &str) -> io::Result<Vec<IpAddr>> {
+            Ok(vec![])
+        }
+    }
+
+    /// FakeTCP 在所有平台都拒绝，文案不能再声称只是 iOS 限制（OrynCore#16）。
+    #[tokio::test]
+    async fn faketcp_rejected_as_unimplemented() {
+        let outbound = HysteriaOutbound::new(
+            "test".into(),
+            HysteriaSpec {
+                server: TargetAddr::Ip("127.0.0.1:443".parse().unwrap()),
+                protocol: "faketcp".into(),
+                ports: None,
+                auth: vec![],
+                up_bps: 1_000_000,
+                down_bps: 1_000_000,
+                obfs: None,
+                tls: oryn_config::TlsSpec {
+                    skip_cert_verify: true,
+                    alpn: vec!["hysteria".into()],
+                    sni: None,
+                    fingerprint: None,
+                    client_fingerprint: None,
+                    reality: None,
+                    ech: None,
+                },
+                hop_min_secs: 10,
+                hop_max_secs: 20,
+                udp: false,
+            },
+            Arc::new(NoDns),
+            Arc::new(oryn_udp::UdpFactory),
+        );
+        let err = outbound.peer().await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+        assert_eq!(err.to_string(), FAKETCP_UNSUPPORTED);
+        assert!(!err.to_string().contains("iOS"));
     }
 }

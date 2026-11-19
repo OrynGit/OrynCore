@@ -1345,7 +1345,7 @@ fn hysteria_v1_and_gecko() {
     }
     assert!(kind_of(base).is_err(), "up / down 必填");
     assert!(kind_of(&format!("{base}, up: 1 kbps, down: 10")).is_err());
-    // wechat-video 进入独立 UDP 伪装；FakeTCP 由运行时按 iOS 平台边界拒绝。
+    // wechat-video 进入独立 UDP 伪装；FakeTCP 照常解析但给出未实现警告，运行时拒绝。
     match kind_of(&format!(
         "{base}, up: 30 Mbps, down: 100 Mbps, protocol: wechat-video"
     ))
@@ -1362,6 +1362,17 @@ fn hysteria_v1_and_gecko() {
         OutboundKind::Hysteria(spec) => assert_eq!(spec.protocol, "faketcp"),
         other => panic!("{other:?}"),
     }
+    let c = parse_config(&format!(
+        "proxies: [{{name: P, {base}, up: 30 Mbps, down: 100 Mbps, protocol: FakeTCP}}]"
+    ))
+    .unwrap();
+    assert!(
+        c.warnings
+            .iter()
+            .any(|w| w.contains("faketcp is not implemented") && !w.contains("iOS")),
+        "{:?}",
+        c.warnings
+    );
 
     let h2 = "type: hysteria2, server: a.com, port: 443, password: p, obfs-password: obfs";
     match kind_of(&format!("{h2}, obfs: gecko")).unwrap() {

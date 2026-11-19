@@ -8,7 +8,7 @@
 
 `wechat-video` 已接入 QUIC 套接字层：每个 UDP 包增加固定 13 字节标识和递增序号；若同时设置 `obfs`，先应用 XPlus，再包裹 WeChat Video 首部。解析、坏包丢弃、IPv4/IPv6、端口跳跃和 QUIC 数据报仍受现有有界队列与重组预算限制。
 
-`faketcp` 仅完成配置识别和平台边界检查。iOS Packet Tunnel 不允许使用 mihomo Linux raw socket/iptables 路径，运行时会返回 `hysteria faketcp is unavailable in the iOS Packet Tunnel`，不会退回普通 UDP 或 TCP；FakeTCP 的完整伪 TCP 线格式保持未完成。`obfs-protocol` 可作为 mihomo 兼容别名；`recv-window*`、`disable_mtu_discovery`、`fast-open` 等未实现字段仍忽略并警告。
+`faketcp` 只做配置识别，没有实现：参考实现依赖 Linux 原始套接字与防火墙规则，Oryn 在所有平台都不支持。配置照常加载并给出警告，经该节点的连接返回 `hysteria faketcp transport is not implemented; use protocol udp or wechat-video`，不会退回普通 UDP 或 TCP。`obfs-protocol` 可作为 mihomo 兼容别名；`recv-window*`、`disable_mtu_discovery`、`fast-open` 等未实现字段仍忽略并警告。
 
 ## 线格式
 

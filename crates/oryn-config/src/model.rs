@@ -1397,7 +1397,7 @@ pub struct SsrSpec {
 #[derive(Debug, Clone)]
 pub struct HysteriaSpec {
     pub server: TargetAddr,
-    /// QUIC 外层承载：udp、wechat-video 或 faketcp（后者在 iOS 明确拒绝）。
+    /// QUIC 外层承载：udp、wechat-video 或 faketcp（后者未实现，运行时在所有平台拒绝）。
     pub protocol: String,
     pub ports: Option<PortSet>,
     /// `auth-str` 的字节，或 `auth`（Base64）解码后的字节。
