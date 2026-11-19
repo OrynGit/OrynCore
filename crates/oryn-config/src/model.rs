@@ -543,7 +543,7 @@ pub struct MieruSpec {
     pub username: String,
     pub password: String,
     pub udp: bool,
-    /// 每个载体允许共享的会话数，OFF 为 1；全节点仍有 32 条上限。
+    /// 每个载体允许共享的会话数，OFF 为 1；全节点上限随资源档位设定（64–512）。
     pub multiplexing: usize,
     pub no_wait: bool,
     pub traffic_pattern: crate::MieruTrafficPattern,

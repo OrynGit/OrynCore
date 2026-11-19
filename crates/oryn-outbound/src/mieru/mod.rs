@@ -7,6 +7,9 @@ mod carrier;
 mod key_lifecycle_tests;
 mod pattern;
 mod session;
+#[cfg(test)]
+#[path = "session_budget_tests.rs"]
+mod session_budget_tests;
 mod wire;
 use crate::{BoxStream, Dialer, Outbound, PacketConn, Resolver, SessionControl};
 use async_trait::async_trait;
@@ -14,6 +17,7 @@ use carrier::Carrier;
 use oryn_config::{MieruSpec, TargetAddr};
 use oryn_protocol::socks5;
 use oryn_udp::DatagramFactory;
+use std::time::Duration;
 use std::{
     io,
     pin::Pin,
@@ -27,6 +31,9 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, ReadHalf, WriteHalf},
     sync::{Mutex as AsyncMutex, Semaphore},
 };
+
+/// 满载时新连接在会话名额上排队的最长时间；外层 `with_timeout`（10 s）之内。
+const SESSION_QUEUE: Duration = Duration::from_secs(2);
 
 struct State {
     carriers: Mutex<Vec<Weak<Carrier>>>,
@@ -66,6 +73,8 @@ pub struct MieruOutbound {
     connecting: AtomicUsize,
     state: Arc<State>,
     slots: Arc<Semaphore>,
+    /// 载体池上限：与会话预算同值（载体按需扩展，官方实现无上限）。
+    carrier_limit: usize,
 }
 struct PooledCarrier {
     carrier: Arc<Carrier>,
@@ -112,6 +121,7 @@ impl MieruOutbound {
         resolver: Arc<dyn Resolver>,
         target_resolver: Arc<dyn Resolver>,
         datagrams: Arc<dyn DatagramFactory>,
+        sessions: usize,
     ) -> Arc<Self> {
         Arc::new(Self {
             tag,
@@ -127,18 +137,29 @@ impl MieruOutbound {
                 generation: AtomicU64::new(0),
                 sleeping: AtomicBool::new(false),
             }),
-            slots: Arc::new(Semaphore::new(wire::MAX_SESSIONS)),
+            slots: Arc::new(Semaphore::new(sessions.max(1))),
+            carrier_limit: sessions.max(1),
         })
     }
     async fn connect(&self, target: &TargetAddr, udp: bool) -> io::Result<BoxStream> {
         crate::with_timeout(
             async {
-                let permit = self.slots.clone().try_acquire_owned().map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::WouldBlock,
-                        "Mieru active session limit reached",
-                    )
-                })?;
+                // 满载时短暂排队而不是立即拒绝：浏览器式突发的连接多为短命，
+                // 槽位毫秒级释放（应用关流即归还），排队把硬失败变成小延迟，
+                // 对齐官方「从不拒绝」的失败形态（issue #5）。
+                let permit =
+                    match tokio::time::timeout(SESSION_QUEUE, self.slots.clone().acquire_owned())
+                        .await
+                    {
+                        // 信号量从不关闭，Closed 分支同样按限额拒绝处理。
+                        Ok(Ok(permit)) => permit,
+                        _ => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::WouldBlock,
+                                "Mieru active session limit reached",
+                            ))
+                        }
+                    };
                 let mut request = vec![5, if udp { 3 } else { 1 }, 0];
                 socks5::encode_addr(target, &mut request)?;
                 let mut pool = self.pool.lock().await;
@@ -156,7 +177,7 @@ impl MieruOutbound {
                 }) {
                     c.carrier.clone()
                 } else {
-                    if pool.len() + self.connecting.load(Ordering::Acquire) >= 32 {
+                    if pool.len() + self.connecting.load(Ordering::Acquire) >= self.carrier_limit {
                         return Err(io::Error::new(
                             io::ErrorKind::WouldBlock,
                             "Mieru carrier limit reached",
@@ -203,7 +224,14 @@ impl MieruOutbound {
                         break id;
                     }
                 };
-                let stream = session::open(carrier, id, request, permit, self.slots.clone());
+                let stream = session::open(
+                    carrier,
+                    id,
+                    request,
+                    permit,
+                    self.slots.clone(),
+                    self.carrier_limit,
+                );
                 drop(pool);
                 let mut reply = ReplyStream {
                     inner: stream,

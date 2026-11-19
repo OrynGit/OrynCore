@@ -189,3 +189,13 @@ fn resource_profile_budgets_and_reload_identity() {
         }
     });
 }
+
+#[test]
+fn mieru_session_limits_follow_resource_profile() {
+    // issue #5：Mieru 会话上限档位化，Constrained 与引擎 active=Some(64) 对齐。
+    assert_eq!(ResourceProfile::Constrained.limits().mieru_sessions, 64);
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    assert_eq!(ResourceProfile::DesktopHigh.limits().mieru_sessions, 512);
+    #[cfg(target_os = "ios")]
+    assert_eq!(ResourceProfile::MobilePlus.limits().mieru_sessions, 256);
+}

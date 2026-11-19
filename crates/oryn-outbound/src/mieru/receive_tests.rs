@@ -14,7 +14,7 @@ impl Drop for Peer {
 }
 impl Peer {
     async fn new() -> Self {
-        Self::with_slots(Arc::new(Semaphore::new(0))).await
+        Self::with_slots(Arc::new(Semaphore::new(1))).await
     }
     async fn with_slots(slots: Arc<Semaphore>) -> Self {
         let (send, ack) = mpsc::channel(32);
@@ -30,8 +30,11 @@ impl Peer {
         let (input, rx) = mpsc::channel(RECV_WINDOW);
         // 小桥接使慢应用的额外容量可精确核算；直接驱动产品 run。
         let (app, mut bridge) = tokio::io::duplex(64);
+        // run 自身持有 1 个名额（应用写半关闭即归还）；limit=32 对应满节点预算
+        // （active = 32 − available）。Peer::new 传容量 1：名额被 run 持有，active 恒为 32。
+        let permit = slots.clone().try_acquire_owned().unwrap();
         let task = tokio::spawn(async move {
-            run(&carrier, 1, vec![], &mut bridge, rx, &slots).await
+            run(&carrier, 1, vec![], &mut bridge, rx, &slots, 32, permit).await
         });
         let mut peer = Self {
             input,
@@ -171,7 +174,8 @@ async fn near_capacity_reorder_reserves_room_for_gap() {
 /// 空闲窗口更新在窗口之外）；没有节流时每个丢弃各回一次，会超过两次。
 #[tokio::test]
 async fn outside_window_drop_is_acked_immediately_and_merged() {
-    let slots = Arc::new(Semaphore::new(32));
+    // 容量 33 = 32 个测试名额 + run 自持的 1 个。
+    let slots = Arc::new(Semaphore::new(33));
     let mut peer = Peer::with_slots(slots.clone()).await;
     // 名额全空闲：active = 1，接收窗口份额 1024。先按序交付几段。
     for seq in 1..=4 {

@@ -5,8 +5,7 @@
 use super::{
     carrier::Carrier,
     wire::{
-        bad, Frame, MAX_SESSIONS, MIN_RECV_WINDOW, MIN_WINDOW, RECV_BUDGET, RECV_WINDOW, WINDOW,
-        WINDOW_BUDGET,
+        bad, Frame, MIN_RECV_WINDOW, MIN_WINDOW, RECV_BUDGET, RECV_WINDOW, WINDOW, WINDOW_BUDGET,
     },
 };
 use std::{
@@ -155,6 +154,7 @@ pub fn open(
     request: Vec<u8>,
     permit: OwnedSemaphorePermit,
     slots: Arc<Semaphore>,
+    limit: usize,
 ) -> Stream {
     let (app, bridge) = tokio::io::duplex(16 * 1024);
     let (tx, rx) = mpsc::channel(if carrier.packet { RECV_WINDOW } else { 2 });
@@ -169,9 +169,17 @@ pub fn open(
     let errors = failure.clone();
     tokio::spawn(async move {
         let _registration = registration;
-        let _permit = permit;
         let mut bridge = bridge;
-        let work = run(&carrier, id, request, &mut bridge, rx, &slots);
+        let work = run(
+            &carrier,
+            id,
+            request,
+            &mut bridge,
+            rx,
+            &slots,
+            limit,
+            permit,
+        );
         let result = tokio::select! {
             _ = cancel.cancelled() => Ok(()),
             _ = carrier.stop.cancelled() => Err(io::Error::new(io::ErrorKind::ConnectionReset, "Mieru carrier closed")),
@@ -276,6 +284,8 @@ impl Sender {
 const RTO_INITIAL: Duration = Duration::from_millis(250);
 const RTO_MIN: Duration = Duration::from_millis(40);
 const RTO_MAX: Duration = Duration::from_secs(2);
+// slots 与 limit 成对出现（tokio 1.x 的 Semaphore 查不到容量），permit 是独立所有权。
+#[allow(clippy::too_many_arguments)]
 async fn run(
     carrier: &Carrier,
     id: u32,
@@ -283,7 +293,11 @@ async fn run(
     bridge: &mut DuplexStream,
     mut input: mpsc::Receiver<Frame>,
     slots: &Semaphore,
+    limit: usize,
+    permit: OwnedSemaphorePermit,
 ) -> io::Result<()> {
+    // 会话名额：应用写半关闭后即归还（见 eof 分支），取消/退出时随任务结束归还。
+    let mut permit = Some(permit);
     let mut pending = BTreeMap::<u32, Pending>::new();
     let mut reorder = BTreeMap::<u32, Frame>::new();
     let mut reorder_bytes = 0usize;
@@ -322,7 +336,7 @@ async fn run(
         () => {{
             let mut ack = Frame::new(8, id, next_send, vec![]);
             ack.ack = next_recv;
-            ack.window = receive_window(output.len(), reorder_bytes, recv_limit(slots));
+            ack.window = receive_window(output.len(), reorder_bytes, recv_limit(slots, limit));
             carrier.write(ack).await?;
             last_ack = Instant::now();
             unacked = 0;
@@ -341,7 +355,7 @@ async fn run(
                         < sender
                             .congestion
                             .min(remote_window)
-                            .min(window_limit(slots))));
+                            .min(window_limit(slots, limit))));
         let can_receive = !closed && (carrier.packet || output.len() <= 32 * 1024);
         let contiguous = output.make_contiguous();
         tokio::select! {
@@ -353,7 +367,7 @@ async fn run(
                 if n == 0 {
                     return Ok(());
                 }
-                let limit = recv_limit(slots);
+                let limit = recv_limit(slots, limit);
                 let was_zero = receive_window(output.len(), reorder_bytes, limit) == 0;
                 output.drain(..n);
                 // 窗口随缓存收缩到 0 后，应用排空必须马上通告新窗口，
@@ -367,6 +381,10 @@ async fn run(
                 let n = result?;
                 if n == 0 {
                     eof = true;
+                    // 应用写半关闭：本会话只剩接收排空，立即归还并发名额。
+                    // 原来等到任务退出（对端关闭握手 / 服务端会话超时，30–60 s）才归还，
+                    // 突发后窗口期新连接全被拒（issue #5）。
+                    permit.take();
                     continue;
                 }
                 let mut frame = Frame::new(6, id, next_send, buf[..n].to_vec());
@@ -375,7 +393,7 @@ async fn run(
                     .ok_or_else(|| bad("Mieru sequence exhausted"))?;
                 // 数据段顺带确认，攒着的确认随之清零
                 frame.ack = next_recv;
-                frame.window = receive_window(output.len(), reorder_bytes, recv_limit(slots));
+                frame.window = receive_window(output.len(), reorder_bytes, recv_limit(slots, limit));
                 carrier.write(frame.clone()).await?;
                 unacked = 0;
                 if carrier.packet {
@@ -424,7 +442,7 @@ async fn run(
                             if now.duration_since(p.sent) >= loss_delay {
                                 p.frame.ack = next_recv;
                                 p.frame.window =
-                                    receive_window(output.len(), reorder_bytes, recv_limit(slots));
+                                    receive_window(output.len(), reorder_bytes, recv_limit(slots, limit));
                                 carrier.write(p.frame.clone()).await?;
                                 count(3);
                                 p.tries = p.tries.saturating_add(1);
@@ -525,7 +543,7 @@ async fn run(
                             return Err(io::Error::new(io::ErrorKind::TimedOut, "Mieru retransmission limit reached"));
                         }
                         p.frame.ack = next_recv;
-                        p.frame.window = receive_window(output.len(), reorder_bytes, recv_limit(slots));
+                        p.frame.window = receive_window(output.len(), reorder_bytes, recv_limit(slots, limit));
                         carrier.write(p.frame.clone()).await?;
                         count(3);
                         p.tries += 1;
@@ -551,18 +569,17 @@ fn receive_capacity() -> usize {
 const WINDOW_SAFETY: usize = 256 * 1024;
 /// 单个 UDP 数据报能承载的最大载荷（线上数据报不超过 1500 字节）。
 const MAX_SEGMENT: usize = 1500;
-fn active_sessions(slots: &Semaphore) -> usize {
-    MAX_SESSIONS
-        .saturating_sub(slots.available_permits())
-        .max(1)
+fn active_sessions(slots: &Semaphore, limit: usize) -> usize {
+    // 上限随资源档位（64–512）由调用方传入；tokio 1.x 的 Semaphore 没有容量查询。
+    limit.saturating_sub(slots.available_permits()).max(1)
 }
 /// 现在这个会话可以使用的发送窗口：节点预算按活跃会话数平分。
-fn window_limit(slots: &Semaphore) -> usize {
-    (WINDOW_BUDGET / active_sessions(slots)).clamp(MIN_WINDOW, WINDOW)
+fn window_limit(slots: &Semaphore, limit: usize) -> usize {
+    (WINDOW_BUDGET / active_sessions(slots, limit)).clamp(MIN_WINDOW, WINDOW)
 }
 /// 现在这个会话可以使用的接收窗口：同样按活跃会话数平分节点预算。
-fn recv_limit(slots: &Semaphore) -> usize {
-    (RECV_BUDGET / active_sessions(slots)).clamp(MIN_RECV_WINDOW, RECV_WINDOW)
+fn recv_limit(slots: &Semaphore, limit: usize) -> usize {
+    (RECV_BUDGET / active_sessions(slots, limit)).clamp(MIN_RECV_WINDOW, RECV_WINDOW)
 }
 /// 通告的接收窗口（段数）：会话的窗口份额与缓存空位取较小者。空位按
 /// 容量 − 安全边际 −（重排字节 + 待读字节）折算，与官方实现一致把待读数据也算进窗口
