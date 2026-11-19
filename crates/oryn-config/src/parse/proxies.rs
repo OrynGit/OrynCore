@@ -237,7 +237,12 @@ pub(super) fn parse(root: &Yaml, b: &mut Builder) -> Result<(), ConfigError> {
             }
             "ss" => {
                 let cipher = str_of(p, "cipher").ok_or_else(|| error(&name, "missing cipher"))?;
-                let password = required_password(p, &name)?;
+                // 明文模式（cipher: none）不需要密钥，密码可省略、为空或任意值（与 mihomo 对齐）。
+                let password = if cipher == "none" {
+                    password_value(p).unwrap_or_default()
+                } else {
+                    required_password(p, &name)?
+                };
                 validate_ss(&cipher, &password).map_err(|e| error(&name, &e))?;
                 let plugin = ss_plugin(p, &name, &server)?;
                 let uot = if bool_of(p, "udp-over-tcp").unwrap_or(false) {

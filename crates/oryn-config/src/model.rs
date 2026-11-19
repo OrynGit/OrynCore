@@ -1345,8 +1345,9 @@ pub const SS_AEAD_CIPHERS: &[&str] = &[
     "xchacha20-ietf-poly1305",
 ];
 
-/// Shadowsocks / ShadowsocksR 的旧流式加密方式（没有认证，只为兼容旧服务端）。
+/// Shadowsocks / ShadowsocksR 的旧流式加密与明文方式（没有认证，只为兼容旧服务端或内层已有加密的场景）。
 pub const SS_STREAM_CIPHERS: &[&str] = &[
+    "none",
     "aes-128-ctr",
     "aes-192-ctr",
     "aes-256-ctr",

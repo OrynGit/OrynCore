@@ -724,6 +724,28 @@ fn p1_invalid_credentials_and_transport() {
     }
 }
 
+#[test]
+fn ss_cipher_none_allows_empty_or_any_password() {
+    for (extra, expected_pw) in [
+        ("", ""),
+        (", password: ''", ""),
+        (", password: secret", "secret"),
+    ] {
+        let yaml = format!(
+            "proxies: [{{name: P, type: ss, server: localhost, port: 8388, cipher: none{extra}}}]"
+        );
+        let c = parse_config(&yaml).unwrap_or_else(|e| panic!("{extra}: {e}"));
+        let OutboundKind::Shadowsocks {
+            cipher, password, ..
+        } = &c.outbounds[c.outbound_index("P").unwrap()].kind
+        else {
+            panic!()
+        };
+        assert_eq!(cipher, "none");
+        assert_eq!(password, expected_pw);
+    }
+}
+
 /// 与 Swift 的 `ProxyValidationTests.testValidatorMatchesCoreContract` 共用样例：
 /// App 校验通过的代理 Core 必须接受（且不被跳过）；App 拒绝的写法 Core 也必须拒绝。
 #[test]

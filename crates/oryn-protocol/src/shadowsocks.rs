@@ -116,4 +116,63 @@ mod tests {
             }
         }
     }
+
+    #[tokio::test]
+    async fn cipher_none_tcp_and_udp_roundtrip() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for password in ["", "unused-secret"] {
+            let cfg = config(
+                &TargetAddr::Ip("127.0.0.1:8388".parse().unwrap()),
+                "none",
+                password,
+            )
+            .unwrap();
+            let target = TargetAddr::Domain("example.com".into(), 80);
+
+            // UDP 往返（明文无认证标签）
+            let context = Context::new(ServerType::Local);
+            let control = UdpSocketControlData::default();
+            let mut packet = BytesMut::new();
+            crypto_io::encrypt_server_payload(
+                &context,
+                cfg.method(),
+                cfg.key(),
+                &address(&target).unwrap(),
+                &control,
+                b"ping",
+                &mut packet,
+            );
+            let (n, addr, _) =
+                crypto_io::decrypt_server_payload(&context, cfg.method(), cfg.key(), &mut packet)
+                    .unwrap();
+            assert_eq!(&packet[..n], b"ping");
+            assert_eq!(super::target(addr), target);
+
+            // TCP 往返
+            let (client_io, server_io) = tokio::io::duplex(4096);
+            let mut client = ProxyClientStream::from_stream(
+                Context::new_shared(ServerType::Local),
+                client_io,
+                &cfg,
+                address(&target).unwrap(),
+            );
+            let mut server = ProxyServerStream::from_stream(
+                Context::new_shared(ServerType::Server),
+                server_io,
+                cfg.method(),
+                cfg.key(),
+            );
+            client.write_all(b"hello").await.unwrap();
+            client.flush().await.unwrap();
+            let got_addr = server.handshake().await.unwrap();
+            assert_eq!(super::target(got_addr), target);
+            let mut buf = [0u8; 5];
+            server.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, b"hello");
+            server.write_all(b"world").await.unwrap();
+            server.flush().await.unwrap();
+            client.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, b"world");
+        }
+    }
 }
