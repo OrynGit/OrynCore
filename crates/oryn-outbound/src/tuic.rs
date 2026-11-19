@@ -78,6 +78,7 @@ impl TuicOutbound {
             hop: None,
             rendezvous: None,
             zero_rtt: spec.reduce_rtt,
+            keep_alive: None,
         });
         Arc::new(Self {
             name,

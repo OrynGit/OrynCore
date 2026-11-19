@@ -144,6 +144,8 @@ impl HysteriaOutbound {
             hop,
             rendezvous: None,
             zero_rtt: false,
+            // 与官方客户端一致：服务端空闲超时（默认 30 s）前保活，长连接上的流不会因空闲被拆
+            keep_alive: Some(oryn_quic::KEEP_ALIVE),
         });
         Arc::new(Self {
             name,

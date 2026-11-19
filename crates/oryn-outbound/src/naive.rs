@@ -87,6 +87,7 @@ impl NaiveOutbound {
                 hop: None,
                 rendezvous: None,
                 zero_rtt: false,
+                keep_alive: None,
             })
         });
         #[cfg(not(feature = "hysteria2"))]

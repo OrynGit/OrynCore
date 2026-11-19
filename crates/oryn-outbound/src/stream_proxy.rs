@@ -136,6 +136,7 @@ impl StreamProxyOutbound {
                         hop: None,
                         rendezvous: None,
                         zero_rtt: false,
+                        keep_alive: None,
                     }),
                     streams: crate::slots::Slots::default(),
                 })

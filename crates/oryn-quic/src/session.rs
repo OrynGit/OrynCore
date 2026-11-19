@@ -48,6 +48,9 @@ pub struct QuicParams {
     pub rendezvous: Option<Arc<dyn Rendezvous>>,
     /// 有会话票据时以 0-RTT 发起连接（TUIC `reduce-rtt`）。服务器拒绝时，0-RTT 期间打开的流会失败。
     pub zero_rtt: bool,
+    /// QUIC 层保活（PING）间隔。`None` 时连接空闲 30 s 即关闭，其上仍打开的流随之失效；
+    /// 协议自带心跳（TUIC）或不需要长连接的出站保持 `None`。
+    pub keep_alive: Option<Duration>,
 }
 
 #[async_trait::async_trait]
@@ -365,7 +368,7 @@ impl QuicClient {
             .map_err(std::io::Error::other)?;
         transport
             .max_idle_timeout(Some(idle))
-            .keep_alive_interval(None)
+            .keep_alive_interval(self.params.keep_alive)
             .stream_receive_window(quinn::VarInt::from_u32(STREAM_RECEIVE_WINDOW))
             .receive_window(quinn::VarInt::from_u32(RECEIVE_WINDOW))
             .send_window(if brutal {
@@ -426,4 +429,82 @@ fn pick(ranges: &[(u16, u16)], count: u32, n: u32) -> u16 {
         left -= width;
     }
     ranges.first().map(|range| range.0).unwrap_or(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 本机 QUIC 服务端，空闲超时 `idle`。
+    fn server(idle: Duration) -> quinn::Endpoint {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let tls = rustls::ServerConfig::builder_with_provider(oryn_tls::provider())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.cert.der().clone()],
+                rustls::pki_types::PrivateKeyDer::Pkcs8(cert.signing_key.serialize_der().into()),
+            )
+            .unwrap();
+        let mut config = quinn::ServerConfig::with_crypto(Arc::new(
+            quinn::crypto::rustls::QuicServerConfig::try_from(tls).unwrap(),
+        ));
+        let mut transport = quinn::TransportConfig::default();
+        transport.max_idle_timeout(Some(idle.try_into().unwrap()));
+        config.transport_config(Arc::new(transport));
+        quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap()
+    }
+
+    fn client(keep_alive: Option<Duration>) -> Arc<QuicClient> {
+        QuicClient::new(QuicParams {
+            datagrams: Arc::new(oryn_udp::UdpFactory),
+            alpn: Vec::new(),
+            skip_verify: true,
+            fingerprint: None,
+            disable_sni: false,
+            congestion: Congestion::Bbr,
+            brutal_rate: None,
+            obfs: None,
+            hop: None,
+            rendezvous: None,
+            zero_rtt: false,
+            keep_alive,
+        })
+    }
+
+    /// 流上写一段、空闲超过服务端空闲超时、再写一段，返回服务端是否完整收到。
+    async fn survives_idle(keep_alive: Option<Duration>) -> bool {
+        let endpoint = server(Duration::from_secs(1));
+        let addr = endpoint.local_addr().unwrap();
+        let receiver = tokio::spawn(async move {
+            let conn = endpoint.accept().await.unwrap().await.unwrap();
+            let mut stream = conn.accept_uni().await.ok()?;
+            stream.read_to_end(64).await.ok()
+        });
+        let client = client(keep_alive);
+        let conn = client
+            .connection(addr.ip(), "localhost", addr.port())
+            .await
+            .unwrap();
+        let mut stream = conn.open_uni().await.unwrap();
+        stream.write_all(b"before").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        let sent = stream.write_all(b"after").await.is_ok() && stream.finish().is_ok();
+        let received = receiver.await.unwrap();
+        sent && received.as_deref() == Some(b"beforeafter".as_slice())
+    }
+
+    /// 空闲超过服务端超时后，长连接上的流仍可用（OrynCore#14）。
+    #[tokio::test]
+    async fn keep_alive_keeps_idle_stream_usable() {
+        assert!(
+            !survives_idle(None).await,
+            "without keep-alive the idle connection should time out"
+        );
+        assert!(
+            survives_idle(Some(Duration::from_millis(300))).await,
+            "keep-alive should keep the idle connection alive"
+        );
+    }
 }
