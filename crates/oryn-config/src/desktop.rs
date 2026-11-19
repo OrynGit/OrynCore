@@ -270,6 +270,13 @@ fn parse_tun(tun: &Yaml, warnings: &mut Vec<String>) -> Result<TunSettings, Conf
             return Err(ConfigError(format!("tun: more than {MAX_LIST} route entries")));
         }
     }
+    // dns-hijack 只能接管进入 TUN 的流量；不开 auto-route 时发往 8.8.8.8:53 之类的查询走原路由，
+    // 不会经过核心（issue #9）。
+    if !settings.auto_route && !settings.dns_hijack.is_empty() {
+        warnings.push(
+            "tun.dns-hijack only sees traffic routed into the TUN; enable tun.auto-route (or route DNS servers into the TUN yourself)".into(),
+        );
+    }
     if settings.inet4_address.is_empty() {
         settings.inet4_address.push(IpCidr::parse(DEFAULT_INET4_ADDRESS).expect("valid default"));
     }
@@ -386,6 +393,16 @@ mod tests {
         assert_eq!(s.effective_routing_mark(), Some(2022));
         // stack、mixed-port、strict-route、未知键各一条警告
         assert_eq!(s.warnings.len(), 4, "{:?}", s.warnings);
+    }
+
+    #[test]
+    fn dns_hijack_without_auto_route_warns() {
+        let s = parse_desktop("tun: {enable: true, dns-hijack: [any:53]}").unwrap();
+        assert!(s.warnings.iter().any(|w| w.contains("tun.auto-route")), "{:?}", s.warnings);
+        let s = parse_desktop("tun: {enable: true, auto-route: true, dns-hijack: [any:53]}").unwrap();
+        assert!(s.warnings.is_empty(), "{:?}", s.warnings);
+        let s = parse_desktop("tun: {enable: true}").unwrap();
+        assert!(s.warnings.is_empty(), "{:?}", s.warnings);
     }
 
     #[test]
