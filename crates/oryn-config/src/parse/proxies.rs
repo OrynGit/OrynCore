@@ -1708,10 +1708,24 @@ fn ss_plugin(p: &Yaml, name: &str, server: &TargetAddr) -> Result<SsPlugin, Conf
             Ok(SsPlugin::Obfs(ObfsSpec { tls, host }))
         }
         "v2ray-plugin" | "gost-plugin" => {
-            let mode = str_of(opts, "mode").unwrap_or_else(|| "websocket".into());
-            if mode != "websocket" {
-                return Err(error(name, "only websocket plugin mode is supported"));
-            }
+            let is_gost = plugin == "gost-plugin";
+            let mode = str_of(opts, "mode")
+                .unwrap_or_else(|| "websocket".into())
+                .to_ascii_lowercase();
+            let (mode_tls, mode_mux) = if is_gost {
+                match mode.as_str() {
+                    "websocket" | "ws" => (false, false),
+                    "wss" => (true, false),
+                    "mws" => (false, true),
+                    "mwss" => (true, true),
+                    _ => return Err(error(name, "only websocket plugin mode is supported")),
+                }
+            } else {
+                if mode != "websocket" {
+                    return Err(error(name, "only websocket plugin mode is supported"));
+                }
+                (false, true)
+            };
             if bool_of(opts, "v2ray-http-upgrade").unwrap_or(false) {
                 return Err(error(name, "v2ray-plugin HTTPUpgrade is not supported"));
             }
@@ -1721,7 +1735,7 @@ fn ss_plugin(p: &Yaml, name: &str, server: &TargetAddr) -> Result<SsPlugin, Conf
                 return Err(error(name, "invalid v2ray-plugin host or path"));
             }
             let headers = transport_headers(opts, name)?;
-            let tls = if bool_of(opts, "tls").unwrap_or(false) {
+            let tls = if bool_of(opts, "tls").unwrap_or(mode_tls) {
                 let fingerprint = match str_of(opts, "fingerprint") {
                     Some(s) => Some(
                         hex::<32>(&s.replace(':', ""))
@@ -1750,8 +1764,9 @@ fn ss_plugin(p: &Yaml, name: &str, server: &TargetAddr) -> Result<SsPlugin, Conf
             } else {
                 None
             };
-            // 两个插件默认都开启复用：v2ray-plugin 是 Mux.Cool，gost-plugin 是 smux（与 mihomo 相同）
-            let mux = bool_of(opts, "mux").unwrap_or(true);
+            // v2ray-plugin 服务端默认开启 Mux.Cool，因此默认 mux=true；
+            // gost-plugin 的 ws/wss 模式是裸 WebSocket（无 smux），只有 mws/mwss 或显式 mux: true 才启用 smux。
+            let mux = bool_of(opts, "mux").unwrap_or(mode_mux);
             let spec = V2RayPluginSpec {
                 tls,
                 host,
@@ -1759,7 +1774,7 @@ fn ss_plugin(p: &Yaml, name: &str, server: &TargetAddr) -> Result<SsPlugin, Conf
                 headers,
                 mux,
             };
-            Ok(if plugin == "gost-plugin" {
+            Ok(if is_gost {
                 SsPlugin::Gost(spec)
             } else {
                 SsPlugin::V2Ray(spec)

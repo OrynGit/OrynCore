@@ -1022,11 +1022,22 @@ fn shadowsocks_plugins_and_udp_over_tcp() {
             "{extra}: {p:?}"
         );
     }
-    // gost-plugin：字段与 v2ray-plugin 相同，mux（smux）默认开启
+    // gost-plugin：ws/websocket/wss 默认无 smux（与 gost-plugin v1.6.3 服务端默认 ws 模式一致），
+    // mws/mwss 或显式 mux: true 才启用 smux。
     let (p, _) = ss_plugin_of("plugin: gost-plugin, plugin-opts: {mode: websocket, tls: true, host: cdn.example, path: /gost}").unwrap();
     assert!(
-        matches!(p, SsPlugin::Gost(g) if g.mux && g.path == "/gost" && g.tls.as_ref().unwrap().sni.as_deref() == Some("cdn.example"))
+        matches!(p, SsPlugin::Gost(g) if !g.mux && g.path == "/gost" && g.tls.as_ref().unwrap().sni.as_deref() == Some("cdn.example"))
     );
+    let (p, _) = ss_plugin_of("plugin: gost-plugin, plugin-opts: {mode: ws, host: cdn.example}").unwrap();
+    assert!(matches!(p, SsPlugin::Gost(g) if !g.mux && g.tls.is_none()));
+    let (p, _) = ss_plugin_of("plugin: gost-plugin, plugin-opts: {mode: wss, host: cdn.example}").unwrap();
+    assert!(matches!(p, SsPlugin::Gost(g) if !g.mux && g.tls.is_some()));
+    let (p, _) = ss_plugin_of("plugin: gost-plugin, plugin-opts: {mode: mws, host: cdn.example}").unwrap();
+    assert!(matches!(p, SsPlugin::Gost(g) if g.mux && g.tls.is_none()));
+    let (p, _) = ss_plugin_of("plugin: gost-plugin, plugin-opts: {mode: mwss, host: cdn.example}").unwrap();
+    assert!(matches!(p, SsPlugin::Gost(g) if g.mux && g.tls.is_some()));
+    let (p, _) = ss_plugin_of("plugin: gost-plugin, plugin-opts: {mode: websocket, mux: true}").unwrap();
+    assert!(matches!(p, SsPlugin::Gost(g) if g.mux && g.tls.is_none()));
     let (p, _) = ss_plugin_of("plugin: gost-plugin, plugin-opts: {mux: false}").unwrap();
     assert!(matches!(p, SsPlugin::Gost(g) if !g.mux && g.tls.is_none()));
     assert!(ss_plugin_of("plugin: gost-plugin, plugin-opts: {mode: quic}").is_err());
