@@ -35,7 +35,7 @@ fn admission_actual_factory_unpolled_overload_reload_and_recovery() {
         );
         let mut operations = Vec::new();
         let mut clients = Vec::new();
-        for index in 0..8 {
+        for index in 0..32 {
             let (client, server, peer) = pair().await;
             clients.push(client);
             operations.push(
@@ -55,7 +55,7 @@ fn admission_actual_factory_unpolled_overload_reload_and_recovery() {
         // 真实入口 future 尚未 poll 已收费；配置代际不能重置旧连接额度。
         ctx.apply_config(config());
         assert!(ctx.admission.try_tcp().is_none());
-        let dns: Vec<_> = (0..4).map(|_| ctx.admission.try_dns().unwrap()).collect();
+        let dns: Vec<_> = (0..8).map(|_| ctx.admission.try_dns().unwrap()).collect();
         assert!(ctx.admission.try_dns().is_none());
         let (mut client, server, peer) = pair().await;
         assert!(admit(ctx.clone(), server, peer, ListenerKind::Http).is_none());
@@ -70,14 +70,15 @@ fn admission_actual_factory_unpolled_overload_reload_and_recovery() {
         let operation = admit(ctx.clone(), server, peer, ListenerKind::Socks).unwrap();
         drop(client); // 协商错误路径也必须退账。
         operation.await;
-        let recovered: Vec<_> = (0..8).map(|_| ctx.admission.try_tcp().unwrap()).collect();
+        // 重开额度全部可再取回；未完成握手的连接受 establishing 档（修后 32）约束。
+        let recovered: Vec<_> = (0..32).map(|_| ctx.admission.try_tcp().unwrap()).collect();
         assert!(ctx.admission.try_tcp().is_none());
         drop(recovered);
     }));
 }
 
 #[test]
-fn admission_64_established_local_connections_keep_active_only() {
+fn admission_256_established_local_connections_keep_active_only() {
     let _lock = crate::udp::performance_survey::STACK_LOCK.lock().unwrap();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -94,7 +95,7 @@ fn admission_64_established_local_connections_keep_active_only() {
         let mut clients = Vec::new();
         let mut remotes = Vec::new();
         let mut tasks = Vec::new();
-        for _ in 0..64 {
+        for _ in 0..256 {
             let (mut client, server, peer) = pair().await;
             tasks.push(tokio::task::spawn_local(
                 admit(ctx.clone(), server, peer, ListenerKind::Http).unwrap(),
@@ -128,7 +129,7 @@ fn admission_64_established_local_connections_keep_active_only() {
             clients.push(client);
         }
         assert!(ctx.admission.try_tcp().is_none());
-        // 已建立连接继续双向转发；第65条拒绝不影响既有relay。
+        // 已建立连接继续双向转发；第257条拒绝不影响既有relay。
         clients[0].write_all(b"hello").await.unwrap();
         let mut data = [0; 5];
         tokio::time::timeout(

@@ -25,8 +25,8 @@ use tokio_util::sync::CancellationToken;
 #[cfg(test)]
 #[path = "udp_lifecycle_tests.rs"]
 mod lifecycle_tests;
-const MAX_IDS: usize = 256;
-const MAX_DESTINATIONS: usize = 32;
+const MAX_IDS: usize = 512;
+const MAX_DESTINATIONS: usize = 128;
 const MAX_PAYLOAD: usize = 8192;
 struct Receiver {
     id: u64,

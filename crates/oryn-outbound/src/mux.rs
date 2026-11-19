@@ -215,7 +215,7 @@ impl Session {
 const YAMUX_WINDOW_HEADROOM: usize = 4 * 1024 * 1024;
 /// AnyTLS 每个出站的会话上限：超过后按负载共享会话。
 /// 每个会话约为一条 TLS 连接加两个任务，与 Trojan 等每 Flow 一条连接的协议同量级。
-const ANY_MAX_SESSIONS: usize = 32;
+const ANY_MAX_SESSIONS: usize = 128;
 struct Entry {
     session: Arc<Session>,
     active: Arc<AtomicUsize>,

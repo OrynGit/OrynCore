@@ -28,11 +28,17 @@ pub enum ResourceProfile {
 impl Default for ResourceProfile {
     fn default() -> Self {
         #[cfg(target_os = "macos")]
-        { Self::Constrained }
+        {
+            Self::Constrained
+        }
         #[cfg(target_os = "ios")]
-        { Self::MobilePlus }
+        {
+            Self::MobilePlus
+        }
         #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-        { Self::Constrained }
+        {
+            Self::Constrained
+        }
     }
 }
 
@@ -57,21 +63,24 @@ pub(crate) struct ResourceLimits {
 impl ResourceProfile {
     pub(crate) fn limits(self) -> ResourceLimits {
         let (active, establishing, http, udp_sessions) = match self {
-            Self::Constrained => (Some(64), 8, Some(32), 512),
+            // Constrained 是 macOS/Linux 桌面的默认档：浏览器一次页面加载就有几十条并发
+            // 握手，establishing=8 会让后续握手集体排队（issue #7）。实测每连接净内存
+            // ~0.1–0.2 MB（#5 取证），active 64→256 的最坏内存增量 ~40 MB，桌面可承受。
+            Self::Constrained => (Some(256), 32, Some(128), 1024),
             #[cfg(target_os = "ios")]
-            Self::MobilePlus => (Some(640), 64, Some(256), 512),
+            Self::MobilePlus => (Some(640), 128, Some(512), 1024),
             #[cfg(any(target_os = "macos", target_os = "linux"))]
-            Self::DesktopHigh => (None, 48, None, 2048),
+            Self::DesktopHigh => (None, 128, None, 4096),
         };
         ResourceLimits {
             active,
             establishing,
             establishing_soft: match self {
                 #[cfg(target_os = "ios")]
-                Self::MobilePlus => 32,
+                Self::MobilePlus => 64,
                 _ => establishing,
             },
-            dns: 4,
+            dns: 8,
             http_connections: http,
             http_transactions: http,
             http_upstream_establish: match self {
@@ -90,8 +99,9 @@ impl ResourceProfile {
             },
             wg_workers: match self {
                 #[cfg(any(target_os = "macos", target_os = "linux"))]
-                Self::DesktopHigh => std::thread::available_parallelism()
-                    .map_or(1, |n| (n.get() / 2).clamp(1, 4)),
+                Self::DesktopHigh => {
+                    std::thread::available_parallelism().map_or(1, |n| (n.get() / 2).clamp(1, 4))
+                }
                 _ => 1,
             },
         }
