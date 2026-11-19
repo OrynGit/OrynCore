@@ -10,7 +10,7 @@ use std::future::Future;
 use std::io::{self, IoSliceMut};
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
@@ -21,6 +21,8 @@ use oryn_udp::Datagrams;
 use quinn::udp::{RecvMeta, Transmit};
 use quinn::{AsyncUdpSocket, UdpPoller};
 use tokio::sync::{mpsc, Notify};
+
+use crate::brutal::Pacer;
 
 const QUEUE: usize = 64;
 /// 接收的单个线上数据报上限：覆盖 jumbo 帧链路与经 dialer-proxy 的大包。
@@ -427,6 +429,7 @@ impl QuicSocket {
         stable: SocketAddr,
         hop: Arc<HopPort>,
         obfs: Option<Obfs>,
+        pace: Option<Arc<AtomicU64>>,
     ) -> io::Result<Arc<Self>> {
         // 对 quinn 呈现的本地地址只用来区分地址族
         let local = SocketAddr::new(
@@ -451,6 +454,7 @@ impl QuicSocket {
             let obfs = obfs.clone();
             let pool = tx_pool.clone();
             tokio::spawn(async move {
+                let mut pacer = pace.map(Pacer::new);
                 let mut gecko_id = 0u8;
                 let mut wire = Vec::with_capacity(POOL_INITIAL);
                 while let Some(first) = out_rx.recv().await {
@@ -458,6 +462,11 @@ impl QuicSocket {
                     let mut next = Some(first);
                     let mut batch = 0;
                     while let Some(packet) = next.take() {
+                        // Brutal 的速率在这里落实：quinn 的步调只跟随窗口 ÷ RTT，
+                        // 低时延链路上窗口下限就足以让发送远超配置速率
+                        if let Some(pacer) = &mut pacer {
+                            pacer.wait(packet.len()).await;
+                        }
                         writable_sender.notify_waiters();
                         let mut dest = stable;
                         let port = hop.0.load(Ordering::Relaxed);

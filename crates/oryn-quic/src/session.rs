@@ -270,7 +270,13 @@ impl QuicClient {
             Some(_) => Arc::new(HopPort(std::sync::atomic::AtomicU16::new(0))),
             None => self.hop_port.clone(),
         };
-        let socket = QuicSocket::bind(udp, remote, hop, self.params.obfs.clone())?;
+        // Brutal 是否生效在建连时确定（模式切换会重建连接），速率本身可在认证后调低
+        let pace = self
+            .params
+            .brutal_rate
+            .clone()
+            .filter(|_| self.use_brutal.load(Ordering::Relaxed));
+        let socket = QuicSocket::bind(udp, remote, hop, self.params.obfs.clone(), pace)?;
         let endpoint = quinn::Endpoint::new_with_abstract_socket(
             quinn::EndpointConfig::default(),
             None,
@@ -456,7 +462,7 @@ mod tests {
         quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap()
     }
 
-    fn client(keep_alive: Option<Duration>) -> Arc<QuicClient> {
+    fn client(keep_alive: Option<Duration>, brutal: Option<u64>) -> Arc<QuicClient> {
         QuicClient::new(QuicParams {
             datagrams: Arc::new(oryn_udp::UdpFactory),
             alpn: Vec::new(),
@@ -464,7 +470,7 @@ mod tests {
             fingerprint: None,
             disable_sni: false,
             congestion: Congestion::Bbr,
-            brutal_rate: None,
+            brutal_rate: brutal.map(|rate| Arc::new(AtomicU64::new(rate))),
             obfs: None,
             hop: None,
             rendezvous: None,
@@ -482,7 +488,7 @@ mod tests {
             let mut stream = conn.accept_uni().await.ok()?;
             stream.read_to_end(64).await.ok()
         });
-        let client = client(keep_alive);
+        let client = client(keep_alive, None);
         let conn = client
             .connection(addr.ip(), "localhost", addr.port())
             .await
@@ -505,6 +511,41 @@ mod tests {
         assert!(
             survives_idle(Some(Duration::from_millis(300))).await,
             "keep-alive should keep the idle connection alive"
+        );
+    }
+
+    /// 上传 `bytes` 字节，返回服务端收完所用的时间。
+    async fn upload(rate: u64, bytes: usize) -> Duration {
+        let endpoint = server(Duration::from_secs(30));
+        let addr = endpoint.local_addr().unwrap();
+        let receiver = tokio::spawn(async move {
+            let conn = endpoint.accept().await.unwrap().await.unwrap();
+            let mut stream = conn.accept_uni().await.unwrap();
+            let start = tokio::time::Instant::now();
+            let data = stream.read_to_end(usize::MAX).await.unwrap();
+            (data.len(), start.elapsed())
+        });
+        let client = client(None, Some(rate));
+        let conn = client
+            .connection(addr.ip(), "localhost", addr.port())
+            .await
+            .unwrap();
+        let mut stream = conn.open_uni().await.unwrap();
+        stream.write_all(&vec![0u8; bytes]).await.unwrap();
+        stream.finish().unwrap();
+        let (received, elapsed) = receiver.await.unwrap();
+        assert_eq!(received, bytes);
+        elapsed
+    }
+
+    /// 本机回环往返不到 1 ms：只靠窗口时 Brutal 远超配置速率（OrynCore#15，修复前约 340 Mbit/s）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn brutal_upload_holds_configured_rate_on_loopback() {
+        // 20 Mbit/s = 2.5 MB/s，上传 2.5 MB 应约 1 s
+        let elapsed = upload(2_500_000, 2_500_000).await.as_secs_f64();
+        assert!(
+            (0.85..1.5).contains(&elapsed),
+            "brutal upload took {elapsed:.3}s, expected about 1s"
         );
     }
 }
