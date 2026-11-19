@@ -90,19 +90,21 @@ pub(super) fn parse(
             ))
         }
     };
-    let transport_udp = match required("transport")?.as_str() {
+    // mihomo 生态的配置惯用小写枚举（`transport: tcp`），三个枚举字段都按大小写不敏感处理。
+    let upper = |key| str_of(p, key).unwrap_or_default().to_ascii_uppercase();
+    let transport_udp = match required("transport")?.to_ascii_uppercase().as_str() {
         "TCP" => false,
         "UDP" => true,
         _ => return Err(error(name, "Mieru transport must be TCP or UDP")),
     };
-    let multiplexing = match str_of(p, "multiplexing").unwrap_or_default().as_str() {
+    let multiplexing = match upper("multiplexing").as_str() {
         "" | "MULTIPLEXING_DEFAULT" | "MULTIPLEXING_LOW" => 4,
         "MULTIPLEXING_OFF" => 1,
         "MULTIPLEXING_MIDDLE" => 8,
         "MULTIPLEXING_HIGH" => 16,
         _ => return Err(error(name, "invalid Mieru multiplexing")),
     };
-    let no_wait = match str_of(p, "handshake-mode").unwrap_or_default().as_str() {
+    let no_wait = match upper("handshake-mode").as_str() {
         "" | "HANDSHAKE_DEFAULT" | "HANDSHAKE_STANDARD" => false,
         "HANDSHAKE_NO_WAIT" => true,
         _ => return Err(error(name, "invalid Mieru handshake-mode")),
@@ -159,5 +161,26 @@ mod tests {
         ] {
             assert!(parse(fields).is_err(), "{fields}");
         }
+    }
+
+    #[test]
+    fn mieru_enums_are_case_insensitive() {
+        let parse = |fields: &str| {
+            let c = parse_config(&format!(
+                "proxies:\n- {{name: M, type: mieru, server: proxy.test, port: 443, username: user, password: secret{fields}}}\nrules: ['MATCH,M']"
+            ))
+            .unwrap();
+            match &c.outbounds[c.outbound_index("M").unwrap()].kind {
+                OutboundKind::Mieru(spec) => spec.clone(),
+                _ => unreachable!(),
+            }
+        };
+        assert!(!parse(", transport: tcp").transport_udp);
+        assert!(parse(", transport: udp").transport_udp);
+        assert!(parse(", transport: Udp").transport_udp);
+        let s = parse(", transport: tcp, multiplexing: multiplexing_high, handshake-mode: handshake_no_wait");
+        assert_eq!((s.multiplexing, s.no_wait), (16, true));
+        let s = parse(", transport: TCP, multiplexing: MULTIPLEXING_OFF, handshake-mode: HANDSHAKE_STANDARD");
+        assert_eq!((s.multiplexing, s.no_wait), (1, false));
     }
 }
