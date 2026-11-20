@@ -42,11 +42,57 @@ pub fn split_rule_line(line: &str) -> Option<(String, String, String)> {
     Some((ty, value, policy))
 }
 
+/// 拆分模块中的一行规则为（类型，值，策略）。
+/// 当 `default_policy` 为 `Some`（如 Loon 插件默认 `"DIRECT"`）且省略策略（两字段形式）时补齐默认策略；
+/// 同时先剥离末尾已知选项，避免 `IP-CIDR,10.0.0.0/8,no-resolve` 将选项误判为策略名。
+pub(super) fn split_module_rule_line(
+    line: &str,
+    default_policy: Option<&str>,
+) -> Option<(String, String, String)> {
+    let mut fields: Vec<&str> = line.split(',').map(str::trim).collect();
+    let ty = fields.first()?.to_ascii_uppercase();
+    if ty == "MATCH" || ty == "FINAL" {
+        let policy = fields.get(1).filter(|p| !p.is_empty())?;
+        return Some((ty, String::new(), policy.to_string()));
+    }
+    let min_fields = if default_policy.is_some() { 2 } else { 3 };
+    while fields.len() > min_fields && OPTIONS.contains(&fields.last()?.to_ascii_lowercase().as_str())
+    {
+        fields.pop();
+    }
+    if fields.len() == 2 {
+        let policy = default_policy?;
+        let value = fields[1];
+        if value.is_empty() {
+            return None;
+        }
+        return Some((ty, value.to_string(), policy.to_string()));
+    }
+    if fields.len() < 3 {
+        return None;
+    }
+    let policy = fields.pop()?.to_string();
+    let value = fields[1..].join(",");
+    if value.is_empty() || policy.is_empty() {
+        return None;
+    }
+    Some((ty, value, policy))
+}
+
 /// 策略之后的选项（小写），即 `split_rule_line` 去掉的部分。
 pub(super) fn rule_options(line: &str) -> Vec<String> {
+    rule_options_min(line, 3)
+}
+
+/// 模块规则末尾的选项（支持两字段 Loon 规则）。
+pub(super) fn module_rule_options(line: &str, allow_two_fields: bool) -> Vec<String> {
+    rule_options_min(line, if allow_two_fields { 2 } else { 3 })
+}
+
+fn rule_options_min(line: &str, min_fields: usize) -> Vec<String> {
     let mut fields: Vec<&str> = line.split(',').map(str::trim).collect();
     let mut out = Vec::new();
-    while fields.len() > 3 {
+    while fields.len() > min_fields {
         let last = fields[fields.len() - 1].to_ascii_lowercase();
         if !OPTIONS.contains(&last.as_str()) {
             break;
@@ -463,6 +509,18 @@ mod tests {
             Some(("FINAL".into(), String::new(), "DIRECT".into()))
         );
         assert_eq!(split_rule_line("DOMAIN,a.com"), None);
+        assert_eq!(
+            split_module_rule_line("DOMAIN,a.com", Some("DIRECT")),
+            Some(("DOMAIN".into(), "a.com".into(), "DIRECT".into()))
+        );
+        assert_eq!(
+            split_module_rule_line("IP-CIDR,10.0.0.0/8,no-resolve", Some("DIRECT")),
+            Some(("IP-CIDR".into(), "10.0.0.0/8".into(), "DIRECT".into()))
+        );
+        assert_eq!(
+            module_rule_options("IP-CIDR,10.0.0.0/8,no-resolve", true),
+            vec!["no-resolve".to_string()]
+        );
     }
 
     #[test]
