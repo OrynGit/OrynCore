@@ -1232,7 +1232,9 @@ fn script_rule(
         for item in split_top(&body, ',').map_err(invalid)? {
             if let Some((k, v)) = item.split_once('=') {
                 let mut key = k.trim().replace('_', "-");
-                if dialect == ModuleFormat::Loon && key == "enabled" { key = "enable".into(); }
+                if key == "enabled" {
+                    key = "enable".into();
+                }
                 let mut value = unquote(v.trim()).map_err(invalid)?;
                 if dialect == ModuleFormat::Loon && matches!(key.as_str(), "enable" | "timeout" | "debug") {
                     if let Some(name) = value.strip_prefix("${").or_else(|| value.strip_prefix('{')).and_then(|v| v.strip_suffix('}')) {
