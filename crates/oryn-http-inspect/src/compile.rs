@@ -1126,20 +1126,45 @@ fn script_rule(
                         }
                     }
                 }
+                let known = matches!(
+                    key.as_str(),
+                    "enable"
+                        | "debug"
+                        | "requires-body"
+                        | "binary-body-mode"
+                        | "full-header-mode"
+                        | "wake-system"
+                        | "timeout"
+                        | "max-size"
+                        | "tag"
+                        | "img-url"
+                        | "engine"
+                        | "ability"
+                        | "script-update-interval"
+                );
+                if !known {
+                    warnings.push(format!("unknown script option {k} ignored"));
+                    if !p.eat(",") {
+                        break;
+                    }
+                    continue;
+                }
                 let valid = match key.as_str() {
                     "enable" | "debug" | "requires-body" | "binary-body-mode" | "full-header-mode"
                     | "wake-system" => matches!(&v, Expr::Literal(Value::Bool(_))),
-                    "timeout" => matches!(&v, Expr::Literal(Value::Number(_) | Value::String(_))),
+                    "timeout" | "script-update-interval" => {
+                        matches!(&v, Expr::Literal(Value::Number(_) | Value::String(_)))
+                    }
                     "max-size" => {
                         matches!(&v, Expr::Literal(Value::Number(n)) if n.as_u64().is_some_and(|n| n > 0))
                     }
                     "tag" | "img-url" | "engine" | "ability" => {
                         matches!(&v, Expr::Template(_) | Expr::Literal(Value::String(_)))
                     }
-                    _ => false,
+                    _ => unreachable!(),
                 };
                 if !valid {
-                    return Err(invalid(format!("invalid or unknown script option {k}")));
+                    return Err(invalid(format!("invalid script option {k}")));
                 }
                 let v = match v {
                     Expr::Literal(v) => string(v),
@@ -1272,17 +1297,29 @@ fn script_rule(
         )));
     }
     for (k, v) in &options {
-        let valid = match k.as_str() {
+        match k.as_str() {
             "enable" | "debug" | "requires-body" | "binary-body-mode" | "full-header-mode"
-            | "wake-system" => matches!(v.as_str(), "true" | "false" | "1" | "0"),
-            "timeout" => v.parse::<f64>().is_ok_and(|n| n.is_finite() && n > 0.0),
-            "max-size" => v.parse::<u64>().is_ok(),
+            | "wake-system" => {
+                if !matches!(v.as_str(), "true" | "false" | "1" | "0") {
+                    return Err(invalid(format!("invalid script option {k}")));
+                }
+            }
+            "timeout" => {
+                if !v.parse::<f64>().is_ok_and(|n| n.is_finite() && n > 0.0) {
+                    return Err(invalid(format!("invalid script option {k}")));
+                }
+            }
+            "max-size" => {
+                if v.parse::<u64>().is_err() {
+                    return Err(invalid(format!("invalid script option {k}")));
+                }
+            }
             "type" | "pattern" | "script-path" | "argument" | "tag" | "engine" | "ability"
-            | "cronexp" | "event-name" | "img-url" => true,
-            _ => false,
-        };
-        if !valid {
-            return Err(invalid(format!("invalid or unknown script option {k}")));
+            | "cronexp" | "event-name" | "img-url" | "script-update-interval" => {}
+            _ => {
+                // 模块生态的选项集持续演进，未知选项降级为警告而非丢弃整条脚本。
+                warnings.push(format!("unknown script option {k} ignored"));
+            }
         }
     }
     if dialect == ModuleFormat::Loon
@@ -1306,13 +1343,14 @@ fn script_rule(
         }
     }
     // `engine=webview` 只是 Surge 的执行引擎偏好；脚本仍按同一 API 在隔离运行时中执行。
+    // `wake-system` 依赖 iOS 后台唤醒调度，降级为警告并保留脚本运行。
     if options
         .get("wake-system")
         .is_some_and(|s| s == "true" || s == "1")
     {
-        return Err(unsupported(
-            "wake-system requires an unavailable iOS scheduling API",
-        ));
+        warnings.push(
+            "script option wake-system is unsupported by Oryn runtime and has no effect".into(),
+        );
     }
     for key in ["tag", "img-url", "requires-body", "binary-body-mode"] {
         // DSL已在原token上检查；raw字符串的字面量${...}不能再次被当模板。
@@ -1453,5 +1491,20 @@ http-request ^http://a\\.test/ script-path=a.js, timeout=200, tag=req
         };
         let err = plan.apply_request(&mut msg).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
+    fn unknown_and_wake_system_script_options_warn_instead_of_dropping() {
+        let text = "\
+[Script]
+s1 = type=http-request, pattern=^https://a\\.test/, script-path=a.js, script-update-interval=86400, wake-system=true, future-flag=1
+s2 = type=http-request, pattern=^https://b\\.test/, script-path=a.js, timeout=bad
+";
+        let ir = oryn_module::parse(text, Some(ModuleFormat::Surge)).unwrap();
+        let mut resources = Resources::new();
+        resources.insert("a.js".into(), Arc::<[u8]>::from(&b"$done({});"[..]));
+        let plan = compile_module(&ir, &BTreeMap::new(), &resources).unwrap();
+        assert_eq!(plan.scripts.len(), 1, "{:?}", plan.warnings);
+        assert_eq!(plan.scripts[0].name, "s1");
+        assert!(plan.warnings.iter().any(|w| w.contains("future-flag")), "{:?}", plan.warnings);
+        assert!(plan.warnings.iter().any(|w| w.contains("wake-system")), "{:?}", plan.warnings);
+        assert!(plan.warnings.iter().any(|w| w.contains("script skipped")), "{:?}", plan.warnings);
     }
 }

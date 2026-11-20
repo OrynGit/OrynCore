@@ -248,7 +248,10 @@ pub fn merge(config: &mut crate::RuntimeConfig) -> Result<(), crate::ConfigError
         let mut dropped_final = false;
         let mut proxy_fallback = false;
         for line in &m.rules {
-            let Some((ty, v, policy)) = rules::split_rule_line(line) else {
+            let is_loon = m.format == ModuleFormat::Loon;
+            let Some((ty, v, policy)) =
+                rules::split_module_rule_line(line, is_loon.then_some("DIRECT"))
+            else {
                 b.warn(format!("malformed module rule `{line}`"));
                 continue;
             };
@@ -272,7 +275,7 @@ pub fn merge(config: &mut crate::RuntimeConfig) -> Result<(), crate::ConfigError
             };
             proxy_fallback |= fallback;
             // 只有 no-resolve 与 src 影响匹配，其余选项与原规则解析一致地丢弃。
-            let options = rules::rule_options(line)
+            let options = rules::module_rule_options(line, is_loon)
                 .into_iter()
                 .rev()
                 .filter(|o| o == "no-resolve" || o == "src")
