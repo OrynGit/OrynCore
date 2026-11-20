@@ -755,8 +755,22 @@ fn legacy(
     }
     let (op, params) = if section == "url rewrite"
         && (dialect == ModuleFormat::Surge
-            || v.get(i + 1)
-                .is_some_and(|op| matches!(*op, "header" | "302" | "307" | "reject")))
+            || v.get(i + 1).is_some_and(|op| {
+                matches!(
+                    op.to_ascii_lowercase().replace('_', "-").as_str(),
+                    "header"
+                        | "302"
+                        | "307"
+                        | "301"
+                        | "308"
+                        | "reject"
+                        | "reject-200"
+                        | "reject-dict"
+                        | "reject-array"
+                        | "reject-img"
+                        | "reject-video"
+                )
+            }))
     {
         if v.len() > i + 2 {
             return Err(invalid("unexpected URL rewrite trailing fields"));
@@ -765,24 +779,36 @@ fn legacy(
     } else {
         (v[i], v[i + 1..].to_vec())
     };
-    let op = if let Some(s) = op.strip_prefix("response-") {
+    let op_norm = op.to_ascii_lowercase().replace('_', "-");
+    let op = if let Some(s) = op_norm.strip_prefix("response-") {
         response = true;
         s
-    } else if let Some(s) = op.strip_prefix("request-") {
+    } else if let Some(s) = op_norm.strip_prefix("request-") {
         s
     } else {
-        op
+        op_norm.as_str()
     };
     match op {
-        "header" => actions.push(Action::Url(
-            pat,
-            e(params.first().ok_or_else(|| invalid("missing URL"))?)?,
-        )),
-        "302" | "307" | "301" | "308" => actions.push(Action::Redirect(
-            op.parse().unwrap(),
-            pat,
-            e(params.first().ok_or_else(|| invalid("missing redirect"))?)?,
-        )),
+        "header" => {
+            let target = e(params.first().ok_or_else(|| invalid("missing URL"))?)?;
+            if matches!(&target, Expr::Literal(Value::String(s)) if s.contains("{{{GATEWAY_ADDRESS}}}"))
+            {
+                warnings.push(
+                    "rewrite target contains {{{GATEWAY_ADDRESS}}}, which is not expanded in OrynCore HTTP inspection".into(),
+                );
+            }
+            actions.push(Action::Url(pat, target));
+        }
+        "302" | "307" | "301" | "308" => {
+            let target = e(params.first().ok_or_else(|| invalid("missing redirect"))?)?;
+            if matches!(&target, Expr::Literal(Value::String(s)) if s.contains("{{{GATEWAY_ADDRESS}}}"))
+            {
+                warnings.push(
+                    "redirect target contains {{{GATEWAY_ADDRESS}}}, which is not expanded in OrynCore HTTP inspection".into(),
+                );
+            }
+            actions.push(Action::Redirect(op.parse().unwrap(), pat, target));
+        }
         "reject" | "reject-200" | "reject-dict" | "reject-array" | "reject-img"
         | "reject-video" => actions.push(Action::Reject(
             if op == "reject" { 404 } else { 200 },
@@ -1528,6 +1554,17 @@ other = type=http-request, pattern=^http://ad\\.test/x, ability=dns, script-path
     }
 
     #[test]
+    fn reject_underscore_and_gateway_address_warning() {
+        let text = "\
+[Rewrite]
+^https://ad\\.test/ reject_img
+^https://gw\\.test/ 302 http://{{{GATEWAY_ADDRESS}}}/ok
+";
+        let ir = oryn_module::parse(text, Some(ModuleFormat::Loon)).unwrap();
+        let plan = compile_module(&ir, &BTreeMap::new(), &Resources::new()).unwrap();
+        assert_eq!(plan.request.len(), 2, "{:?}", plan.warnings);
+        assert!(matches!(&plan.request[0].actions[0], Action::Reject(200, k) if k == "img"));
+        assert!(plan.warnings.iter().any(|w| w.contains("{{{GATEWAY_ADDRESS}}}")), "{:?}", plan.warnings);
     fn map_local_base64_header_and_extended_status_code() {
         let encoded = base64::Engine::encode(
             &base64::engine::general_purpose::STANDARD,
