@@ -388,12 +388,20 @@ impl EngineCtx {
             let Some(ir) = spec.inline.as_ref().filter(|_| spec.enabled) else {
                 continue;
             };
-            if let Err(reason) = crate::modules::allowed(ir, self.system_version()) {
-                spec.enabled = false;
-                config.warnings.push(format!(
-                    "module {} disabled: {reason}",
-                    spec.url.as_deref().unwrap_or("inline")
-                ));
+            match crate::modules::allowed(ir, self.system_version()) {
+                Ok(warnings) => {
+                    let label = spec.url.as_deref().unwrap_or("inline");
+                    for w in warnings {
+                        config.warnings.push(format!("module {label}: {w}"));
+                    }
+                }
+                Err(reason) => {
+                    spec.enabled = false;
+                    config.warnings.push(format!(
+                        "module {} disabled: {reason}",
+                        spec.url.as_deref().unwrap_or("inline")
+                    ));
+                }
             }
         }
         let mut plans = plans.into_iter().peekable();
