@@ -584,6 +584,7 @@ fn legacy(
     line: &str,
     dialect: ModuleFormat,
     res: &Resources,
+    warnings: &mut Vec<String>,
 ) -> io::Result<(bool, Condition, Vec<Action>)> {
     let mut v = Vec::new();
     let mut rest = line.trim();
@@ -654,30 +655,73 @@ fn legacy(
             .map(|s| s.parse::<u16>().map_err(invalid))
             .transpose()?
             .unwrap_or(200);
-        if !(100..=599).contains(&status) {
+        if !(100..=999).contains(&status) {
             return Err(invalid("invalid Map Local HTTP status"));
         }
+        let validate_header = |k: &str, v: &str| -> io::Result<(String, String)> {
+            if k.is_empty()
+                || !k.bytes().all(|b| {
+                    b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
+                })
+                || v.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0)
+            {
+                return Err(invalid("invalid Map Local header"));
+            }
+            Ok((k.to_owned(), v.to_owned()))
+        };
+        let parse_decoded_headers = |decoded: &str| -> Option<Vec<(String, String)>> {
+            let mut out = Vec::new();
+            for line in decoded.split(['\n', '|']) {
+                let line = line.trim_matches('\r').trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let (k, v) = line.split_once(':')?;
+                out.push(validate_header(k.trim(), v.trim()).ok()?);
+            }
+            (!out.is_empty()).then_some(out)
+        };
         let headers: Vec<(String, String)> = fields
             .get("header")
             .map(|s| {
-                s.split('|')
-                    .map(|p| {
-                        let (k, v) = match p.split_once(':') {
-                            Some((k, v)) => (k.trim(), v.trim()),
-                            None if !p.trim().is_empty() => ("Content-Type", p.trim()),
-                            None => return Err(invalid("invalid Map Local header")),
-                        };
-                        if k.is_empty()
-                            || !k.bytes().all(|b| {
-                                b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
-                            })
-                            || v.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0)
-                        {
-                            return Err(invalid("invalid Map Local header"));
-                        }
-                        Ok((k.to_owned(), v.to_owned()))
+                if s.contains(':') || s.contains('|') {
+                    s.split('|')
+                        .map(|p| {
+                            let (k, v) = match p.split_once(':') {
+                                Some((k, v)) => (k.trim(), v.trim()),
+                                None if !p.trim().is_empty() => ("Content-Type", p.trim()),
+                                None => return Err(invalid("invalid Map Local header")),
+                            };
+                            validate_header(k, v)
+                        })
+                        .collect::<io::Result<Vec<_>>>()
+                } else {
+                    let trimmed = s.trim();
+                    if trimmed.is_empty() {
+                        return Err(invalid("invalid Map Local header"));
+                    }
+                    let decoded = base64::Engine::decode(
+                        &base64::engine::general_purpose::STANDARD,
+                        trimmed,
+                    )
+                    .or_else(|_| {
+                        base64::Engine::decode(
+                            &base64::engine::general_purpose::STANDARD_NO_PAD,
+                            trimmed,
+                        )
                     })
-                    .collect::<io::Result<Vec<_>>>()
+                    .ok()
+                    .and_then(|bytes| String::from_utf8(bytes).ok())
+                    .and_then(|text| parse_decoded_headers(&text));
+                    if let Some(parsed) = decoded {
+                        Ok(parsed)
+                    } else {
+                        warnings.push(format!(
+                            "Map Local bare header `{trimmed}` treated as Content-Type (legacy fallback)"
+                        ));
+                        Ok(vec![validate_header("Content-Type", trimmed)?])
+                    }
+                }
             })
             .transpose()?
             .unwrap_or_default();
@@ -910,11 +954,17 @@ pub fn compile_module_with_policies(
     }
     let mut plan = Plan::default();
     for r in &m.rewrites {
+        let mut rw_warnings = Vec::new();
         let compiled = if r.text.starts_with("request if ") || r.text.starts_with("response if ") {
             loon(&r.text, &args, res)
         } else {
-            legacy(&r.section, &r.text, m.format, res)
+            legacy(&r.section, &r.text, m.format, res, &mut rw_warnings)
         };
+        plan.warnings.extend(
+            rw_warnings
+                .into_iter()
+                .map(|w| format!("{}:{}: {w}", r.source.name, r.source.line)),
+        );
         // 行语法/参数与缺失资源隔离；资源内容验证使用独立错误种类，不吞整模块错误。
         let (response, condition, actions) = match compiled {
             Ok(v) => v,
@@ -1478,6 +1528,29 @@ other = type=http-request, pattern=^http://ad\\.test/x, ability=dns, script-path
     }
 
     #[test]
+    fn map_local_base64_header_and_extended_status_code() {
+        let encoded = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            "Content-Type: application/json\r\nX-Test: ok",
+        );
+        let text = format!(
+            "[Map Local]\n^http://a\\.test/ data-type=text data=\"{{}}\" header=\"{encoded}\" status-code=700\n^http://b\\.test/ data-type=text data=\"{{}}\" status-code=1000\n"
+        );
+        let ir = oryn_module::parse(&text, Some(ModuleFormat::Surge)).unwrap();
+        let plan = compile_module(&ir, &BTreeMap::new(), &Resources::new()).unwrap();
+        assert_eq!(plan.request.len(), 1, "{:?}", plan.warnings);
+        let Action::Mock { status, headers, .. } = &plan.request[0].actions[0] else {
+            panic!("expected mock");
+        };
+        assert_eq!(*status, Some(700));
+        assert_eq!(
+            headers,
+            &[
+                ("Content-Type".into(), "application/json".into()),
+                ("X-Test".into(), "ok".into()),
+            ]
+        );
+        assert!(plan.warnings.iter().any(|w| w.contains("invalid Map Local HTTP status")), "{:?}", plan.warnings);
     fn event_script_triggers_and_unsupported_kinds() {
         let text = "\
 [Script]
