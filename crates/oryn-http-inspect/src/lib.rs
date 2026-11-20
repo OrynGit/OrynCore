@@ -649,6 +649,7 @@ impl Plan {
                             url_rewritten = true
                         }
                     }
+                    Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => return Err(e),
                     Err(e) => log::warn!("{}: rewrite skipped: {e}", rule.source),
                 }
             }
@@ -892,6 +893,12 @@ fn perform(
             return Ok(Some(m.response(*status, body.as_bytes().to_vec(), "text/plain")));
         }
         Action::Reject(s, kind) => {
+            if kind == "drop" {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "rejected with REJECT-DROP",
+                ));
+            }
             let (body, ct) = match kind.as_str() {
                 "dict" => (b"{}".to_vec(), "application/json"),
                 "array" => (b"[]".to_vec(), "application/json"),

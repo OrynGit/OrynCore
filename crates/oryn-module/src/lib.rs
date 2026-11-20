@@ -468,10 +468,11 @@ pub fn regex_ascii_classes(pattern: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
-/// 规则策略为拒绝类时，返回 HTTP 检查用的状态码与空响应种类（`""` / `dict` / `array` / `img`）。
+/// 规则策略为拒绝类时，返回 HTTP 检查用的状态码与空响应种类（`""` / `drop` / `dict` / `array` / `img`）。
 pub fn reject_status(policy: &str) -> Option<(u16, &'static str)> {
     match policy.trim().to_ascii_uppercase().as_str() {
-        "REJECT" | "REJECT-DROP" | "REJECT-NO-DROP" => Some((404, "")),
+        "REJECT" | "REJECT-NO-DROP" => Some((404, "")),
+        "REJECT-DROP" => Some((0, "drop")),
         "REJECT-200" => Some((200, "")),
         "REJECT-TINYGIF" | "REJECT-IMG" => Some((200, "img")),
         "REJECT-DICT" => Some((200, "dict")),

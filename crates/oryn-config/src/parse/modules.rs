@@ -336,11 +336,51 @@ pub fn merge(config: &mut crate::RuntimeConfig) -> Result<(), crate::ConfigError
             let Some((key, value)) = line.split_once('=') else {
                 continue;
             };
-            let target = match key.trim() {
+            let key = key.trim();
+            if key.eq_ignore_ascii_case("always-real-ip") {
+                let (prefixed, hosts) = prefixed_hosts(value);
+                if !prefixed {
+                    b.warn(format!(
+                        "module General {key} without %APPEND%/%INSERT% is appended instead of replacing the list"
+                    ));
+                }
+                let mut front = Vec::new();
+                for (insert, raw) in hosts {
+                    let host = raw.trim();
+                    let entry = if host == "*" {
+                        Some(crate::FakeIpFilter::Glob("*".into()))
+                    } else if let Some(rest) = host.strip_prefix("+.") {
+                        if rest.contains('*') {
+                            Some(crate::FakeIpFilter::Glob(format!("*.{rest}")))
+                        } else {
+                            crate::DomainPattern::parse(host).map(crate::FakeIpFilter::Domain)
+                        }
+                    } else {
+                        crate::DomainPattern::parse(host).map(crate::FakeIpFilter::Domain)
+                    };
+                    let Some(entry) = entry else {
+                        b.warn(format!(
+                            "module {label}: invalid always-real-ip pattern `{host}` ignored"
+                        ));
+                        continue;
+                    };
+                    if config.dns.fake_ip_filter.contains(&entry) || front.contains(&entry) {
+                        continue;
+                    }
+                    if insert {
+                        front.push(entry);
+                    } else {
+                        config.dns.fake_ip_filter.push(entry);
+                    }
+                }
+                config.dns.fake_ip_filter.splice(0..0, front);
+                continue;
+            }
+            let target = match key {
                 "force-http-engine-hosts" => &mut config.force_http_hosts,
                 "always-raw-tcp-hosts" => &mut config.raw_tcp_hosts,
                 _ => {
-                    b.warn(format!("unsupported module General field {}", key.trim()));
+                    b.warn(format!("unsupported module General field {key}"));
                     continue;
                 }
             };
@@ -349,8 +389,7 @@ pub fn merge(config: &mut crate::RuntimeConfig) -> Result<(), crate::ConfigError
             // 列表，结果依赖模块顺序。重复项去掉。
             if !prefixed {
                 b.warn(format!(
-                    "module General {} without %APPEND%/%INSERT% is appended instead of replacing the list",
-                    key.trim()
+                    "module General {key} without %APPEND%/%INSERT% is appended instead of replacing the list"
                 ));
             }
             merge_hosts(target, hosts);
@@ -364,6 +403,50 @@ pub fn merge(config: &mut crate::RuntimeConfig) -> Result<(), crate::ConfigError
                     ));
                     continue;
                 };
+                let trimmed = v.trim();
+                if let Some(rest) = trimmed
+                    .strip_prefix("server:")
+                    .or_else(|| trimmed.strip_prefix("SERVER:"))
+                    .or_else(|| {
+                        trimmed
+                            .get(..7)
+                            .filter(|p| p.eq_ignore_ascii_case("server:"))
+                            .map(|_| &trimmed[7..])
+                    })
+                {
+                    let rest = rest.trim();
+                    if rest.eq_ignore_ascii_case("system") {
+                        config.dns.forward.insert(
+                            0,
+                            crate::ForwardRule {
+                                matcher: crate::ForwardMatch::Pattern(p),
+                                target: crate::ForwardTarget::Bootstrap,
+                                text: line.clone(),
+                            },
+                        );
+                    } else {
+                        let mut servers = Vec::new();
+                        for raw in rest.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                            match super::dns::parse_server(raw, &b) {
+                                Ok(server) => servers.push(server),
+                                Err(e) => b.warn(format!(
+                                    "module {label}: invalid Host DNS server `{raw}`: {e}"
+                                )),
+                            }
+                        }
+                        if !servers.is_empty() {
+                            config.dns.forward.insert(
+                                0,
+                                crate::ForwardRule {
+                                    matcher: crate::ForwardMatch::Pattern(p),
+                                    target: crate::ForwardTarget::Servers(servers),
+                                    text: line.clone(),
+                                },
+                            );
+                        }
+                    }
+                    continue;
+                }
                 {
                     let ips = v
                         .split(',')
@@ -407,4 +490,29 @@ pub fn merge(config: &mut crate::RuntimeConfig) -> Result<(), crate::ConfigError
     // 拒绝动作的 HTTP 内容由 Inspector 处理；Flow 层继续只有 Outbound。
     let _ = Policy::Pass;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn module_always_real_ip_and_host_server_merge_into_dns() {
+        let yaml = r#"
+dns:
+  enable: true
+  enhanced-mode: fake-ip
+modules:
+  - inline: |
+      [General]
+      always-real-ip = %APPEND% *.real.test, exact.test
+      [Host]
+      corp.test = server:1.1.1.1
+      sys.test = server:system
+"#;
+        let mut cfg = crate::parse_config(yaml).unwrap();
+        super::merge(&mut cfg).unwrap();
+        assert!(cfg.dns.fake_ip_filter.iter().any(|f| matches!(f, crate::FakeIpFilter::Domain(p) if p.matches("a.real.test"))));
+        assert!(cfg.dns.fake_ip_filter.iter().any(|f| matches!(f, crate::FakeIpFilter::Domain(p) if p.matches("exact.test"))));
+        assert!(cfg.dns.forward.iter().any(|r| matches!(&r.target, crate::ForwardTarget::Servers(s) if s[0].host == "1.1.1.1")));
+        assert!(cfg.dns.forward.iter().any(|r| matches!(&r.target, crate::ForwardTarget::Bootstrap)));
+    }
 }

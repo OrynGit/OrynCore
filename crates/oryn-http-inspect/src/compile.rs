@@ -789,6 +789,16 @@ fn legacy(
         op_norm.as_str()
     };
     match op {
+        "header" => actions.push(Action::Url(
+            pat,
+            e(params.first().ok_or_else(|| invalid("missing URL"))?)?,
+        )),
+        "302" | "307" | "301" | "308" => actions.push(Action::Redirect(
+            op.parse().unwrap(),
+            pat,
+            e(params.first().ok_or_else(|| invalid("missing redirect"))?)?,
+        )),
+        "reject" | "reject-drop" | "reject-200" | "reject-dict" | "reject-array" | "reject-img"
         "header" => {
             let target = e(params.first().ok_or_else(|| invalid("missing URL"))?)?;
             if matches!(&target, Expr::Literal(Value::String(s)) if s.contains("{{{GATEWAY_ADDRESS}}}"))
@@ -811,7 +821,11 @@ fn legacy(
         }
         "reject" | "reject-200" | "reject-dict" | "reject-array" | "reject-img"
         | "reject-video" => actions.push(Action::Reject(
-            if op == "reject" { 404 } else { 200 },
+            match op {
+                "reject" => 404,
+                "reject-drop" => 0,
+                _ => 200,
+            },
             op.strip_prefix("reject-").unwrap_or("").into(),
         )),
         "mock-response-body" | "mock-request-body" => {
@@ -1062,7 +1076,12 @@ pub fn compile_module_with_policies(
         plan.warnings.extend(warnings.into_iter().map(|w| format!("{}:{}: script {script_name}: {w}", script.source.name, script.source.line)));
         match result {
             Ok(rule) => {
-                plan.warnings.push(format!("{}:{}: Oryn script resource limits: default timeout 5s, maximum 30s; body size capped at {MAX_BODY} bytes", script.source.name, script.source.line));
+                let max_timeout = if matches!(rule.kind.as_str(), "http-request" | "http-response") {
+                    30
+                } else {
+                    300
+                };
+                plan.warnings.push(format!("{}:{}: Oryn script resource limits: default timeout 5s, maximum {max_timeout}s; body size capped at {MAX_BODY} bytes", script.source.name, script.source.line));
                 plan.scripts.push(rule)
             }
             Err(e)
@@ -1457,6 +1476,12 @@ fn script_rule(
         }
     }
     // 验证后仅做显式转换，不能把小数/字符串解析失败偷偷回退到 5 秒。
+    // HTTP 请求/响应脚本保持 30s 上限以免阻塞连接；cron / generic / event 后台脚本放宽至 300s。
+    let max_timeout: u64 = if matches!(kind.as_str(), "http-request" | "http-response") {
+        30
+    } else {
+        300
+    };
     let timeout = match options.get("timeout") {
         None => 5,
         Some(raw) => {
@@ -1464,9 +1489,9 @@ fn script_rule(
             if !seconds.is_finite() || seconds <= 0.0 {
                 return Err(invalid("timeout requires a finite positive number"));
             }
-            let bounded = seconds.ceil().clamp(1.0, 30.0) as u64;
+            let bounded = seconds.ceil().clamp(1.0, max_timeout as f64) as u64;
             if seconds != bounded as f64 {
-                warnings.push(format!("script timeout {raw}s rounded up and capped to Oryn limit: {bounded}s (maximum 30s)"));
+                warnings.push(format!("script timeout {raw}s rounded up and capped to Oryn limit: {bounded}s (maximum {max_timeout}s)"));
             }
             bounded
         }
@@ -1554,6 +1579,13 @@ other = type=http-request, pattern=^http://ad\\.test/x, ability=dns, script-path
     }
 
     #[test]
+    fn reject_drop_aborts_and_background_script_allows_longer_timeout() {
+        let text = "\
+[Rule]
+URL-REGEX,^http://drop\\.test/,REJECT-DROP
+[Script]
+cron \"0 8 * * *\" script-path=a.js, timeout=200, tag=daily
+http-request ^http://a\\.test/ script-path=a.js, timeout=200, tag=req
     fn reject_underscore_and_gateway_address_warning() {
         let text = "\
 [Rewrite]
@@ -1600,6 +1632,18 @@ dns_s = type=dns, domain=a.test, script-path=a.js
         let mut resources = Resources::new();
         resources.insert("a.js".into(), Arc::<[u8]>::from(&b"$done({});"[..]));
         let plan = compile_module(&ir, &BTreeMap::new(), &resources).unwrap();
+        assert_eq!(plan.scripts.len(), 2, "{:?}", plan.warnings);
+        assert_eq!(plan.scripts[0].timeout, 200);
+        assert_eq!(plan.scripts[1].timeout, 30);
+        let mut msg = Message {
+            url: "http://drop.test/x".into(),
+            method: "GET".into(),
+            status: None,
+            headers: vec![],
+            body: vec![],
+        };
+        let err = plan.apply_request(&mut msg).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
         assert_eq!(plan.scripts.len(), 3, "{:?}", plan.warnings);
         assert_eq!(plan.scripts[0].event.as_deref(), Some("engine-started"));
         assert_eq!(plan.scripts[1].event.as_deref(), Some("profile-reloaded"));

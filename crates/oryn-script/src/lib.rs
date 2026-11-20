@@ -41,7 +41,7 @@ pub fn run(
     let runtime = Runtime::new().map_err(|e| e.to_string())?;
     runtime.set_memory_limit(HEAP_LIMIT);
     runtime.set_max_stack_size(256 * 1024);
-    let end = Instant::now() + input.timeout.min(Duration::from_secs(30));
+    let end = Instant::now() + input.timeout.min(Duration::from_secs(300));
     let cancellation = input.cancellation.clone();
     runtime.set_interrupt_handler(Some(Box::new(move || {
         Instant::now() >= end
