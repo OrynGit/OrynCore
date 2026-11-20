@@ -118,8 +118,14 @@ pub enum ListedPort {
     Fixed(u16),
 }
 
-/// Surge 主机名：整段 `*` 匹配任意主机；`*` / `?` 出现在标签内部时只通配这一级，不跨过点。
-/// 其余写法交给 [`DomainPattern`]（`*.a.com` 仍只匹配一级）。
+fn is_ip_literal(host: &str) -> bool {
+    host.trim_matches(['[', ']'])
+        .parse::<std::net::IpAddr>()
+        .is_ok()
+}
+
+/// Surge 主机名：整段 `*` 匹配任意主机；`<ip-address>` 匹配 IP 字面量；`<simple-hostname>` 匹配无点主机名；
+/// `*` / `?` 出现在标签内部时只通配这一级，不跨过点。其余写法交给 [`DomainPattern`]（`*.a.com` 仍只匹配一级）。
 pub fn hostname_matches(pattern: &str, host: &str) -> bool {
     let pattern = normalize_domain(pattern);
     let host = normalize_domain(host);
@@ -128,6 +134,12 @@ pub fn hostname_matches(pattern: &str, host: &str) -> bool {
     }
     if pattern == "*" {
         return true;
+    }
+    if pattern == "<ip-address>" {
+        return is_ip_literal(&host);
+    }
+    if pattern == "<simple-hostname>" {
+        return !host.contains('.') && !is_ip_literal(&host);
     }
     let infix = pattern
         .split('.')
@@ -147,8 +159,8 @@ pub fn hostname_matches(pattern: &str, host: &str) -> bool {
         })
 }
 
-/// `host`、`host:port`、`*`、`*:port` 是否盖住这次连接。
-/// 模式为 `*` 时，没有域名的连接（按 IP 直连）也命中。
+/// `host`、`host:port`、`host:0`（任意端口）、`*`、`*:port`、`<ip-address>`、`<simple-hostname>` 是否盖住这次连接。
+/// 模式为 `*` 或 `<ip-address>` 时，没有域名的连接（按 IP 直连）也命中。
 pub fn listed_host_matches(
     item: &str,
     domain: Option<&str>,
@@ -172,11 +184,15 @@ pub fn listed_host_matches(
         Some(split) => split,
         None => (item, fallback),
     };
-    if port != wanted {
+    // Surge 官方 Host List 语法：`:0` 表示匹配任意端口。
+    if wanted != 0 && port != wanted {
         return false;
     }
     if pattern == "*" {
         return true;
+    }
+    if pattern.eq_ignore_ascii_case("<ip-address>") {
+        return domain.map_or(true, is_ip_literal);
     }
     domain.is_some_and(|host| hostname_matches(pattern, host))
 }
@@ -290,6 +306,36 @@ mod tests {
             "*.mcdn.bilivideo.cn",
             Some("a.mcdn.bilivideo.cn"),
             8000,
+            ListedPort::Fixed(443)
+        ));
+        assert!(hostname_matches("<ip-address>", "1.2.3.4"));
+        assert!(hostname_matches("<ip-address>", "2001:db8::1"));
+        assert!(!hostname_matches("<ip-address>", "example.com"));
+        assert!(hostname_matches("<simple-hostname>", "router"));
+        assert!(!hostname_matches("<simple-hostname>", "a.example.com"));
+        assert!(!hostname_matches("<simple-hostname>", "1.2.3.4"));
+        assert!(listed_host_matches(
+            "example.com:0",
+            Some("example.com"),
+            8443,
+            ListedPort::Fixed(443)
+        ));
+        assert!(listed_host_matches(
+            "<ip-address>",
+            None,
+            443,
+            ListedPort::Fixed(443)
+        ));
+        assert!(listed_host_matches(
+            "<ip-address>:0",
+            Some("192.168.1.1"),
+            8080,
+            ListedPort::Fixed(443)
+        ));
+        assert!(!listed_host_matches(
+            "<simple-hostname>",
+            Some("www.example.com"),
+            443,
             ListedPort::Fixed(443)
         ));
         assert!(listed_host_matches(
