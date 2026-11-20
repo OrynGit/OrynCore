@@ -789,16 +789,6 @@ fn legacy(
         op_norm.as_str()
     };
     match op {
-        "header" => actions.push(Action::Url(
-            pat,
-            e(params.first().ok_or_else(|| invalid("missing URL"))?)?,
-        )),
-        "302" | "307" | "301" | "308" => actions.push(Action::Redirect(
-            op.parse().unwrap(),
-            pat,
-            e(params.first().ok_or_else(|| invalid("missing redirect"))?)?,
-        )),
-        "reject" | "reject-drop" | "reject-200" | "reject-dict" | "reject-array" | "reject-img"
         "header" => {
             let target = e(params.first().ok_or_else(|| invalid("missing URL"))?)?;
             if matches!(&target, Expr::Literal(Value::String(s)) if s.contains("{{{GATEWAY_ADDRESS}}}"))
@@ -819,7 +809,7 @@ fn legacy(
             }
             actions.push(Action::Redirect(op.parse().unwrap(), pat, target));
         }
-        "reject" | "reject-200" | "reject-dict" | "reject-array" | "reject-img"
+        "reject" | "reject-drop" | "reject-200" | "reject-dict" | "reject-array" | "reject-img"
         | "reject-video" => actions.push(Action::Reject(
             match op {
                 "reject" => 404,
@@ -1586,6 +1576,26 @@ URL-REGEX,^http://drop\\.test/,REJECT-DROP
 [Script]
 cron \"0 8 * * *\" script-path=a.js, timeout=200, tag=daily
 http-request ^http://a\\.test/ script-path=a.js, timeout=200, tag=req
+";
+        let ir = oryn_module::parse(text, Some(ModuleFormat::Loon)).unwrap();
+        let mut resources = Resources::new();
+        resources.insert("a.js".into(), Arc::<[u8]>::from(&b"$done({});"[..]));
+        let plan = compile_module(&ir, &BTreeMap::new(), &resources).unwrap();
+        assert_eq!(plan.scripts.len(), 2, "{:?}", plan.warnings);
+        assert_eq!(plan.scripts[0].timeout, 200);
+        assert_eq!(plan.scripts[1].timeout, 30);
+        let mut msg = Message {
+            url: "http://drop.test/x".into(),
+            method: "GET".into(),
+            status: None,
+            headers: vec![],
+            body: vec![],
+        };
+        let err = plan.apply_request(&mut msg).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
+    }
+
+    #[test]
     fn reject_underscore_and_gateway_address_warning() {
         let text = "\
 [Rewrite]
@@ -1597,6 +1607,9 @@ http-request ^http://a\\.test/ script-path=a.js, timeout=200, tag=req
         assert_eq!(plan.request.len(), 2, "{:?}", plan.warnings);
         assert!(matches!(&plan.request[0].actions[0], Action::Reject(200, k) if k == "img"));
         assert!(plan.warnings.iter().any(|w| w.contains("{{{GATEWAY_ADDRESS}}}")), "{:?}", plan.warnings);
+    }
+
+    #[test]
     fn map_local_base64_header_and_extended_status_code() {
         let encoded = base64::Engine::encode(
             &base64::engine::general_purpose::STANDARD,
@@ -1620,6 +1633,9 @@ http-request ^http://a\\.test/ script-path=a.js, timeout=200, tag=req
             ]
         );
         assert!(plan.warnings.iter().any(|w| w.contains("invalid Map Local HTTP status")), "{:?}", plan.warnings);
+    }
+
+    #[test]
     fn event_script_triggers_and_unsupported_kinds() {
         let text = "\
 [Script]
@@ -1632,24 +1648,15 @@ dns_s = type=dns, domain=a.test, script-path=a.js
         let mut resources = Resources::new();
         resources.insert("a.js".into(), Arc::<[u8]>::from(&b"$done({});"[..]));
         let plan = compile_module(&ir, &BTreeMap::new(), &resources).unwrap();
-        assert_eq!(plan.scripts.len(), 2, "{:?}", plan.warnings);
-        assert_eq!(plan.scripts[0].timeout, 200);
-        assert_eq!(plan.scripts[1].timeout, 30);
-        let mut msg = Message {
-            url: "http://drop.test/x".into(),
-            method: "GET".into(),
-            status: None,
-            headers: vec![],
-            body: vec![],
-        };
-        let err = plan.apply_request(&mut msg).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
         assert_eq!(plan.scripts.len(), 3, "{:?}", plan.warnings);
         assert_eq!(plan.scripts[0].event.as_deref(), Some("engine-started"));
         assert_eq!(plan.scripts[1].event.as_deref(), Some("profile-reloaded"));
         assert_eq!(plan.scripts[2].event.as_deref(), Some("notification"));
         assert!(plan.warnings.iter().any(|w| w.contains("notification") && w.contains("no runtime trigger")), "{:?}", plan.warnings);
         assert!(plan.warnings.iter().any(|w| w.contains("script kind dns is not supported")), "{:?}", plan.warnings);
+    }
+
+    #[test]
     fn unknown_and_wake_system_script_options_warn_instead_of_dropping() {
         let text = "\
 [Script]
