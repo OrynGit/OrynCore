@@ -1235,7 +1235,7 @@ pub enum RejectResponse {
 }
 
 /// Fake-IP 过滤名单的匹配方式。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FakeIpFilter {
     Domain(DomainPattern),
     /// 含有跨标签通配的 mihomo 写法。
