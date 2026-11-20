@@ -584,6 +584,7 @@ fn legacy(
     line: &str,
     dialect: ModuleFormat,
     res: &Resources,
+    warnings: &mut Vec<String>,
 ) -> io::Result<(bool, Condition, Vec<Action>)> {
     let mut v = Vec::new();
     let mut rest = line.trim();
@@ -654,30 +655,73 @@ fn legacy(
             .map(|s| s.parse::<u16>().map_err(invalid))
             .transpose()?
             .unwrap_or(200);
-        if !(100..=599).contains(&status) {
+        if !(100..=999).contains(&status) {
             return Err(invalid("invalid Map Local HTTP status"));
         }
+        let validate_header = |k: &str, v: &str| -> io::Result<(String, String)> {
+            if k.is_empty()
+                || !k.bytes().all(|b| {
+                    b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
+                })
+                || v.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0)
+            {
+                return Err(invalid("invalid Map Local header"));
+            }
+            Ok((k.to_owned(), v.to_owned()))
+        };
+        let parse_decoded_headers = |decoded: &str| -> Option<Vec<(String, String)>> {
+            let mut out = Vec::new();
+            for line in decoded.split(['\n', '|']) {
+                let line = line.trim_matches('\r').trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let (k, v) = line.split_once(':')?;
+                out.push(validate_header(k.trim(), v.trim()).ok()?);
+            }
+            (!out.is_empty()).then_some(out)
+        };
         let headers: Vec<(String, String)> = fields
             .get("header")
             .map(|s| {
-                s.split('|')
-                    .map(|p| {
-                        let (k, v) = match p.split_once(':') {
-                            Some((k, v)) => (k.trim(), v.trim()),
-                            None if !p.trim().is_empty() => ("Content-Type", p.trim()),
-                            None => return Err(invalid("invalid Map Local header")),
-                        };
-                        if k.is_empty()
-                            || !k.bytes().all(|b| {
-                                b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
-                            })
-                            || v.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0)
-                        {
-                            return Err(invalid("invalid Map Local header"));
-                        }
-                        Ok((k.to_owned(), v.to_owned()))
+                if s.contains(':') || s.contains('|') {
+                    s.split('|')
+                        .map(|p| {
+                            let (k, v) = match p.split_once(':') {
+                                Some((k, v)) => (k.trim(), v.trim()),
+                                None if !p.trim().is_empty() => ("Content-Type", p.trim()),
+                                None => return Err(invalid("invalid Map Local header")),
+                            };
+                            validate_header(k, v)
+                        })
+                        .collect::<io::Result<Vec<_>>>()
+                } else {
+                    let trimmed = s.trim();
+                    if trimmed.is_empty() {
+                        return Err(invalid("invalid Map Local header"));
+                    }
+                    let decoded = base64::Engine::decode(
+                        &base64::engine::general_purpose::STANDARD,
+                        trimmed,
+                    )
+                    .or_else(|_| {
+                        base64::Engine::decode(
+                            &base64::engine::general_purpose::STANDARD_NO_PAD,
+                            trimmed,
+                        )
                     })
-                    .collect::<io::Result<Vec<_>>>()
+                    .ok()
+                    .and_then(|bytes| String::from_utf8(bytes).ok())
+                    .and_then(|text| parse_decoded_headers(&text));
+                    if let Some(parsed) = decoded {
+                        Ok(parsed)
+                    } else {
+                        warnings.push(format!(
+                            "Map Local bare header `{trimmed}` treated as Content-Type (legacy fallback)"
+                        ));
+                        Ok(vec![validate_header("Content-Type", trimmed)?])
+                    }
+                }
             })
             .transpose()?
             .unwrap_or_default();
@@ -711,8 +755,22 @@ fn legacy(
     }
     let (op, params) = if section == "url rewrite"
         && (dialect == ModuleFormat::Surge
-            || v.get(i + 1)
-                .is_some_and(|op| matches!(*op, "header" | "302" | "307" | "reject")))
+            || v.get(i + 1).is_some_and(|op| {
+                matches!(
+                    op.to_ascii_lowercase().replace('_', "-").as_str(),
+                    "header"
+                        | "302"
+                        | "307"
+                        | "301"
+                        | "308"
+                        | "reject"
+                        | "reject-200"
+                        | "reject-dict"
+                        | "reject-array"
+                        | "reject-img"
+                        | "reject-video"
+                )
+            }))
     {
         if v.len() > i + 2 {
             return Err(invalid("unexpected URL rewrite trailing fields"));
@@ -721,13 +779,14 @@ fn legacy(
     } else {
         (v[i], v[i + 1..].to_vec())
     };
-    let op = if let Some(s) = op.strip_prefix("response-") {
+    let op_norm = op.to_ascii_lowercase().replace('_', "-");
+    let op = if let Some(s) = op_norm.strip_prefix("response-") {
         response = true;
         s
-    } else if let Some(s) = op.strip_prefix("request-") {
+    } else if let Some(s) = op_norm.strip_prefix("request-") {
         s
     } else {
-        op
+        op_norm.as_str()
     };
     match op {
         "header" => actions.push(Action::Url(
@@ -740,6 +799,27 @@ fn legacy(
             e(params.first().ok_or_else(|| invalid("missing redirect"))?)?,
         )),
         "reject" | "reject-drop" | "reject-200" | "reject-dict" | "reject-array" | "reject-img"
+        "header" => {
+            let target = e(params.first().ok_or_else(|| invalid("missing URL"))?)?;
+            if matches!(&target, Expr::Literal(Value::String(s)) if s.contains("{{{GATEWAY_ADDRESS}}}"))
+            {
+                warnings.push(
+                    "rewrite target contains {{{GATEWAY_ADDRESS}}}, which is not expanded in OrynCore HTTP inspection".into(),
+                );
+            }
+            actions.push(Action::Url(pat, target));
+        }
+        "302" | "307" | "301" | "308" => {
+            let target = e(params.first().ok_or_else(|| invalid("missing redirect"))?)?;
+            if matches!(&target, Expr::Literal(Value::String(s)) if s.contains("{{{GATEWAY_ADDRESS}}}"))
+            {
+                warnings.push(
+                    "redirect target contains {{{GATEWAY_ADDRESS}}}, which is not expanded in OrynCore HTTP inspection".into(),
+                );
+            }
+            actions.push(Action::Redirect(op.parse().unwrap(), pat, target));
+        }
+        "reject" | "reject-200" | "reject-dict" | "reject-array" | "reject-img"
         | "reject-video" => actions.push(Action::Reject(
             match op {
                 "reject" => 404,
@@ -914,11 +994,17 @@ pub fn compile_module_with_policies(
     }
     let mut plan = Plan::default();
     for r in &m.rewrites {
+        let mut rw_warnings = Vec::new();
         let compiled = if r.text.starts_with("request if ") || r.text.starts_with("response if ") {
             loon(&r.text, &args, res)
         } else {
-            legacy(&r.section, &r.text, m.format, res)
+            legacy(&r.section, &r.text, m.format, res, &mut rw_warnings)
         };
+        plan.warnings.extend(
+            rw_warnings
+                .into_iter()
+                .map(|w| format!("{}:{}: {w}", r.source.name, r.source.line)),
+        );
         // 行语法/参数与缺失资源隔离；资源内容验证使用独立错误种类，不吞整模块错误。
         let (response, condition, actions) = match compiled {
             Ok(v) => v,
@@ -1059,6 +1145,12 @@ fn script_rule(
         } else if p.eat("network-changed") {
             options.insert("event-name".into(), "network-changed".into());
             "event"
+        } else if p.eat("engine-started") {
+            options.insert("event-name".into(), "engine-started".into());
+            "event"
+        } else if p.eat("profile-reloaded") {
+            options.insert("event-name".into(), "profile-reloaded".into());
+            "event"
         } else {
             p.expect("generic")?;
             "generic"
@@ -1187,7 +1279,9 @@ fn script_rule(
         let legacy = line.starts_with("http-")
             || line.starts_with("cron ")
             || line.starts_with("generic ")
-            || line.starts_with("network-changed ");
+            || line.starts_with("network-changed ")
+            || line.starts_with("engine-started ")
+            || line.starts_with("profile-reloaded ");
         let (name, body) = if legacy {
             ("", line)
         } else {
@@ -1198,9 +1292,13 @@ fn script_rule(
             if tokens.len() < 2 {
                 return Err(invalid("incomplete script"));
             }
+            let is_event = matches!(
+                tokens[0],
+                "network-changed" | "engine-started" | "profile-reloaded"
+            );
             options.insert(
                 "type".into(),
-                if tokens[0] == "network-changed" {
+                if is_event {
                     "event".into()
                 } else {
                     tokens[0].into()
@@ -1212,8 +1310,8 @@ fn script_rule(
             if tokens[0] == "cron" {
                 options.insert("cronexp".into(), unquote(tokens[1]).map_err(invalid)?);
             }
-            if tokens[0] == "network-changed" {
-                options.insert("event-name".into(), "network-changed".into());
+            if is_event {
+                options.insert("event-name".into(), tokens[0].into());
             }
             // 类型与 pattern / cron 之后的全部内容都是选项，`requires-body`、`tag` 等可能写在
             // `script-path=` 之前，不能只取 script-path 之后的部分。
@@ -1229,7 +1327,9 @@ fn script_rule(
         for item in split_top(&body, ',').map_err(invalid)? {
             if let Some((k, v)) = item.split_once('=') {
                 let mut key = k.trim().replace('_', "-");
-                if dialect == ModuleFormat::Loon && key == "enabled" { key = "enable".into(); }
+                if key == "enabled" {
+                    key = "enable".into();
+                }
                 let mut value = unquote(v.trim()).map_err(invalid)?;
                 if dialect == ModuleFormat::Loon && matches!(key.as_str(), "enable" | "timeout" | "debug") {
                     if let Some(name) = value.strip_prefix("${").or_else(|| value.strip_prefix('{')).and_then(|v| v.strip_suffix('}')) {
@@ -1293,8 +1393,20 @@ fn script_rule(
         "http-request" | "http-response" | "generic" | "cron" | "event"
     ) {
         return Err(unsupported(format!(
-            "script kind {kind} is not implemented"
+            "script kind {kind} is not supported by OrynCore"
         )));
+    }
+    if kind == "event" {
+        let event_name = options.get("event-name").map(String::as_str);
+        if !matches!(
+            event_name,
+            Some("network-changed" | "engine-started" | "profile-reloaded")
+        ) {
+            let label = event_name.unwrap_or("<missing>");
+            warnings.push(format!(
+                "event-name `{label}` has no runtime trigger in OrynCore and will not execute"
+            ));
+        }
     }
     for (k, v) in &options {
         match k.as_str() {
@@ -1474,6 +1586,47 @@ URL-REGEX,^http://drop\\.test/,REJECT-DROP
 [Script]
 cron \"0 8 * * *\" script-path=a.js, timeout=200, tag=daily
 http-request ^http://a\\.test/ script-path=a.js, timeout=200, tag=req
+    fn reject_underscore_and_gateway_address_warning() {
+        let text = "\
+[Rewrite]
+^https://ad\\.test/ reject_img
+^https://gw\\.test/ 302 http://{{{GATEWAY_ADDRESS}}}/ok
+";
+        let ir = oryn_module::parse(text, Some(ModuleFormat::Loon)).unwrap();
+        let plan = compile_module(&ir, &BTreeMap::new(), &Resources::new()).unwrap();
+        assert_eq!(plan.request.len(), 2, "{:?}", plan.warnings);
+        assert!(matches!(&plan.request[0].actions[0], Action::Reject(200, k) if k == "img"));
+        assert!(plan.warnings.iter().any(|w| w.contains("{{{GATEWAY_ADDRESS}}}")), "{:?}", plan.warnings);
+    fn map_local_base64_header_and_extended_status_code() {
+        let encoded = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            "Content-Type: application/json\r\nX-Test: ok",
+        );
+        let text = format!(
+            "[Map Local]\n^http://a\\.test/ data-type=text data=\"{{}}\" header=\"{encoded}\" status-code=700\n^http://b\\.test/ data-type=text data=\"{{}}\" status-code=1000\n"
+        );
+        let ir = oryn_module::parse(&text, Some(ModuleFormat::Surge)).unwrap();
+        let plan = compile_module(&ir, &BTreeMap::new(), &Resources::new()).unwrap();
+        assert_eq!(plan.request.len(), 1, "{:?}", plan.warnings);
+        let Action::Mock { status, headers, .. } = &plan.request[0].actions[0] else {
+            panic!("expected mock");
+        };
+        assert_eq!(*status, Some(700));
+        assert_eq!(
+            headers,
+            &[
+                ("Content-Type".into(), "application/json".into()),
+                ("X-Test".into(), "ok".into()),
+            ]
+        );
+        assert!(plan.warnings.iter().any(|w| w.contains("invalid Map Local HTTP status")), "{:?}", plan.warnings);
+    fn event_script_triggers_and_unsupported_kinds() {
+        let text = "\
+[Script]
+engine-started script-path=a.js, tag=on_start
+profile-reloaded script-path=a.js, tag=on_reload
+notif = type=event, event-name=notification, script-path=a.js
+dns_s = type=dns, domain=a.test, script-path=a.js
 ";
         let ir = oryn_module::parse(text, Some(ModuleFormat::Loon)).unwrap();
         let mut resources = Resources::new();
@@ -1491,6 +1644,12 @@ http-request ^http://a\\.test/ script-path=a.js, timeout=200, tag=req
         };
         let err = plan.apply_request(&mut msg).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
+        assert_eq!(plan.scripts.len(), 3, "{:?}", plan.warnings);
+        assert_eq!(plan.scripts[0].event.as_deref(), Some("engine-started"));
+        assert_eq!(plan.scripts[1].event.as_deref(), Some("profile-reloaded"));
+        assert_eq!(plan.scripts[2].event.as_deref(), Some("notification"));
+        assert!(plan.warnings.iter().any(|w| w.contains("notification") && w.contains("no runtime trigger")), "{:?}", plan.warnings);
+        assert!(plan.warnings.iter().any(|w| w.contains("script kind dns is not supported")), "{:?}", plan.warnings);
     fn unknown_and_wake_system_script_options_warn_instead_of_dropping() {
         let text = "\
 [Script]

@@ -585,8 +585,28 @@ pub(crate) fn refresh(ctx: &Rc<EngineCtx>, state: Rc<crate::context::RuntimeStat
     }));
 }
 
-/// 模块的 `#!system` / `#!system_version` / `#!requirement` 是否满足；不满足时给出原因。
-pub fn allowed(ir: &oryn_module::ModuleIR, system_version: &str) -> Result<(), String> {
+fn runtime_language() -> String {
+    let raw = std::env::var("LC_ALL")
+        .or_else(|_| std::env::var("LANG"))
+        .unwrap_or_default();
+    let tag = raw.split('.').next().unwrap_or("").trim();
+    if tag.is_empty() || tag.eq_ignore_ascii_case("C") || tag.eq_ignore_ascii_case("POSIX") {
+        return "en".into();
+    }
+    let normalized = tag.replace('_', "-");
+    match normalized.to_ascii_lowercase().as_str() {
+        "zh-cn" | "zh-sg" | "zh-hans" => "zh-Hans".into(),
+        "zh-tw" | "zh-hk" | "zh-mo" | "zh-hant" => "zh-Hant".into(),
+        _ => normalized,
+    }
+}
+
+/// 模块的 `#!system` / `#!system_version` / `#!requirement` 是否满足；不满足时给出原因，
+/// 满足但含未知 `#!requirement` 变量时返回降级告警。
+pub fn allowed(
+    ir: &oryn_module::ModuleIR,
+    system_version: &str,
+) -> Result<Vec<String>, String> {
     if let Some(s) = ir.meta.system.as_deref().filter(|s| !s.is_empty()) {
         if !s
             .split(',')
@@ -616,12 +636,17 @@ pub fn allowed(ir: &oryn_module::ModuleIR, system_version: &str) -> Result<(), S
         ("SYSTEM".into(), "iOS".into()),
         ("SYSTEM_VERSION".into(), system_version.into()),
         ("CORE_VERSION".into(), "20".into()),
+        ("DEVICE_MODEL".into(), "iPhone".into()),
+        ("LANGUAGE".into(), runtime_language()),
     ]);
     match ir.meta.core_requirement.as_deref() {
-        None => Ok(()),
+        None => Ok(Vec::new()),
         Some(r) => match oryn_module::requirements::evaluate(r, &env) {
-            Ok(true) => Ok(()),
+            Ok(true) => Ok(Vec::new()),
             Ok(false) => Err(format!("requirement `{r}` not satisfied")),
+            Err(e) if e.0.starts_with("unknown requirement variable") => Ok(vec![format!(
+                "requirement `{r}` references unknown variable ({e}); allowing module"
+            )]),
             Err(e) => Err(format!("requirement `{r}` invalid: {e}")),
         },
     }
@@ -665,5 +690,16 @@ mod tests {
         bad.arguments.push(("changed".into(), "true".into()));
         assert!(restore_validated(&dir, &mut bad).is_err());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn requirement_supports_device_model_language_and_warns_on_unknown() {
+        let ir = oryn_module::parse("#!requirement = DEVICE_MODEL = iPhone && LANGUAGE != xx\n", Some(ModuleFormat::Surge)).unwrap();
+        assert_eq!(allowed(&ir, "17.0").unwrap(), Vec::<String>::new());
+
+        let unknown = oryn_module::parse("#!requirement = FUTURE_CAP >= 1\n", Some(ModuleFormat::Surge)).unwrap();
+        let warnings = allowed(&unknown, "17.0").unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("FUTURE_CAP"));
     }
 }

@@ -76,7 +76,7 @@ impl std::fmt::Display for ParseError {
 }
 impl std::error::Error for ParseError {}
 pub fn detect_format(text: &str) -> ModuleFormat {
-    // 转换仓库会保留 Loon 元数据，实际 section 比版本注释更可靠。
+    // 转换仓库会保留 Loon 元数据，实际 section 与脚本语法比注释元数据更可靠。
     if text.lines().any(|s| {
         matches!(
             s.trim().to_ascii_lowercase().as_str(),
@@ -85,12 +85,71 @@ pub fn detect_format(text: &str) -> ModuleFormat {
     }) {
         return ModuleFormat::Surge;
     }
-    if text.lines().any(|s| {
-        let s = s.trim();
-        s.eq_ignore_ascii_case("[rewrite]")
-            || s.eq_ignore_ascii_case("[argument]")
-            || s.starts_with("#!loon_version")
-    }) {
+    let mut section = String::new();
+    let mut has_loon_meta = false;
+    let mut has_surge_script = false;
+    for raw in text.lines() {
+        let s = raw.trim();
+        if s.is_empty() {
+            continue;
+        }
+        if let Some(rest) = s.strip_prefix("#!") {
+            let key = rest.split('=').next().unwrap_or("").trim();
+            if key.eq_ignore_ascii_case("loon_version")
+                || key.eq_ignore_ascii_case("openurl")
+                || key.eq_ignore_ascii_case("select")
+                || key.eq_ignore_ascii_case("date")
+            {
+                has_loon_meta = true;
+            }
+            continue;
+        }
+        if s.starts_with('#') || s.starts_with(';') || s.starts_with("//") {
+            continue;
+        }
+        if s.starts_with('[') && s.ends_with(']') {
+            section = s[1..s.len() - 1].trim().to_ascii_lowercase();
+            if matches!(section.as_str(), "rewrite" | "argument") {
+                return ModuleFormat::Loon;
+            }
+            continue;
+        }
+        if section == "script" {
+            if s.starts_with("http-request ")
+                || s.starts_with("http-response ")
+                || s.starts_with("cron ")
+                || s.starts_with("generic ")
+                || s.starts_with("network-changed ")
+                || s.starts_with("engine-started ")
+                || s.starts_with("profile-reloaded ")
+                || s.starts_with("request if ")
+                || s.starts_with("response if ")
+                || s.contains(" then script(")
+            {
+                return ModuleFormat::Loon;
+            }
+            if let Ok(parts) = split_top(s, ',') {
+                if parts.iter().any(|part| {
+                    part.split_once('=').is_some_and(|(k, _)| {
+                        let k = k.trim();
+                        k.eq_ignore_ascii_case("enabled") || k.eq_ignore_ascii_case("img-url")
+                    })
+                }) {
+                    return ModuleFormat::Loon;
+                }
+            }
+            if let Some((_, rhs)) = s.split_once('=') {
+                if rhs.trim_start().starts_with("type=") {
+                    has_surge_script = true;
+                }
+            }
+        } else if matches!(section.as_str(), "url rewrite" | "rewrite")
+            && (s.starts_with("request if ") || s.starts_with("response if "))
+        {
+            return ModuleFormat::Loon;
+        }
+    }
+    if has_loon_meta && !has_surge_script {
         ModuleFormat::Loon
     } else {
         ModuleFormat::Surge
@@ -749,5 +808,27 @@ mod tests {
         let b = bind(text, ModuleFormat::Surge, &[]).unwrap();
         assert!(b.text.contains("DOMAIN,a.test,\n"));
         assert_eq!(b.warnings.len(), 1);
+    }
+
+    #[test]
+    fn detect_format_recognizes_loon_without_rewrite_or_loon_version() {
+        let plugin = "\
+#!name = Inline Loon
+#!openurl = https://example.com
+[Script]
+http-response ^https://a\\.test/ script-path=a.js, requires-body=true, enabled=true, tag=t
+[MITM]
+hostname = a.test
+";
+        assert_eq!(detect_format(plugin), ModuleFormat::Loon);
+        let converted_surge = "\
+#!name = Converted
+#!date = 2026-01-01
+[Script]
+s = type=http-response, pattern=^https://a\\.test/, script-path=a.js, enable=true
+[MITM]
+hostname = %APPEND% a.test
+";
+        assert_eq!(detect_format(converted_surge), ModuleFormat::Surge);
     }
 }
