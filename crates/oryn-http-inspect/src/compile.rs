@@ -1050,6 +1050,12 @@ fn script_rule(
         } else if p.eat("network-changed") {
             options.insert("event-name".into(), "network-changed".into());
             "event"
+        } else if p.eat("engine-started") {
+            options.insert("event-name".into(), "engine-started".into());
+            "event"
+        } else if p.eat("profile-reloaded") {
+            options.insert("event-name".into(), "profile-reloaded".into());
+            "event"
         } else {
             p.expect("generic")?;
             "generic"
@@ -1178,7 +1184,9 @@ fn script_rule(
         let legacy = line.starts_with("http-")
             || line.starts_with("cron ")
             || line.starts_with("generic ")
-            || line.starts_with("network-changed ");
+            || line.starts_with("network-changed ")
+            || line.starts_with("engine-started ")
+            || line.starts_with("profile-reloaded ");
         let (name, body) = if legacy {
             ("", line)
         } else {
@@ -1189,9 +1197,13 @@ fn script_rule(
             if tokens.len() < 2 {
                 return Err(invalid("incomplete script"));
             }
+            let is_event = matches!(
+                tokens[0],
+                "network-changed" | "engine-started" | "profile-reloaded"
+            );
             options.insert(
                 "type".into(),
-                if tokens[0] == "network-changed" {
+                if is_event {
                     "event".into()
                 } else {
                     tokens[0].into()
@@ -1203,8 +1215,8 @@ fn script_rule(
             if tokens[0] == "cron" {
                 options.insert("cronexp".into(), unquote(tokens[1]).map_err(invalid)?);
             }
-            if tokens[0] == "network-changed" {
-                options.insert("event-name".into(), "network-changed".into());
+            if is_event {
+                options.insert("event-name".into(), tokens[0].into());
             }
             // 类型与 pattern / cron 之后的全部内容都是选项，`requires-body`、`tag` 等可能写在
             // `script-path=` 之前，不能只取 script-path 之后的部分。
@@ -1284,8 +1296,20 @@ fn script_rule(
         "http-request" | "http-response" | "generic" | "cron" | "event"
     ) {
         return Err(unsupported(format!(
-            "script kind {kind} is not implemented"
+            "script kind {kind} is not supported by OrynCore"
         )));
+    }
+    if kind == "event" {
+        let event_name = options.get("event-name").map(String::as_str);
+        if !matches!(
+            event_name,
+            Some("network-changed" | "engine-started" | "profile-reloaded")
+        ) {
+            let label = event_name.unwrap_or("<missing>");
+            warnings.push(format!(
+                "event-name `{label}` has no runtime trigger in OrynCore and will not execute"
+            ));
+        }
     }
     for (k, v) in &options {
         match k.as_str() {
@@ -1452,6 +1476,24 @@ other = type=http-request, pattern=^http://ad\\.test/x, ability=dns, script-path
     }
 
     #[test]
+    fn event_script_triggers_and_unsupported_kinds() {
+        let text = "\
+[Script]
+engine-started script-path=a.js, tag=on_start
+profile-reloaded script-path=a.js, tag=on_reload
+notif = type=event, event-name=notification, script-path=a.js
+dns_s = type=dns, domain=a.test, script-path=a.js
+";
+        let ir = oryn_module::parse(text, Some(ModuleFormat::Loon)).unwrap();
+        let mut resources = Resources::new();
+        resources.insert("a.js".into(), Arc::<[u8]>::from(&b"$done({});"[..]));
+        let plan = compile_module(&ir, &BTreeMap::new(), &resources).unwrap();
+        assert_eq!(plan.scripts.len(), 3, "{:?}", plan.warnings);
+        assert_eq!(plan.scripts[0].event.as_deref(), Some("engine-started"));
+        assert_eq!(plan.scripts[1].event.as_deref(), Some("profile-reloaded"));
+        assert_eq!(plan.scripts[2].event.as_deref(), Some("notification"));
+        assert!(plan.warnings.iter().any(|w| w.contains("notification") && w.contains("no runtime trigger")), "{:?}", plan.warnings);
+        assert!(plan.warnings.iter().any(|w| w.contains("script kind dns is not supported")), "{:?}", plan.warnings);
     fn unknown_and_wake_system_script_options_warn_instead_of_dropping() {
         let text = "\
 [Script]
