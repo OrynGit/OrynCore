@@ -22,7 +22,7 @@ OrynCore 是 Oryn 的高效代理客户端代理核心，OrynCore 的目标是�
 
 - Shadowsocks(R)、Snell
 - VMess、VLESS（含 Vision、REALITY）、AnyTLS
-- Trojan、
+- Trojan
 - Hysteria 1/2、TUIC v5、WireGuard / AmneziaWG
 - NaïveProxy、Mieru、Sudoku、ShadowQUIC、SSH、Tailscale、SOCKS5、HTTP
 
