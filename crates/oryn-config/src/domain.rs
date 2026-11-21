@@ -192,7 +192,7 @@ pub fn listed_host_matches(
         return true;
     }
     if pattern.eq_ignore_ascii_case("<ip-address>") {
-        return domain.map_or(true, is_ip_literal);
+        return domain.is_none_or(is_ip_literal);
     }
     domain.is_some_and(|host| hostname_matches(pattern, host))
 }
