@@ -476,7 +476,7 @@ pub(super) fn parse(root: &Yaml, b: &mut Builder) -> Result<DnsSpec, ConfigError
         forward,
         use_hosts: bool_of(d, "use-hosts").unwrap_or(true),
         ipv6: bool_of(d, "ipv6").unwrap_or(true),
-        respect_rules: bool_of(d, "respect-rules").unwrap_or(true),
+        respect_rules: bool_of(d, "respect-rules").unwrap_or(false),
         skip_cert_verify: bool_of(d, "skip-cert-verify").unwrap_or(false),
         blocked_ips,
         public_ip_url,

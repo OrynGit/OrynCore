@@ -339,7 +339,7 @@ fn defaults_for_empty_config() {
     assert_eq!(hosts, ["119.29.29.29", "223.5.5.5"]);
     let hosts: Vec<&str> = c.dns.nameserver.iter().map(|s| s.host.as_str()).collect();
     assert_eq!(hosts, ["8.8.8.8", "1.1.1.1", "9.9.9.9"]);
-    assert!(c.dns.respect_rules && c.dns.ipv6 && c.dns.proxy_server.is_empty());
+    assert!(!c.dns.respect_rules && c.dns.ipv6 && c.dns.proxy_server.is_empty());
     assert_eq!(c.dns.reject_response, RejectResponse::Refused);
     assert!(!c.sniffer.enable);
     assert_eq!(c.geoip.url, DEFAULT_MMDB_URL);

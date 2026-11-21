@@ -5,7 +5,7 @@
 //! 2. 主机映射（`hosts`）；
 //! 3. 应答缓存；
 //! 4. 转发规则选出上游（组 / 单个服务器 / 引导 DNS / 拒绝），未命中用 `nameserver`；
-//! 5. 按顺序逐个服务器查询：每个服务器所用的出站按服务器参数或分流规则决定（`respect-rules`），
+//! 5. 按顺序逐个服务器查询：每个服务器所用的出站按服务器参数或分流规则决定（`respect-rules`，按服务器地址匹配），
 //!    查询附加 ECS；
 //! 6. 结果去除被屏蔽的 IP 等，写入缓存与 IP → 域名映射。
 //!
@@ -890,13 +890,18 @@ impl DnsEngine {
             }
         };
 
+        // 出站按服务器地址选择，查询域名本身命中分流规则 REJECT 时在这里拒绝。
+        if purpose != Purpose::ProxyServer && self.domain_rejected(&q.name, source) {
+            outcome.upstream = Some("reject".into());
+            return reject_response(query, q, rt.spec.reject_response);
+        }
         let mut rejected = false;
         let mut candidates = Vec::with_capacity(servers.len());
         for server in &servers {
             let decision = if purpose == Purpose::ProxyServer {
                 Decision::Direct
             } else {
-                self.decide(rt, server, &q.name, source)
+                self.decide(rt, server, source).await
             };
             match decision {
                 Decision::Reject => rejected = true,
@@ -1025,15 +1030,21 @@ impl DnsEngine {
     }
 
     /// 决定发往某个服务器的查询经过哪个出站。
-    fn decide(
+    ///
+    /// 与 mihomo 一致，按**服务器地址**匹配分流规则：服务器的域名参与域名类规则，
+    /// 引导 DNS 解析出的 IP 参与 IP 类规则；被查询的域名不参与。
+    async fn decide(
         &self,
         rt: &DnsRuntime,
         server: &ServerSpec,
-        domain: &str,
         source: Option<SocketAddr>,
     ) -> Decision {
         let Some(routing) = self.routing.read().unwrap().upgrade() else {
             return Decision::Direct;
+        };
+        let (host_ip, target) = match server.host_ip() {
+            Some(ip) => (Some(ip), TargetAddr::Ip(SocketAddr::new(ip, server.port))),
+            None => (None, TargetAddr::Domain(server.host.clone(), server.port)),
         };
         let start = match server.via {
             DnsVia::Direct => return Decision::Direct,
@@ -1043,20 +1054,26 @@ impl DnsEngine {
             },
             DnsVia::Default if !rt.spec.respect_rules => return Decision::Direct,
             DnsVia::Default | DnsVia::Rules => {
-                let dst = SocketAddr::new(
-                    server
-                        .host_ip()
+                // 引导 DNS 只用 IP 服务器且始终直连，不会反过来依赖本函数，没有循环；
+                // 解析失败时 IP 类规则不命中（0.0.0.0 不参与 IP 匹配），域名类规则照常。
+                let ip = match host_ip {
+                    Some(ip) => ip,
+                    None => self
+                        .bootstrap_resolve(&server.host)
+                        .await
+                        .ok()
+                        .and_then(|ips| ips.first().copied())
                         .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
-                    server.port,
-                );
+                };
                 let src = source.unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
-                let mut ctx = FlowContext::new(0, Network::Udp, src, dst);
-                ctx.set_domain(domain.to_string(), DomainSource::DnsQuery);
+                let mut ctx = FlowContext::new(0, Network::Udp, src, SocketAddr::new(ip, server.port));
+                if host_ip.is_none() {
+                    ctx.set_domain(server.host.clone(), DomainSource::DnsQuery);
+                }
                 let decision = routing.router.route(&ctx);
                 routing.outbounds[decision.outbound].clone()
             }
         };
-        let target = TargetAddr::Domain(domain.to_string(), server.port);
         let meta = PickMeta {
             source,
             target: &target,

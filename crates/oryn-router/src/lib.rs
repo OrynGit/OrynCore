@@ -46,7 +46,7 @@ pub enum DomainSource {
     Sniffed,
     /// Fake-IP 地址池的权威映射。
     FakeIp,
-    /// DNS 查询本身携带的域名。
+    /// DNS 相关：查询本身携带的域名，或 DNS 上游连接的服务器域名。
     DnsQuery,
     /// 由本地 HTTP / SOCKS 入站明确携带的域名。
     Explicit,

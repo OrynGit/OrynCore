@@ -644,33 +644,48 @@ proxies:
   - {{name: P, type: socks5, server: 127.0.0.1, port: {sp}}}
 rules:
   - DOMAIN-SUFFIX,blocked.test,REJECT
-  - DOMAIN-SUFFIX,proxied.test,P
+  - DOMAIN-SUFFIX,domain-only.test,P
+  - DOMAIN,ns.by-name.test,REJECT
+  - IP-CIDR,10.3.3.3/32,REJECT
+  - DST-PORT,{tp},P
   - MATCH,DIRECT
 dns:
+  respect-rules: true
   default-nameserver: ['{boot}']
-  nameserver: ['{direct_ns}', 'tcp://{tcp_upstream}']
+  nameserver: ['{direct_ns}']
+  nameserver-policy:
+    '+.proxied.test': 'tcp://{tcp_upstream}'
+    '+.by-name.test': 'udp://ns.by-name.test:{dp}'
+    '+.by-ip.test': 'udp://ns.other.test:{dp}'
   proxy-server-nameserver: ['{proxy_ns}']
 "#,
-        sp = socks.port()
+        sp = socks.port(),
+        tp = tcp_upstream.port(),
+        dp = direct_ns.port(),
     );
     let (e, cfg) = engine(&yaml);
     let _routing = attach_routing(&e, &cfg);
 
-    // 分流为 REJECT 的域名：DNS 查询同样被拒绝
+    // 查询域名分流为 REJECT：DNS 查询同样被拒绝
     let (m, out) = query(&e, "x.blocked.test", TYPE_A).await;
     assert_eq!((m.rcode(), out.upstream.as_deref()), (5, Some("reject")));
-    // 分流为 P：经 SOCKS5 以 TCP 访问上游（UDP 服务器经代理改用 TCP，第一个 UDP 服务器因此失败，回退到 TCP 服务器）
+    // 出站按服务器地址匹配（与 mihomo 一致）：上游端口命中 DST-PORT → P，经 SOCKS5 以 TCP 访问
     let (m, out) = query(&e, "x.proxied.test", TYPE_A).await;
     assert_eq!(ip_of(&m), Some("10.7.7.7".parse().unwrap()), "{out:?}");
     assert_eq!(out.via.as_deref(), Some("P"));
     assert!(direct_log.lock().unwrap().is_empty());
-    // 其余直连；两个上游并发查询，取先到的应答。
-    let (m, out) = query(&e, "plain.test", TYPE_A).await;
+    // 被查询的域名不参与出站选择：查询域名分流为 P，但服务器地址命中 DIRECT
+    let (m, out) = query(&e, "x.domain-only.test", TYPE_A).await;
+    assert_eq!(ip_of(&m), Some("10.1.1.1".parse().unwrap()), "{out:?}");
     assert_eq!(out.via.as_deref(), Some("DIRECT"));
-    assert!(
-        [Some("10.1.1.1".parse().unwrap()), Some("10.7.7.7".parse().unwrap())].contains(&ip_of(&m)),
-        "{out:?}"
-    );
+    // 服务器写成域名：域名参与域名类规则
+    let (m, out) = query(&e, "x.by-name.test", TYPE_A).await;
+    assert_eq!((m.rcode(), out.upstream.as_deref()), (5, Some("reject")), "{out:?}");
+    // 服务器写成域名：引导 DNS 解析出的 IP（10.3.3.3）参与 IP 类规则
+    let (m, out) = query(&e, "x.by-ip.test", TYPE_A).await;
+    assert_eq!((m.rcode(), out.upstream.as_deref()), (5, Some("reject")), "{out:?}");
+    assert!(!boot_log.lock().unwrap().is_empty());
+    boot_log.lock().unwrap().clear();
 
     // 代理服务器域名：强制使用代理域名服务器
     let ips = e.resolve_proxy_server("node.example").await.unwrap();
