@@ -61,7 +61,8 @@ impl ShadowQuicOutbound {
             &spec.alpn,
             spec.zero_rtt,
         )?;
-        let window = u64::from(spec.cwnd) * 1200;
+        // 至少两个包：一个包的窗口等于 Initial 数据报大小，quinn 判定阻塞后首包永远发不出（OrynCore#58）
+        let window = u64::from(spec.cwnd.max(2)) * 1200;
         let factory: Arc<dyn ControllerFactory + Send + Sync> = match spec.congestion.as_str() {
             "bbr" => {
                 let mut c = BbrConfig::default();

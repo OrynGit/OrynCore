@@ -12,6 +12,9 @@ use yaml_rust2::Yaml;
 fn text(p: &Yaml, k: &str) -> String {
     str_of(p, k).unwrap_or_default()
 }
+/// ShadowQUIC 初始拥塞窗口下限（包数）。
+const MIN_CWND: u32 = 2;
+
 fn bounded(
     p: &Yaml,
     name: &str,
@@ -420,7 +423,16 @@ pub(super) fn shadowquic(
         zero_rtt: bool_of(p, "zero-rtt").unwrap_or(false),
         keep_alive_ms: bounded(p, name, "keep-alive-interval", 0, 0, 60000)? as u64,
         congestion,
-        cwnd: bounded(p, name, "cwnd", 32, 1, 256)? as u32,
+        cwnd: {
+            let cwnd = bounded(p, name, "cwnd", 32, 1, 256)? as u32;
+            // 1 个包的初始窗口恰好等于 Initial 数据报大小，quinn 以 `>=` 判定阻塞，首包永远发不出（OrynCore#58）
+            if cwnd < MIN_CWND {
+                b.warn(format!(
+                    "proxy {name}: shadowquic cwnd {cwnd} cannot send the first packet; using {MIN_CWND}"
+                ));
+            }
+            cwnd.max(MIN_CWND)
+        },
         stream_window: sw,
         receive_window: rw,
         max_streams: streams,
@@ -486,6 +498,24 @@ mod tests {
             panic!()
         };
         assert_eq!((s.receive_window, s.max_streams), (1048576, 32));
+        // cwnd 1 发不出首包：夹到 2 并警告，2 原样保留（OrynCore#58）
+        for (raw, want, warned) in [(1, 2, true), (2, 2, false), (32, 32, false)] {
+            let cfg = parse_config(&format!(
+                "proxies: [{{name: P,type: shadowquic,server: proxy.test,port: 443,cwnd: {raw}}}]"
+            ))
+            .unwrap();
+            let OutboundKind::ShadowQuic(s) =
+                &cfg.outbounds[cfg.outbound_index("P").unwrap()].kind
+            else {
+                panic!()
+            };
+            assert_eq!(s.cwnd, want, "cwnd {raw}");
+            assert_eq!(
+                cfg.warnings.iter().any(|w| w.contains("cwnd")),
+                warned,
+                "cwnd {raw}"
+            );
+        }
         assert!(cfg
             .warnings
             .iter()
@@ -493,6 +523,7 @@ mod tests {
         for field in [
             "quic-versions: [bad]",
             "cwnd: 0",
+            "cwnd: 257",
             "max-datagram-frame-size: 1401",
             "up: nan",
             "zero-rtt: wrong",
