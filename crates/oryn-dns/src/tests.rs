@@ -1019,3 +1019,57 @@ async fn real_ip_domains_preserve_ipv6_hosts_and_dns_rejection() {
     server.abort();
     let _ = server.await;
 }
+
+/// 固定结果的出站替身：`fresh` 为假时模拟已失效的策略组快照（如 epoch 过期的 Smart Plan）。
+struct SnapshotOutbound {
+    fresh: bool,
+}
+
+#[async_trait::async_trait]
+impl Outbound for SnapshotOutbound {
+    fn tag(&self) -> &str {
+        "P"
+    }
+    fn kind(&self) -> &'static str {
+        "smart"
+    }
+    async fn connect_tcp(
+        &self,
+        target: &oryn_config::TargetAddr,
+    ) -> std::io::Result<oryn_outbound::BoxStream> {
+        let oryn_config::TargetAddr::Ip(addr) = target else {
+            unreachable!("DNS 上游按 IP 连接");
+        };
+        if !self.fresh {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "Smart network context changed",
+            ));
+        }
+        Ok(Box::new(tokio::net::TcpStream::connect(addr).await?))
+    }
+    async fn bind_udp(
+        &self,
+        _: &oryn_config::TargetAddr,
+    ) -> std::io::Result<Box<dyn oryn_outbound::PacketConn>> {
+        Err(std::io::Error::other("unsupported"))
+    }
+}
+
+#[tokio::test]
+async fn cached_client_uses_latest_proxy_resolution() {
+    let upstream = tcp_server(Ipv4Addr::new(10, 9, 9, 9)).await;
+    let (e, _) = engine(&format!("dns:\n  nameserver: ['tcp://{upstream}']\n"));
+    let rt = e.rt();
+    let server = rt.spec.nameserver[0].clone();
+    let query = wire::build_query(0x4242, "a.test", TYPE_A);
+
+    // 第一次解析出的出站已失效：查询失败，但客户端按「服务器 + 出站标签」缓存下来。
+    let stale = Via::Proxy(Arc::new(SnapshotOutbound { fresh: false }));
+    assert!(e.exchange(&server, stale, &query, &rt).await.is_err());
+    // 同一标签的新解析结果必须替换缓存里的旧快照，否则此后每次查询都会立即失败。
+    let fresh = Via::Proxy(Arc::new(SnapshotOutbound { fresh: true }));
+    let resp = e.exchange(&server, fresh, &query, &rt).await.unwrap();
+    assert_eq!(ip_of(&Message::parse(&resp).unwrap()), Some("10.9.9.9".parse().unwrap()));
+    assert_eq!(e.clients.lock().unwrap().len(), 1, "仍复用同一个缓存客户端");
+}

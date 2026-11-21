@@ -489,9 +489,10 @@ impl SessionControl for Smart {
         };
     }
     fn on_sleep(&self) {}
-    fn on_wake(&self) {
-        self.on_network_changed();
-    }
+    /// 唤醒不等于换网：iOS 会在亮屏使用中每十几秒让扩展休眠 / 唤醒一次。若在此清空学习状态
+    /// 并递增 epoch，Smart 永远积累不到证据，在途 Plan 也会全部报「network context changed」。
+    /// 真正的网络切换由平台的路径监测经 `on_network_changed` 通知；旧证据靠时间衰减淘汰。
+    fn on_wake(&self) {}
 }
 struct Plan {
     smart: Arc<Smart>,
@@ -1356,6 +1357,11 @@ mod tests {
             })
             .unwrap();
         assert_eq!(selected.tag(), "v4");
+        // 睡眠 / 唤醒保留学习状态与 epoch，在途 Plan 不失效。
+        smart.on_sleep();
+        smart.on_wake();
+        assert!(!smart.state.lock().unwrap().paths.is_empty());
+        assert_eq!(smart.state.lock().unwrap().epoch, 0);
         smart.on_network_changed();
         assert!(smart.state.lock().unwrap().paths.is_empty());
         assert_eq!(smart.state.lock().unwrap().epoch, 1);

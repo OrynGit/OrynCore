@@ -1108,6 +1108,9 @@ impl DnsEngine {
     ) -> io::Result<Arc<Client>> {
         let key = format!("{}|{}", server.raw, via.key());
         if let Some(c) = self.clients.lock().unwrap().get(&key) {
+            // 缓存键只含出站标签；换成本次查询刚解析出的出站，避免沿用过期的策略组快照
+            // （例如唤醒或换网后 epoch 已失效的 Smart Plan，会让此后每次新建连接都立即失败）。
+            c.set_via(via);
             return Ok(c.clone());
         }
         let ip = match server.host_ip() {

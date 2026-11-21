@@ -42,7 +42,9 @@ type H3Send = h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>;
 
 pub struct Client {
     spec: ServerSpec,
-    via: Via,
+    /// 新建连接时经过的出站。策略组解析出的出站（如 Smart 的 Plan）带有目标与网络环境的快照，
+    /// 每次查询都由调用方以最新的解析结果替换，已建立的复用连接不受影响。
+    via: Mutex<Via>,
     addr: SocketAddr,
     skip_verify: bool,
     tls_idle: Mutex<Vec<TlsConn>>,
@@ -62,7 +64,7 @@ impl Client {
         Client {
             skip_verify: skip_verify || spec.skip_cert_verify,
             spec,
-            via,
+            via: Mutex::new(via),
             addr,
             tls_idle: Mutex::new(Vec::new()),
             h2: Mutex::new(None),
@@ -70,6 +72,15 @@ impl Client {
             quic: Mutex::new(None),
             h3: Mutex::new(None),
         }
+    }
+
+    /// 替换新建连接所用的出站（同一缓存键下最新一次路由解析的结果）。
+    pub fn set_via(&self, via: Via) {
+        *self.via.lock().unwrap() = via;
+    }
+
+    fn via(&self) -> Via {
+        self.via.lock().unwrap().clone()
     }
 
     /// 发送查询并返回应答（应答的 ID 与查询一致）。
@@ -92,7 +103,7 @@ impl Client {
         // 应答还要求问题段与查询一致。
         let wire_id = random_id();
         let query = &with_id(query, wire_id);
-        let mut resp = match (self.spec.proto, &self.via) {
+        let mut resp = match (self.spec.proto, &self.via()) {
             (DnsProto::Tailscale, _) => {
                 return Err(io::Error::other(
                     "identity DNS must be queried through its outbound",
@@ -145,7 +156,7 @@ impl Client {
     }
 
     async fn tcp(&self) -> io::Result<BoxStream> {
-        match &self.via {
+        match self.via() {
             Via::Direct => {
                 let s = oryn_udp::iface::connect_tcp(self.addr).await?;
                 let _ = s.set_nodelay(true);
@@ -268,7 +279,7 @@ impl Client {
             .receive_window(quinn::VarInt::from_u32(256 * 1024))
             .send_window(256 * 1024);
         config.transport_config(Arc::new(transport));
-        let endpoint = match &self.via {
+        let endpoint = match self.via() {
             Via::Direct => {
                 let local: SocketAddr = if self.addr.is_ipv6() {
                     "[::]:0".parse().unwrap()
