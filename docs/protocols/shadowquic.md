@@ -19,9 +19,9 @@ TCP：每条 QUIC 双向流写入 0x01 + SOCKS5 地址，随后转发字节流�
 ## 支持边界
 
 - QUIC v1（mihomo 默认）支持；当前 quinn-proto 不实现 v2。仅 v2 的节点被忽略并警告，混合 v1/v2 列表明确警告后使用 v1，不伪造 v2。
-- CUBIC / NewReno / 标准 BBR 及初始 cwnd 支持。BBR conservative/aggressive 暂未实现，配置警告后使用标准 BBR；不是静默等价。
+- CUBIC / NewReno / 标准 BBR 及初始 cwnd 支持；cwnd 下限 2 个包（1 个包的窗口等于 Initial 数据报大小，quinn 判定阻塞后首包发不出），配置为 1 时警告并按 2。BBR conservative/aggressive 暂未实现，配置警告后使用标准 BBR；不是静默等价。
 - 每节点最多 32 条 Flow，导入的更大 max-open-streams 夹到 32 并警告；每流接收窗口最多 256 KiB、连接接收窗口最多 1 MiB，夹值警告。默认 64 KiB / 512 KiB，发送窗口 256 KiB。
-- UDP 每关联最多 32 个目的地址；全连接最多 256 个发送/接收上下文；未知 ID 总共最多 8 包/64 KiB、2 s 到期；每关联队列 8 包；接收单向流任务最多 32 个。
+- UDP 每关联最多 128 个目的地址；全连接最多 512 个发送上下文与 512 个接收上下文；未知 ID 总共最多 8 包/64 KiB、2 s 到期；每关联队列 8 包；接收单向流任务最多 32 个。
 - UDP-over-stream 负载最多 8192 字节；DATAGRAM 无分片，受协商 MTU / max-datagram-frame-size 限制，过大的包明确报错。
 - JLS 的底层加密和普通 TLS 的证书校验是不同语义；不接受 skip-cert-verify 作为关闭 JLS 认证的开关。
 - 网络切换和睡眠关闭旧 QUIC 连接；唤醒/下一条 Flow 重建。票据可跨同节点连接使用，凭据不进入日志。
