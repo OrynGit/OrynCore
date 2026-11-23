@@ -204,6 +204,72 @@ async fn test_members(
     while set.join_next().await.is_some() {}
 }
 
+/// 最近一次「经代理」探测的结果；只有一份，覆盖写入。
+#[derive(Clone, Copy, Default)]
+struct ProxyProbe {
+    delay_ms: Option<u32>,
+    checked_at_ms: Option<u64>,
+    running: bool,
+    started_at_ms: u64,
+}
+
+static PROXY_PROBE: std::sync::Mutex<ProxyProbe> = std::sync::Mutex::new(ProxyProbe {
+    delay_ms: None,
+    checked_at_ms: None,
+    running: false,
+    started_at_ms: 0,
+});
+
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// 开始一次「经代理」探测：测试地址按分流规则选出口，与普通流量走同一条路。
+/// 已有探测在进行时返回 false，不重复发起；超过最长超时仍未结束的（例如任务随重载被取消）视为已结束。
+pub fn begin_proxy_probe() -> bool {
+    let mut probe = PROXY_PROBE.lock().unwrap();
+    let now = unix_ms();
+    let stale = now.saturating_sub(probe.started_at_ms) > MANUAL_TIMEOUT_MS.end() + 5_000;
+    if probe.running && !stale {
+        return false;
+    }
+    probe.running = true;
+    probe.started_at_ms = now;
+    true
+}
+
+/// 执行 [`begin_proxy_probe`] 登记的探测并写回结果。
+pub async fn run_proxy_probe(routing: Arc<oryn_dns::Routing>, url: String, timeout: Duration) {
+    let connector = crate::download::RulesConnector(routing);
+    let delay = match PROBE_LIMIT.acquire().await {
+        Ok(_permit) => probe_unified(&connector, &url, timeout, false)
+            .await
+            .ok()
+            .map(|d| d.as_millis().min(u32::MAX as u128) as u32),
+        Err(_) => None,
+    };
+    *PROXY_PROBE.lock().unwrap() = ProxyProbe {
+        delay_ms: delay,
+        checked_at_ms: Some(unix_ms()),
+        running: false,
+        started_at_ms: 0,
+    };
+}
+
+/// `proxy_probe` 命令的返回：`delay` 为毫秒（null 表示失败或未测），`checked_at` 为 Unix 毫秒。
+pub fn proxy_probe_status() -> serde_json::Value {
+    let mut probe = *PROXY_PROBE.lock().unwrap();
+    probe.running &= unix_ms().saturating_sub(probe.started_at_ms) <= MANUAL_TIMEOUT_MS.end() + 5_000;
+    serde_json::json!({
+        "delay": probe.delay_ms,
+        "checked_at": probe.checked_at_ms,
+        "testing": probe.running,
+    })
+}
+
 /// UDP 延迟测试地址的默认值，格式 `域名@DNS 服务器[:端口]`。
 pub const DEFAULT_UDP_TEST: &str = "apple.com@1.1.1.1";
 

@@ -273,6 +273,15 @@ impl EngineCtx {
         self.options.data_dir.as_deref()
     }
 
+    /// 代理测试地址（首页「代理」一段与策略组测速共用），未设置时用配置格式的默认值。
+    pub fn proxy_test_url(&self) -> &str {
+        self.options
+            .proxy_test_url
+            .as_deref()
+            .filter(|u| !u.trim().is_empty())
+            .unwrap_or(oryn_config::DEFAULT_TEST_URL)
+    }
+
     /// 手动 UDP 延迟测试的地址（`域名@DNS 服务器`），未设置时用默认值。
     pub fn udp_test_address(&self) -> &str {
         self.options

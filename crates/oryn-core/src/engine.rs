@@ -1014,6 +1014,19 @@ fn handle_command(ctx: &Rc<EngineCtx>, req: &Value) -> Value {
             }
             json!({ "ok": true })
         }
+        "probe_proxy" => {
+            // 首页「代理」一段：测试地址按分流规则选出口测一次，结果用 proxy_probe 取
+            let timeout = health::clamp_manual_timeout(
+                req.get("timeout_ms").and_then(Value::as_u64).unwrap_or(5000),
+            );
+            if health::begin_proxy_probe() {
+                let routing = state.routing.clone();
+                let url = ctx.proxy_test_url().to_string();
+                state.spawn(async move { health::run_proxy_probe(routing, url, timeout).await });
+            }
+            json!({ "ok": true })
+        }
+        "proxy_probe" => health::proxy_probe_status(),
         "close_group_connections" => {
             let Some(group) = str_arg(req, "group") else {
                 return json!({ "error": "close_group_connections requires group" });

@@ -10,7 +10,7 @@ use oryn_outbound::{resolve, BoxStream, PickMeta};
 use oryn_router::{DomainSource, FlowContext, Network};
 
 /// 遵循分流规则的连接方式：每次连接（含重定向）都按目标域名走一遍 Router，与普通流量一致。
-struct RulesConnector(Arc<Routing>);
+pub(crate) struct RulesConnector(pub(crate) Arc<Routing>);
 
 #[async_trait::async_trait]
 impl Connector for RulesConnector {
