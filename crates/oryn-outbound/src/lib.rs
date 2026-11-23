@@ -43,7 +43,7 @@ mod ssh;
 mod ssr;
 mod stream_proxy;
 mod sudoku;
-mod tailscale;
+pub mod tailscale;
 #[cfg(feature = "tuic")]
 mod tuic;
 mod uot;
@@ -112,6 +112,10 @@ pub trait Outbound: Send + Sync {
         false
     }
     fn as_group(&self) -> Option<&GroupOutbound> {
+        None
+    }
+    /// Tailscale 出站（登录状态与登录 / 登出命令）。
+    fn as_tailscale(&self) -> Option<&tailscale::TailscaleOutbound> {
         None
     }
     fn session_control(&self) -> Option<Arc<dyn SessionControl>> {

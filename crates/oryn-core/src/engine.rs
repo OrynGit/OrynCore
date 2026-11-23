@@ -907,6 +907,30 @@ fn handle_command(ctx: &Rc<EngineCtx>, req: &Value) -> Value {
             let closed = ctx.conns.close_all();
             json!({ "ok": true, "closed": closed })
         }
+        "tailscale_status" | "tailscale_login" | "tailscale_logout" => {
+            let cmd = str_arg(req, "cmd").unwrap_or_default();
+            let Some(proxy) = str_arg(req, "proxy") else {
+                return json!({"error": format!("{cmd} requires proxy")});
+            };
+            let Some(ts) = state
+                .routing
+                .outbounds
+                .iter()
+                .find(|o| o.tag() == proxy)
+                .and_then(|o| o.as_tailscale())
+            else {
+                return json!({"error":"unknown Tailscale proxy"});
+            };
+            let result = match cmd {
+                "tailscale_login" => ts.login(req.get("force").and_then(Value::as_bool).unwrap_or(false)),
+                "tailscale_logout" => ts.logout(),
+                _ => Ok(()),
+            };
+            match result {
+                Ok(()) => ts.status(),
+                Err(e) => json!({"error": e.to_string()}),
+            }
+        }
         "smart_explain" => {
             let (Some(group), Some(host)) = (str_arg(req, "group"), str_arg(req, "target")) else {
                 return json!({"error":"smart_explain requires group and target"});

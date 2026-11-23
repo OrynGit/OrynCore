@@ -13,7 +13,7 @@ use ts_keys::{MachinePublicKey, NodeState};
 /// 单个 MapResponse 上限：须容下 256 个对端的完整 netmap（见 snapshot::MAX_PEERS）。
 pub const MAX_MAP: usize = 1024 * 1024;
 const MAX_HTTP: usize = 64 * 1024;
-const CAP: ts_capabilityversion::CapabilityVersion =
+pub const CAP: ts_capabilityversion::CapabilityVersion =
     ts_capabilityversion::CapabilityVersion::CURRENT;
 
 /// Hostinfo.OS：与 tailscale `version.OS()` 一致（GOOS，Apple 平台写作 iOS / macOS）。
@@ -24,6 +24,19 @@ pub fn host_os() -> &'static str {
         "macos" => "macOS",
         os => os,
     }
+}
+
+/// Hostinfo；`region` 为本机 home DERP（map 请求时上报）。
+pub fn hostinfo(spec: &TailscaleSpec, region: Option<u16>) -> Value {
+    let mut info = json!({
+        "Hostname": spec.hostname.as_deref().unwrap_or("oryn"),
+        "OS": host_os(),
+        "IPNVersion": "Oryn/0.0.1",
+    });
+    if let Some(region) = region {
+        info["NetInfo"] = json!({ "PreferredDERP": region });
+    }
+    info
 }
 
 pub async fn transport(dialer: &dyn Dialer, url: &url::Url) -> io::Result<BoxStream> {
@@ -256,27 +269,17 @@ impl Control {
         let driver = Task(tokio::spawn(async move {
             let _ = driver.await;
         }));
-        let mut ctl = Self {
+        // 注册另行进行（login.rs）：交互登录要长轮询，且可能换 node key
+        Ok(Self {
             sender,
             _driver: driver,
             url,
-        };
-        let register = json!({"Version":u16::from(CAP),"NodeKey":keys.node_keys.public.to_string(),
-            "Hostinfo":{"Hostname":spec.hostname.as_deref().unwrap_or("oryn"),"OS":host_os(),"IPNVersion":"Oryn/0.0.1"},
-            "Auth":spec.auth_key.as_ref().map(|key| json!({"AuthKey":key})),"Ephemeral":spec.ephemeral});
-        let mut response = ctl.post("/machine/register", register).await?;
-        let result: Value =
-            serde_json::from_slice(&response.all(MAX_HTTP).await?).map_err(io::Error::other)?;
-        if result["MachineAuthorized"].as_bool() != Some(true)
-            || result["NodeKeyExpired"].as_bool() == Some(true)
-            || result["Error"].as_str().is_some_and(|s| !s.is_empty())
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "Tailscale registration denied; supply a valid auth-key or approve the device",
-            ));
-        }
-        Ok(ctl)
+        })
+    }
+    /// 一次 RegisterRequest，返回控制面的 RegisterResponse。
+    pub async fn register(&mut self, body: Value) -> io::Result<Value> {
+        let mut response = self.post("/machine/register", body).await?;
+        serde_json::from_slice(&response.all(MAX_HTTP).await?).map_err(io::Error::other)
     }
     async fn post(&mut self, path: &str, body: Value) -> io::Result<Body> {
         let bytes = Bytes::from(serde_json::to_vec(&body).map_err(io::Error::other)?);
@@ -314,8 +317,7 @@ impl Control {
     ) -> io::Result<Body> {
         self.post("/machine/map",json!({"Version":u16::from(CAP), "NodeKey": keys.node_keys.public.to_string(),
             "DiscoKey":keys.disco_keys.public.to_string(),"Stream":stream,"KeepAlive":true,"OmitPeers":!stream,
-            "Hostinfo":{"Hostname":spec.hostname.as_deref().unwrap_or("oryn"),"OS":host_os(),"IPNVersion":"Oryn/0.0.1",
-                "NetInfo":{"PreferredDERP":region.unwrap_or(0)}},"Endpoints":[]})).await
+            "Hostinfo":hostinfo(spec, Some(region.unwrap_or(0))),"Endpoints":[]})).await
     }
 }
 
