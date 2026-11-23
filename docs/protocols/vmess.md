@@ -3,7 +3,7 @@
 依据：[V2Fly VMess 公开规范](https://www.v2fly.org/developer/protocols/vmess.html)。认证使用 AEAD 命令密钥及嵌套 HMAC-SHA256 KDF；旧版 alterId 按 sing-vmess v0.2.7（commit 3a8da1e3baff96ba453501e0959863fec2c30977）的首个派生 ID 行为兼容。公开规范与参考行为有差异时，独立对端测试决定是否可声明支持。
 
 - UUID 严格 16 字节；每次连接重新生成请求密钥、IV、响应认证字节与认证 nonce。
-- AEAD、CFB、none / zero；CFB 与 MD5 仅用于历史协议兼容。
+- AEAD、CFB、none / zero；CFB 与 MD5 仅用于历史协议兼容。`zero` 与 `none` 在线上相同：security 字节为 5（NONE），TCP 不分块、UDP 分块，与 sing-vmess 客户端一致（V2Ray 客户端同样把 zero 落成 NONE 并去掉分块）；不发送 6（ZERO），sing-vmess 服务端不接受 6。较新的 Xray / V2Ray 服务端已移除 NONE，`none` / `zero` 节点只能对接接受 NONE 的服务端（mihomo、sing-box 等）。
 - 帧最大 65535 字节；每方向最多 65536 个 AEAD nonce，耗尽后必须断开，禁止重用 nonce。
 - 读取状态保留在连接内，取消读取不能丢字节；写入最多缓存一帧，满载回压。
 - 响应认证、长度、FNV、AEAD 标签必须验证；错误后连接不可继续。
