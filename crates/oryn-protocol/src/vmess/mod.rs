@@ -71,12 +71,7 @@ impl Body {
         request_key: &[u8],
         request_iv: &[u8],
     ) -> Self {
-        let security = match spec.cipher.as_str() {
-            "aes-128-cfb" => 1,
-            "aes-128-gcm" | "auto" => 3,
-            "chacha20-poly1305" => 4,
-            _ => 5,
-        };
+        let security = security_byte(&spec.cipher).unwrap_or(5);
         let mut shake = Shake128::default();
         shake.update(iv);
         let len_key = kdf(request_key, &[b"auth_len"]);
@@ -240,6 +235,37 @@ impl Body {
         Ok(Some(body.freeze()))
     }
 }
+/// 请求首部的 security 字节。`zero` 与 `none` 一样发 5（NONE）：sing-vmess（client.go
+/// `case "none", "zero": rawSecurity = SecurityTypeNone`）、V2Ray 客户端都把 zero 落成 NONE 并去掉分块，
+/// 线上没有 6（ZERO）；sing-vmess 服务端只接受 1 / 3 / 4 / 5，收到 6 报 `unknown security type`
+/// （OrynCore#60）。`auto` 按 AES-128-GCM。
+fn security_byte(cipher: &str) -> Option<u8> {
+    match cipher {
+        "aes-128-cfb" => Some(1),
+        "aes-128-gcm" | "auto" => Some(3),
+        "chacha20-poly1305" => Some(4),
+        "none" | "zero" => Some(5),
+        _ => None,
+    }
+}
+/// 请求选项：CFB 分块；AEAD 分块 + 长度掩码（可选全局填充、认证长度）；NONE 只在 UDP 分块，
+/// TCP 原样传输（与 sing-vmess client.go 一致）。
+fn request_options(spec: &VmessSpec, security: u8, command: u8) -> u8 {
+    match security {
+        1 => 1,
+        3 | 4 => {
+            5 | if spec.global_padding { 8 } else { 0 }
+                | if spec.authenticated_length { 16 } else { 0 }
+        }
+        _ => {
+            if command == 2 {
+                1
+            } else {
+                0
+            }
+        }
+    }
+}
 pub struct Session {
     key: [u8; 16],
     iv: [u8; 16],
@@ -272,27 +298,9 @@ impl Session {
         let iv = random::<16>()?;
         let response = random::<1>()?[0];
         let legacy = spec.alter_id > 0;
-        let security = match spec.cipher.as_str() {
-            "aes-128-cfb" => 1,
-            "aes-128-gcm" | "auto" => 3,
-            "chacha20-poly1305" => 4,
-            "none" | "zero" => 5,
-            _ => return Err(bad("unsupported VMess cipher")),
-        };
-        let options = match security {
-            1 => 1,
-            3 | 4 => {
-                5 | if spec.global_padding { 8 } else { 0 }
-                    | if spec.authenticated_length { 16 } else { 0 }
-            }
-            _ => {
-                if command == 2 {
-                    1
-                } else {
-                    0
-                }
-            }
-        };
+        let security =
+            security_byte(&spec.cipher).ok_or_else(|| bad("unsupported VMess cipher"))?;
+        let options = request_options(spec, security, command);
         let mut header = vec![1];
         header.extend(iv);
         header.extend(key);
@@ -528,10 +536,28 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for VmessStream<S> {
         ready!(self.drain(cx))?;
         Pin::new(&mut self.stream).poll_flush(cx)
     }
+    /// 半关闭。分块模式（options 第 0 位）用协议内的结束块（空负载块）告知服务端「请求发完了」，
+    /// 承载保持打开以继续接收响应，与 V2Ray 客户端一致；服务端（V2Ray / Xray / sing-vmess）读到它即
+    /// 半关闭到目标的连接。WebSocket、smux 等没有半关闭的承载上，关闭承载会连同响应一起丢掉
+    /// （OrynCore#61）。不分块（none / zero 的 TCP）没有结束标记，只能关闭承载的写方向。
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         ready!(self.drain(cx))?;
-        self.closed = true;
-        Pin::new(&mut self.stream).poll_shutdown(cx)
+        if self.session.write.options & 1 == 0 || self.failed {
+            self.closed = true;
+            return Pin::new(&mut self.stream).poll_shutdown(cx);
+        }
+        if !self.closed {
+            match self.session.write.encode(&[]) {
+                Ok(end) => self.pending = end,
+                Err(e) => {
+                    self.failed = true;
+                    return Poll::Ready(Err(e));
+                }
+            }
+            self.closed = true;
+        }
+        ready!(self.drain(cx))?;
+        Pin::new(&mut self.stream).poll_flush(cx)
     }
 }
 impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for VmessStream<S> {
@@ -623,6 +649,21 @@ mod tests {
             authenticated_length: auth,
         }
     }
+    /// zero 与 none 线上相同：security 5、TCP 不分块、UDP 分块（OrynCore#60，对照 sing-vmess）。
+    #[test]
+    fn zero_maps_to_none_like_sing_vmess() {
+        assert_eq!(security_byte("zero"), Some(5));
+        assert_eq!(security_byte("none"), Some(5));
+        assert_eq!(security_byte("auto"), Some(3));
+        assert_eq!(security_byte("bogus"), None);
+        for cipher in ["zero", "none"] {
+            let spec = spec(cipher, true, true);
+            assert_eq!(request_options(&spec, 5, 1), 0, "{cipher} tcp");
+            assert_eq!(request_options(&spec, 5, 2), 1, "{cipher} udp");
+        }
+        assert_eq!(request_options(&spec("aes-128-gcm", false, false), 3, 1), 5);
+        assert!(Session::request(&spec("bogus", false, false), &TargetAddr::Domain("a.test".into(), 443), 1).is_err());
+    }
     #[test]
     fn stream_ciphers_do_not_have_an_aead_nonce_limit() {
         for cipher in ["aes-128-cfb", "none"] {
@@ -694,5 +735,57 @@ mod tests {
         let mut wire = BytesMut::from(&w.encode(b"secret").unwrap()[..]);
         *wire.last_mut().unwrap() ^= 1;
         assert!(r.decode(&mut wire).is_err());
+    }
+    fn session(spec: &VmessSpec, options: u8) -> Session {
+        Session {
+            key: [1; 16],
+            iv: [2; 16],
+            response: 0,
+            packet: false,
+            legacy: false,
+            read: Body::new(spec, options, &[3; 16], &[4; 16], &[1; 16], &[2; 16]),
+            write: Body::new(spec, options, &[1; 16], &[2; 16], &[1; 16], &[2; 16]),
+        }
+    }
+    /// 分块模式的半关闭发结束块、不关闭承载；不分块时关闭承载写方向（OrynCore#61）。
+    #[tokio::test]
+    async fn half_close_sends_end_chunk_and_keeps_transport_open() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (cipher, options) in [("aes-128-gcm", 5 | 8 | 16), ("chacha20-poly1305", 5), ("aes-128-cfb", 1)] {
+            let spec = spec(cipher, options & 8 != 0, options & 16 != 0);
+            let (client, mut server) = tokio::io::duplex(64 * 1024);
+            let mut stream = session(&spec, options).stream(client);
+            stream.write_all(b"request").await.unwrap();
+            stream.shutdown().await.unwrap();
+            assert!(stream.write_all(b"late").await.is_err(), "{cipher}");
+            let mut wire = vec![0; 4096];
+            let n = server.read(&mut wire).await.unwrap();
+            let mut wire = BytesMut::from(&wire[..n]);
+            let mut read = Body::new(&spec, options, &[1; 16], &[2; 16], &[1; 16], &[2; 16]);
+            if let Some(cfb) = &mut read.cfb {
+                cfb.apply(&mut wire, true);
+            }
+            assert_eq!(read.decode(&mut wire).unwrap().unwrap().as_ref(), b"request");
+            assert!(read.decode(&mut wire).unwrap().unwrap().is_empty(), "{cipher} end chunk");
+            assert!(wire.is_empty());
+            // 承载没有关闭：对端读不到 EOF，仍可回写
+            let mut probe = [0; 1];
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(50), server.read(&mut probe))
+                    .await
+                    .is_err(),
+                "{cipher} transport must stay open"
+            );
+            server.write_all(b"x").await.unwrap();
+        }
+        // none 的 TCP 不分块：没有结束标记，关闭承载写方向
+        let spec = spec("none", false, false);
+        let (client, mut server) = tokio::io::duplex(64 * 1024);
+        let mut stream = session(&spec, 0).stream(client);
+        stream.write_all(b"raw").await.unwrap();
+        stream.shutdown().await.unwrap();
+        let mut got = Vec::new();
+        server.read_to_end(&mut got).await.unwrap();
+        assert_eq!(got, b"raw");
     }
 }

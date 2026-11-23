@@ -926,6 +926,23 @@ fn handle_command(ctx: &Rc<EngineCtx>, req: &Value) -> Value {
                 .and_then(|g| g.smart_explain(&target, network))
                 .unwrap_or_else(|| json!({"error":"unknown Smart group"}))
         }
+        "smart_usage" => {
+            let Some(group) = str_arg(req, "group") else {
+                return json!({"error":"smart_usage requires group"});
+            };
+            state
+                .routing
+                .outbounds
+                .iter()
+                .find(|o| o.tag() == group)
+                .and_then(|o| o.as_group())
+                .and_then(|g| g.smart_usage())
+                .map(|mut v| {
+                    v["group"] = group.into();
+                    v
+                })
+                .unwrap_or_else(|| json!({"error":"unknown Smart group"}))
+        }
         "groups" => {
             let groups: Vec<Value> = state
                 .routing

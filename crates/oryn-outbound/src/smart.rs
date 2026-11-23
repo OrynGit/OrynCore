@@ -16,6 +16,62 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 const MAX_RECORDS: usize = 16384;
 const MAX_LEASES: usize = 4096;
+/// 端到端延迟样本上限（毫秒）：长轮询、服务端推送的首字节可能在几十秒后才到，
+/// 不截断会让一次样本长期拖垮滑动平均。与承载拨号超时同量级。
+const MAX_RESPONSE_DELAY_MS: f64 = 3000.0;
+/// 延迟噪声下限（毫秒）：低于它的差别没有选路意义，局域网里亚毫秒的抖动不应决定胜负，
+/// 并列时按配置顺序（OrynCore#55）。
+const DELAY_FLOOR_MS: f64 = 10.0;
+/// 抖动噪声下限（毫秒），含义同上。
+const JITTER_FLOOR_MS: f64 = 5.0;
+/// 使用状态标签：近期尝试（衰减和）占比与数量门槛（OrynCore#56）。
+const MOST_USED_SHARE: f64 = 0.4;
+const MOST_USED_MIN: f64 = 8.0;
+const OCCASIONAL_MIN: f64 = 2.0;
+
+/// 评分用的延迟：端到端（首次写出到首个响应字节，池化协议热池命中也有）优先，
+/// 其次承载拨号、探针；都没有时为 `None`（按 300 ms 计）。返回值与来源。
+fn delay_of(
+    target: Option<&Evidence>,
+    carrier: Option<&Evidence>,
+    probe: Option<&Evidence>,
+) -> (Option<f64>, &'static str) {
+    if let Some(d) = target.and_then(|e| e.delay) {
+        return (Some(d), "end-to-end");
+    }
+    if let Some(d) = carrier.and_then(|e| e.delay) {
+        return (Some(d), "carrier");
+    }
+    if let Some(d) = probe.and_then(|e| e.delay) {
+        return (Some(d), "probe");
+    }
+    (None, "default")
+}
+
+/// 质量分：可靠性三次方 ÷ 延迟项 ÷ 抖动项。延迟、抖动先扣掉噪声下限。
+fn quality(r: f64, delay: Option<f64>, jitter: f64) -> f64 {
+    let d = delay.unwrap_or(300.0).max(DELAY_FLOOR_MS);
+    let j = (jitter - JITTER_FLOOR_MS).max(0.0);
+    r.powi(3) / (1.0 + d / 300.0) / (1.0 + j / 100.0)
+}
+
+fn score_bucket(score: f64) -> i64 {
+    if score > 0.0 {
+        (score.ln() * 200.0).floor() as i64
+    } else {
+        i64::MIN
+    }
+}
+
+fn usage_label(attempts: f64, share: f64) -> Option<&'static str> {
+    if attempts >= MOST_USED_MIN && share >= MOST_USED_SHARE {
+        Some("most-used")
+    } else if attempts >= OCCASIONAL_MIN {
+        Some("occasional")
+    } else {
+        None
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Family {
     Unknown,
@@ -49,6 +105,8 @@ struct Evidence {
     delay: Option<f64>,
     jitter: f64,
     at: Instant,
+    /// 最近一次失败；之后出现成功即清除。不持久化（只用于 failure-window 内的租约旁路）。
+    last_failure: Option<Instant>,
 }
 impl Default for Evidence {
     fn default() -> Self {
@@ -58,6 +116,7 @@ impl Default for Evidence {
             delay: None,
             jitter: 0.0,
             at: Instant::now(),
+            last_failure: None,
         }
     }
 }
@@ -78,6 +137,7 @@ impl Evidence {
         self.success = s + f64::from(success);
         self.failure = f + f64::from(!success);
         self.at = now;
+        self.last_failure = if success { None } else { Some(now) };
         if let Some(d) = delay {
             if let Some(old) = self.delay {
                 self.jitter = self.jitter * 0.8 + (d - old).abs() * 0.2;
@@ -151,6 +211,8 @@ pub struct State {
     targets: HashMap<TargetKey, Evidence>,
     endpoints: HashMap<(PathKey, SocketAddr), PathHealth>,
     leases: HashMap<(IpAddr, String), Lease>,
+    /// 每条路径的近期尝试量（成功 + 失败，衰减），只用于使用状态标签。键来自本组候选，天然有界。
+    usage: HashMap<PathKey, Evidence>,
 }
 #[derive(Default)]
 pub struct Registry {
@@ -293,10 +355,7 @@ impl Smart {
                     } else {
                         carrier.map_or(0.9, |s| s.reliability(now, &t))
                     };
-                let d = carrier
-                    .and_then(|s| s.delay)
-                    .or_else(|| state.probes.get(path).and_then(|p| p.delay))
-                    .unwrap_or(300.0);
+                let (d, _) = delay_of(target_stats, carrier, state.probes.get(path));
                 let j = carrier.map_or(0.0, |s| s.jitter);
                 let preferred = matches!(
                     (self.spec.server_strategy, c.family),
@@ -304,7 +363,7 @@ impl Smart {
                 );
                 (
                     i,
-                    r.powi(3) / (1.0 + d / 300.0) / (1.0 + j / 100.0)
+                    quality(r, d, j)
                         * c.factor
                         * if preferred { 1.03 } else { 1.0 }
                         * match c.family {
@@ -338,7 +397,13 @@ impl Smart {
                         >= best_lower - 0.05
             })
         });
-        scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        // 分数按约 0.5% 宽的对数桶比较：衰减时刻、亚毫秒延迟之类的噪声不决定胜负，
+        // 桶内并列按配置顺序（OrynCore#55）。桶是全序，排序比较保持一致。
+        scored.sort_by(|a, b| {
+            score_bucket(b.1)
+                .cmp(&score_bucket(a.1))
+                .then(a.0.cmp(&b.0))
+        });
         let &(mut chosen, best) = scored.first()?;
         if !state
             .leases
@@ -366,6 +431,27 @@ impl Smart {
             }
         }
         let lease_key = (client, target.clone());
+        // 租约路径在 failure-window 内有可归因失败（承载或本目标）时，新连接暂时绕开它，
+        // 但不改写租约：偶发失败不让出口漂移，持续失败经评分与确认门迁移（OrynCore#52）。
+        let window = Duration::from_secs(t.failure_window_secs);
+        let recent = |at: Option<Instant>| at.is_some_and(|at| now.duration_since(at) < window);
+        let suspended = |path: &PathKey| {
+            state
+                .paths
+                .get(path)
+                .is_some_and(|p| p.failures > 0 && recent(p.last_failure))
+                || state
+                    .targets
+                    .get(&TargetKey(target.clone(), udp, path.clone()))
+                    .is_some_and(|e| recent(e.last_failure))
+        };
+        let lease_path = state
+            .leases
+            .get(&lease_key)
+            .filter(|l| now.duration_since(l.used) < idle)
+            .map(|l| l.path.clone());
+        let held_suspended = lease_path.as_ref().is_some_and(suspended);
+        let mut bypass = false;
         if let Some(lease) = state.leases.get_mut(&lease_key) {
             if now.duration_since(lease.used) < idle {
                 if let Some(&(current, score)) =
@@ -392,6 +478,14 @@ impl Smart {
                         }
                     }
                     lease.used = now;
+                    if chosen == current && held_suspended {
+                        if let Some(&(other, _)) =
+                            scored.iter().find(|(i, _)| keys[*i].0 != lease.path)
+                        {
+                            chosen = other;
+                            bypass = true;
+                        }
+                    }
                 }
             }
         }
@@ -407,10 +501,11 @@ impl Smart {
                 state.leases.remove(&old);
             }
         }
-        if state
-            .leases
-            .get(&lease_key)
-            .is_none_or(|l| l.path != path || now.duration_since(l.used) >= idle)
+        if !bypass
+            && state
+                .leases
+                .get(&lease_key)
+                .is_none_or(|l| l.path != path || now.duration_since(l.used) >= idle)
         {
             state.leases.insert(
                 lease_key,
@@ -625,6 +720,20 @@ impl Dialer for FamilyDialer {
         Ok(Box::new(stream))
     }
 }
+/// 记一次真实尝试（已发起的连接，不含熔断拒绝与取消）到使用量。
+fn usage_event(smart: &Smart, path: PathKey, epoch: u64, success: bool) {
+    let mut state = smart.state.lock().unwrap();
+    if state.epoch != epoch {
+        return;
+    }
+    let tn = state.tuning;
+    state.dirty = true;
+    state
+        .usage
+        .entry(path)
+        .or_default()
+        .record(success, None, Instant::now(), &tn);
+}
 fn target_event(
     smart: &Smart,
     key: TargetKey,
@@ -723,7 +832,15 @@ impl Outbound for Plan {
             c.outbound.bind_udp(target),
         )
         .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Smart UDP setup timeout"))??;
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Smart UDP setup timeout"))
+        .and_then(|r| r);
+        usage_event(
+            &self.smart,
+            PathKey(c.node.clone(), Family::Unknown),
+            self.epoch,
+            inner.is_ok(),
+        );
+        let inner = inner?;
         Ok(Box::new(ObservedPacket {
             inner,
             smart: self.smart.clone(),
@@ -764,7 +881,8 @@ impl AsyncRead for ObservedStream {
                 self.site.clone(),
                 self.epoch,
                 true,
-                self.committed.map(|t| t.elapsed().as_secs_f64() * 1000.0),
+                self.committed
+                    .map(|t| (t.elapsed().as_secs_f64() * 1000.0).min(MAX_RESPONSE_DELAY_MS)),
             );
         }
         result
@@ -870,12 +988,22 @@ pub fn build(
         let node = identity(index, config);
         let factor = group.smart.factor(outbound.tag());
         let precise = oryn_config::smart_family_capable(&spec.kind, spec.dialer.is_some());
+        // 服务器是 IP 字面量时地址族已知，另一族的候选永远拨不通，只会消耗回退次数（OrynCore#53）
+        let literal = match oryn_config::smart_server(&spec.kind) {
+            Some(TargetAddr::Ip(addr)) => Some(if addr.is_ipv6() {
+                Family::V6
+            } else {
+                Family::V4
+            }),
+            _ => None,
+        };
         if precise {
             for family in [Family::V4, Family::V6] {
                 if matches!(
                     (group.smart.server_strategy, family),
                     (ServerStrategy::V4Only, Family::V6) | (ServerStrategy::V6Only, Family::V4)
-                ) {
+                ) || literal.is_some_and(|f| f != family)
+                {
                     continue;
                 }
                 let dialer: Arc<dyn Dialer> = Arc::new(FamilyDialer {
@@ -909,19 +1037,11 @@ pub fn build(
             supports_udp: udp_capable(&spec.kind),
         });
     }
-    candidates.sort_by(|a, b| {
-        a.node
-            .cmp(&b.node)
-            .then((a.family as u8).cmp(&(b.family as u8)))
-    });
-    let key = format!(
-        "{}:{:?}",
-        name,
-        candidates
-            .iter()
-            .map(|c| (&c.node, c.family))
-            .collect::<Vec<_>>()
-    );
+    // 状态键按指纹排序（成员换序仍复用学习状态）；候选本身保持配置顺序，
+    // 分数并列时按配置顺序决胜（OrynCore#55）
+    let mut identity_order: Vec<_> = candidates.iter().map(|c| (&c.node, c.family)).collect();
+    identity_order.sort_by(|a, b| a.0.cmp(b.0).then((a.1 as u8).cmp(&(b.1 as u8))));
+    let key = format!("{name}:{identity_order:?}");
     let state = ctx.health.smart.get(key.clone());
     state.lock().unwrap().tuning = group.smart.tuning;
     if let Some(dir) = data_dir {
@@ -995,18 +1115,22 @@ impl Plan {
             endpoint: Arc::new(Mutex::new(None)),
             carrier_ready: ready.clone(),
         };
-        match TRACE.scope(trace, c.outbound.connect_tcp(target)).await {
+        let result = TRACE.scope(trace, c.outbound.connect_tcp(target)).await;
+        // 熔断拒绝、网络切换与取消在上面就返回了；这里每个结果都是一次真实尝试
+        if !matches!(&result, Err(e) if e.kind() == io::ErrorKind::Interrupted) {
+            usage_event(&self.smart, path.clone(), self.epoch, result.is_ok());
+        }
+        match result {
             Ok(stream) => {
                 *self.winner.lock().unwrap() = Some(i);
                 let mut state = self.smart.state.lock().unwrap();
                 if state.epoch == self.epoch {
+                    // 回退成功不改写租约（OrynCore#52）：失败已记入证据，租约路径在
+                    // failure-window 内被旁路；是否迁移交给评分与确认门。
                     if let Some(lease) = state.leases.get_mut(&(self.client, self.target.clone())) {
-                        if lease.path != path {
-                            lease.created = Instant::now();
-                            lease.confirmations = 0;
+                        if lease.path == path {
+                            lease.used = Instant::now();
                         }
-                        lease.path = path.clone();
-                        lease.used = Instant::now();
                     }
                 }
                 drop(state);
@@ -1054,15 +1178,128 @@ impl Smart {
         let target = self.target_key(target);
         let now = Instant::now();
         let s = self.state.lock().unwrap();
+        let labels = self.labels(&s, now);
         let hashed = digest(&s.salt, &target);
-        serde_json::json!({"target":target,"network":if network==Network::Udp{"udp"}else{"tcp"},"epoch":s.epoch,"target_family":"unknown","paths":self.candidates.iter().filter(|c| if network==Network::Udp{!c.tcp_only}else{!c.udp_only}).map(|c|{
-            let key=PathKey(c.node.clone(),c.family);let p=s.paths.get(&key);let t=s.targets.get(&TargetKey(hashed.clone(),network==Network::Udp,key.clone()));
-            let (success,failure)=t.map_or((0.0,0.0),|t|t.values(now,&s.tuning));
-            let carrier=p.map_or(0.9,|p|p.evidence.reliability(now,&s.tuning));let response=t.map_or(0.9,|t|t.reliability(now,&s.tuning));
-            let delay=p.and_then(|p|p.evidence.delay);let jitter=p.map_or(0.0,|p|p.evidence.jitter);
-            let q=(response*if c.family==Family::Unknown{1.0}else{carrier}).powi(3)/(1.0+delay.unwrap_or(300.0)/300.0)/(1.0+jitter/100.0);
-            serde_json::json!({"node":c.outbound.tag(),"node_id":c.node,"server_family":c.family.name(),"carrier_delay_ms":delay,"success":success,"failure":failure,"confidence":if success+failure<s.tuning.min_samples{"warming"}else{"observed"},"base_score":q,"name_factor":c.factor,"score":q*c.factor,"eligible":p.is_none_or(|p|p.eligible(now)),"circuit":p.map_or("closed",|p|if p.open_until.is_some(){if p.eligible(now){"half_open"}else{"open"}}else{"closed"}),"endpoints":s.endpoints.iter().filter(|((path,_),_)|path==&key).take(16).map(|((_,addr),e)|serde_json::json!({"address":addr.to_string(),"eligible":e.eligible(now),"recent_failures":e.failures})).collect::<Vec<_>>()})
-        }).collect::<Vec<_>>()})
+        let udp = network == Network::Udp;
+        let paths = self
+            .candidates
+            .iter()
+            .filter(|c| if udp { !c.tcp_only } else { !c.udp_only })
+            .map(|c| {
+                let key = PathKey(c.node.clone(), c.family);
+                let p = s.paths.get(&key);
+                let t = s.targets.get(&TargetKey(hashed.clone(), udp, key.clone()));
+                let (success, failure) = t.map_or((0.0, 0.0), |t| t.values(now, &s.tuning));
+                let carrier = p.map_or(0.9, |p| p.evidence.reliability(now, &s.tuning));
+                let response = t.map_or(0.9, |t| t.reliability(now, &s.tuning));
+                let (delay, source) =
+                    delay_of(t, p.map(|p| &p.evidence), s.probes.get(&key));
+                let jitter = p.map_or(0.0, |p| p.evidence.jitter);
+                let r = response * if c.family == Family::Unknown { 1.0 } else { carrier };
+                let q = quality(r, delay, jitter);
+                serde_json::json!({
+                    "node": c.outbound.tag(),
+                    "node_id": c.node,
+                    "server_family": c.family.name(),
+                    "label": labels.get(c.node.as_str()).copied().flatten(),
+                    "delay_ms": delay,
+                    "delay_source": source,
+                    "target_delay_ms": t.and_then(|t| t.delay),
+                    "carrier_delay_ms": p.and_then(|p| p.evidence.delay),
+                    "success": success,
+                    "failure": failure,
+                    "confidence": if success + failure < s.tuning.min_samples { "warming" } else { "observed" },
+                    "base_score": q,
+                    "name_factor": c.factor,
+                    "score": q * c.factor,
+                    "eligible": p.is_none_or(|p| p.eligible(now)),
+                    "circuit": p.map_or("closed", |p| if p.open_until.is_some() {
+                        if p.eligible(now) { "half_open" } else { "open" }
+                    } else {
+                        "closed"
+                    }),
+                    "endpoints": s.endpoints.iter().filter(|((path, _), _)| path == &key).take(16)
+                        .map(|((_, addr), e)| serde_json::json!({
+                            "address": addr.to_string(),
+                            "eligible": e.eligible(now),
+                            "recent_failures": e.failures,
+                        }))
+                        .collect::<Vec<_>>(),
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "target": target,
+            "network": if udp { "udp" } else { "tcp" },
+            "epoch": s.epoch,
+            "target_family": "unknown",
+            "paths": paths,
+        })
+    }
+
+    /// 每个节点（按配置顺序、去重）的近期尝试量与各地址族明细。
+    fn node_usage(
+        &self,
+        s: &State,
+        now: Instant,
+    ) -> Vec<(&Candidate, f64, serde_json::Map<String, serde_json::Value>)> {
+        let mut nodes: Vec<(&Candidate, f64, serde_json::Map<String, serde_json::Value>)> =
+            Vec::new();
+        for c in &self.candidates {
+            let attempts = s
+                .usage
+                .get(&PathKey(c.node.clone(), c.family))
+                .map_or(0.0, |e| {
+                    let (a, b) = e.values(now, &s.tuning);
+                    a + b
+                });
+            let entry = match nodes.iter_mut().find(|(n, _, _)| n.node == c.node) {
+                Some(entry) => entry,
+                None => {
+                    nodes.push((c, 0.0, serde_json::Map::new()));
+                    nodes.last_mut().unwrap()
+                }
+            };
+            entry.1 += attempts;
+            entry.2.insert(c.family.name().into(), attempts.into());
+        }
+        nodes
+    }
+
+    fn labels<'a>(&'a self, s: &State, now: Instant) -> HashMap<&'a str, Option<&'static str>> {
+        let nodes = self.node_usage(s, now);
+        let total: f64 = nodes.iter().map(|(_, n, _)| n).sum();
+        nodes
+            .iter()
+            .map(|(c, n, _)| {
+                let share = if total > 0.0 { n / total } else { 0.0 };
+                (c.node.as_str(), usage_label(*n, share))
+            })
+            .collect()
+    }
+
+    /// 使用状态（`smart_usage` 命令）：每个节点近期尝试量（衰减和）、占比与标签，按量降序、并列按配置顺序。
+    pub fn usage(&self) -> serde_json::Value {
+        let now = Instant::now();
+        let s = self.state.lock().unwrap();
+        let mut nodes = self.node_usage(&s, now);
+        let total: f64 = nodes.iter().map(|(_, n, _)| n).sum();
+        // 稳定排序：并列保持配置顺序
+        nodes.sort_by(|a, b| b.1.total_cmp(&a.1));
+        serde_json::json!({
+            "epoch": s.epoch,
+            "nodes": nodes.into_iter().map(|(c, n, families)| {
+                let share = if total > 0.0 { n / total } else { 0.0 };
+                serde_json::json!({
+                    "node": c.outbound.tag(),
+                    "node_id": c.node,
+                    "attempts": n,
+                    "share": share,
+                    "label": usage_label(n, share),
+                    "families": families,
+                })
+            }).collect::<Vec<_>>(),
+        })
     }
 }
 
@@ -1110,6 +1347,7 @@ fn restore(v: &serde_json::Value, gap: f64, now: Instant, t: &SmartTuning) -> Op
             .filter(|j| j.is_finite() && *j >= 0.0)
             .unwrap_or(0.0),
         at: now,
+        last_failure: None,
     })
 }
 fn load(state: &mut State, path: &std::path::Path) {
@@ -1184,6 +1422,18 @@ fn load(state: &mut State, path: &std::path::Path) {
             state.paths.entry(key).or_default().evidence = evidence;
         }
     }
+    // 旧快照没有 usage，缺省为空
+    for v in doc
+        .get("usage")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .take(MAX_RECORDS)
+    {
+        if let Some((key, evidence)) = entry(v) {
+            state.usage.insert(key, evidence);
+        }
+    }
     for v in doc
         .get("targets")
         .and_then(serde_json::Value::as_array)
@@ -1228,6 +1478,7 @@ impl Smart {
                 "saved": unix_now(),
                 "salt": s.salt.iter().map(|b| format!("{b:02x}")).collect::<String>(),
                 "paths": s.paths.iter().map(|(k, p)| with_path(snapshot(&p.evidence, now, &tn), k)).collect::<Vec<_>>(),
+                "usage": s.usage.iter().map(|(k, e)| with_path(snapshot(e, now, &tn), k)).collect::<Vec<_>>(),
                 "targets": targets.iter().map(|(k, e)| {
                     let mut v = with_path(snapshot(e, now, &tn), &k.2);
                     v["h"] = k.0.clone().into();
@@ -1843,6 +2094,224 @@ mod tests {
             })
             .is_some());
     }
+    struct Failing;
+    #[async_trait]
+    impl Outbound for Failing {
+        fn tag(&self) -> &str {
+            "bad"
+        }
+        fn kind(&self) -> &'static str {
+            "mock"
+        }
+        async fn connect_tcp(&self, _: &TargetAddr) -> io::Result<BoxStream> {
+            Err(io::ErrorKind::ConnectionRefused.into())
+        }
+        async fn bind_udp(&self, _: &TargetAddr) -> io::Result<Box<dyn PacketConn>> {
+            Err(io::ErrorKind::Unsupported.into())
+        }
+    }
+    /// 多个节点、各一条 IPv4 路径，候选按给出顺序（即配置顺序）。
+    fn nodes(list: Vec<(&'static str, Arc<dyn Outbound>)>) -> Arc<Smart> {
+        Arc::new(Smart {
+            resolver: None,
+            candidates: list
+                .into_iter()
+                .map(|(node, outbound)| Candidate {
+                    node: node.into(),
+                    family: Family::V4,
+                    outbound,
+                    factor: 1.0,
+                    tcp_only: true,
+                    server: None,
+                    udp_only: false,
+                    supports_udp: false,
+                })
+                .collect(),
+            spec: SmartSpec::default(),
+            state: Arc::new(Mutex::new(State::default())),
+        })
+    }
+    fn mock(name: &'static str) -> Arc<dyn Outbound> {
+        Arc::new(Mock {
+            name,
+            slow: false,
+            calls: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+    fn tkey(node: &str) -> TargetKey {
+        TargetKey(
+            digest(&[0; 16], "api.example.com"),
+            false,
+            PathKey(node.into(), Family::V4),
+        )
+    }
+    /// OrynCore#52：持有路径偶发失败只在 failure-window 内被旁路，租约不迁移；回退成功也不改写租约。
+    #[tokio::test]
+    async fn smart_failure_bypasses_lease_without_migrating() {
+        let smart = nodes(vec![("a", mock("a")), ("b", mock("b"))]);
+        let target = target();
+        assert_eq!(smart.pick(&meta(&target)).unwrap().tag(), "a");
+        let lease = |smart: &Smart| {
+            smart.state.lock().unwrap().leases[&(
+                IpAddr::from([0, 0, 0, 0]),
+                digest(&[0; 16], "api.example.com"),
+            )]
+                .path
+                .0
+                .clone()
+        };
+        {
+            let mut s = smart.state.lock().unwrap();
+            let t = s.tuning;
+            s.targets
+                .entry(tkey("a"))
+                .or_default()
+                .record(false, None, Instant::now(), &t);
+        }
+        // 窗口内：新连接走 b，租约仍是 a
+        assert_eq!(smart.pick(&meta(&target)).unwrap().tag(), "b");
+        assert_eq!(lease(&smart), "a");
+        // 窗口过后：回到 a，出口不漂移
+        {
+            let mut s = smart.state.lock().unwrap();
+            let past = Instant::now().checked_sub(Duration::from_secs(60)).unwrap();
+            s.targets.get_mut(&tkey("a")).unwrap().last_failure = Some(past);
+        }
+        assert_eq!(smart.pick(&meta(&target)).unwrap().tag(), "a");
+        assert_eq!(lease(&smart), "a");
+
+        // 回退成功（持有节点拨号失败、次优成功）不改写租约
+        let smart = nodes(vec![("a", Arc::new(Failing)), ("b", mock("b"))]);
+        let plan = smart.pick(&meta(&target)).unwrap();
+        assert_eq!(plan.tag(), "bad");
+        assert!(plan.connect_tcp(&target).await.is_ok());
+        assert_eq!(plan.actual_tag().as_deref(), Some("b"));
+        assert_eq!(lease(&smart), "a");
+    }
+    /// OrynCore#54：池化协议没有承载拨号延迟，评分用端到端延迟；explain 标出来源。
+    #[test]
+    fn smart_scores_end_to_end_delay() {
+        let smart = nodes(vec![("slow", mock("slow")), ("fast", mock("fast"))]);
+        {
+            let mut s = smart.state.lock().unwrap();
+            let t = s.tuning;
+            for _ in 0..30 {
+                s.targets.entry(tkey("slow")).or_default().record(
+                    true,
+                    Some(900.0),
+                    Instant::now(),
+                    &t,
+                );
+                s.targets.entry(tkey("fast")).or_default().record(
+                    true,
+                    Some(40.0),
+                    Instant::now(),
+                    &t,
+                );
+            }
+        }
+        assert_eq!(smart.pick(&meta(&target())).unwrap().tag(), "fast");
+        let explain = smart.explain(&target(), Network::Tcp);
+        let fast = &explain["paths"][1];
+        assert_eq!(fast["node"], "fast");
+        assert_eq!(fast["delay_source"], "end-to-end");
+        assert_eq!(fast["target_delay_ms"], 40.0);
+        assert!(fast["carrier_delay_ms"].is_null());
+        // 无证据的路径仍按默认 300 ms
+        let fresh = nodes(vec![("x", mock("x"))]);
+        assert_eq!(
+            fresh.explain(&target(), Network::Tcp)["paths"][0]["delay_source"],
+            "default"
+        );
+    }
+    /// OrynCore#55：亚毫秒级延迟噪声不决定胜负，并列按配置顺序。
+    #[test]
+    fn smart_ties_follow_config_order_despite_delay_noise() {
+        let smart = nodes(vec![("first", mock("first")), ("second", mock("second"))]);
+        {
+            let mut s = smart.state.lock().unwrap();
+            let t = s.tuning;
+            for (node, d) in [("first", 0.9), ("second", 0.2)] {
+                s.paths
+                    .entry(PathKey(node.into(), Family::V4))
+                    .or_default()
+                    .record(true, Some(d), Instant::now(), &t);
+            }
+        }
+        assert_eq!(smart.pick(&meta(&target())).unwrap().tag(), "first");
+        // 真实差距仍然生效
+        let smart = nodes(vec![("first", mock("first")), ("second", mock("second"))]);
+        {
+            let mut s = smart.state.lock().unwrap();
+            let t = s.tuning;
+            for (node, d) in [("first", 250.0), ("second", 30.0)] {
+                s.paths
+                    .entry(PathKey(node.into(), Family::V4))
+                    .or_default()
+                    .record(true, Some(d), Instant::now(), &t);
+            }
+        }
+        assert_eq!(smart.pick(&meta(&target())).unwrap().tag(), "second");
+    }
+    #[test]
+    fn smart_usage_labels_buckets() {
+        assert_eq!(usage_label(0.0, 0.0), None);
+        assert_eq!(usage_label(1.5, 1.0), None);
+        assert_eq!(usage_label(5.0, 1.0), Some("occasional"));
+        assert_eq!(usage_label(20.0, 0.39), Some("occasional"));
+        assert_eq!(usage_label(20.0, 0.4), Some("most-used"));
+    }
+    /// OrynCore#56：使用量来自真实尝试（含失败），网络变化后清空，并随快照持久化。
+    #[tokio::test]
+    async fn smart_usage_counts_attempts_and_resets_on_network_change() {
+        let smart = nodes(vec![("a", mock("a")), ("b", mock("b")), ("c", mock("c"))]);
+        assert!(smart.usage()["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|n| n["label"].is_null()));
+        let target = target();
+        for _ in 0..12 {
+            let plan = smart.pick(&meta(&target)).unwrap();
+            assert!(plan.connect_tcp(&target).await.is_ok());
+        }
+        usage_event(&smart, PathKey("b".into(), Family::V4), 0, false);
+        for _ in 0..2 {
+            usage_event(&smart, PathKey("b".into(), Family::V4), 0, true);
+        }
+        let usage = smart.usage();
+        let nodes = usage["nodes"].as_array().unwrap();
+        assert_eq!(nodes[0]["node"], "a");
+        assert_eq!(nodes[0]["label"], "most-used");
+        assert_eq!(nodes[1]["node"], "b");
+        assert_eq!(nodes[1]["label"], "occasional");
+        assert_eq!(nodes[2]["node"], "c");
+        assert!(nodes[2]["label"].is_null());
+        assert!(nodes[0]["families"]["ipv4"].as_f64().unwrap() > 11.0);
+        assert_eq!(
+            smart.explain(&target, Network::Tcp)["paths"][0]["label"],
+            "most-used"
+        );
+        // 持久化往返
+        let dir = std::env::temp_dir().join(format!("oryn-smart-usage-{}", rand::random::<u32>()));
+        let file = dir.join("g.json");
+        {
+            let mut s = smart.state.lock().unwrap();
+            s.store = Some(file.clone());
+            s.dirty = true;
+        }
+        smart.save();
+        let mut restored = State::default();
+        load(&mut restored, &file);
+        assert_eq!(restored.usage.len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+        smart.on_network_changed();
+        assert!(smart.usage()["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|n| n["attempts"] == 0.0));
+    }
 }
 
 #[cfg(test)]
@@ -2186,6 +2655,51 @@ rules: ['MATCH,Auto']",
                 PathKey("x".into(), Family::Unknown)
             )
         );
+    }
+
+    /// OrynCore#55 / #53：构建后候选保持配置顺序；IP 字面量服务器只生成本族候选。
+    #[test]
+    fn smart_build_keeps_config_order_and_literal_family() {
+        let config = oryn_config::parse_config(
+            "proxies:
+ - {name: zz, type: ss, server: 172.19.0.3, port: 1, cipher: aes-128-gcm, password: p}
+ - {name: aa, type: ss, server: '2001:db8::1', port: 1, cipher: aes-128-gcm, password: q}
+ - {name: mm, type: ss, server: m.test, port: 1, cipher: aes-128-gcm, password: r}
+proxy-groups:
+ - {name: Auto, type: smart, proxies: [zz, aa, mm]}
+rules: ['MATCH,Auto']",
+        )
+        .unwrap();
+        let smart = smart_of(&crate::build_outbounds(&config, &smart_test_ctx()));
+        let list: Vec<_> = smart
+            .candidates
+            .iter()
+            .map(|c| (c.outbound.tag().to_string(), c.family))
+            .collect();
+        let expect = [
+            ("zz", Family::V4),
+            ("zz", Family::Unknown),
+            ("aa", Family::V6),
+            ("aa", Family::Unknown),
+            ("mm", Family::V4),
+            ("mm", Family::V6),
+            ("mm", Family::Unknown),
+        ];
+        assert_eq!(
+            list,
+            expect
+                .iter()
+                .map(|(t, f)| (t.to_string(), *f))
+                .collect::<Vec<_>>()
+        );
+        // 冷启动按配置顺序
+        let target = TargetAddr::Domain("api.example.com".into(), 443);
+        let meta = PickMeta {
+            source: None,
+            target: &target,
+            network: Network::Tcp,
+        };
+        assert_eq!(smart.pick(&meta).unwrap().tag(), "zz");
     }
 }
 

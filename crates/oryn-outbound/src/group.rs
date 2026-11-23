@@ -223,6 +223,11 @@ impl GroupOutbound {
         self.smart.as_ref().map(|s| s.explain(target, network))
     }
 
+    /// Smart 组的使用状态；非 Smart 组为 `None`。
+    pub fn smart_usage(&self) -> Option<serde_json::Value> {
+        self.smart.as_ref().map(|s| s.usage())
+    }
+
     pub fn kind(&self) -> GroupKind {
         self.kind
     }

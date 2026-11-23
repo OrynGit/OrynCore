@@ -49,12 +49,14 @@ fn hysteria2(p: &Yaml, name: &str, b: &mut Builder) -> Result<Option<OutboundKin
         return Err(error(name, "unsupported hysteria2 obfuscation"));
     }
     let gecko = if obfs.as_deref() == Some("gecko") {
+        // 0 与不写相同，取缺省值：sing-quic hysteria2/client.go 对 0 套用缺省（512 / 1200），
+        // mihomo 的字段带 omitempty，0 也按缺省处理（OrynCore#63）。线上上限 2048。
         let size = |key: &str, default: i64| -> Result<u16, ConfigError> {
             match get(p, key) {
                 None => Ok(default as u16),
                 Some(_) => int_of(p, key)
                     .filter(|n| (0..=2048).contains(n))
-                    .map(|n| n as u16)
+                    .map(|n| if n == 0 { default } else { n } as u16)
                     .ok_or_else(|| error(name, "invalid gecko packet size")),
             }
         };
@@ -95,7 +97,11 @@ fn hysteria2(p: &Yaml, name: &str, b: &mut Builder) -> Result<Option<OutboundKin
     let obfs_password = if obfs.is_some() {
         let pw = password_value_key(p, "obfs-password").unwrap_or_default();
         if pw.len() < 4 {
-            return Err(error(name, "invalid salamander password"));
+            // 文案按实际混淆类型（salamander / gecko），避免排障时误导（OrynCore#63）
+            return Err(error(
+                name,
+                &format!("invalid {} password", obfs.as_deref().unwrap_or("obfs")),
+            ));
         }
         Some(pw)
     } else {

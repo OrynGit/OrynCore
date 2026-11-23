@@ -662,6 +662,26 @@ fn swift_generated_fixture() {
     assert_eq!(c.hosts.len(), 2);
 }
 
+/// 未写 protocol 时与 sing-mux / mihomo 一致为 h2mux（OrynCore#61：smux 的 FIN 是整流关闭，不能半关闭）。
+#[test]
+fn mux_protocol_defaults_to_h2mux() {
+    for (field, want) in [
+        ("", MuxProtocol::H2Mux),
+        (", protocol: smux", MuxProtocol::Smux),
+        (", protocol: yamux", MuxProtocol::Yamux),
+        (", protocol: h2mux", MuxProtocol::H2Mux),
+    ] {
+        let c = parse_config(&format!(
+            "proxies: [{{name: P, type: trojan, server: a.test, port: 443, password: p, smux: {{enabled: true{field}}}}}]"
+        ))
+        .unwrap();
+        let OutboundKind::Trojan { stream, .. } = &c.outbounds[c.outbound_index("P").unwrap()].kind else {
+            panic!()
+        };
+        assert_eq!(stream.mux.as_ref().unwrap().protocol, want, "{field}");
+    }
+}
+
 #[test]
 fn p1_options_and_unsupported_nodes() {
     let c = parse_config(r#"
@@ -1431,6 +1451,26 @@ fn hysteria_v1_and_gecko() {
     ))
     .is_err());
     assert!(kind_of(&format!("{h2}, obfs: gecko, obfs-max-packet-size: 4000")).is_err());
+    // 0 与不写相同取缺省（sing-quic / mihomo 一致），负数仍报错（OrynCore#63）
+    match kind_of(&format!(
+        "{h2}, obfs: gecko, obfs-min-packet-size: 0, obfs-max-packet-size: 0"
+    ))
+    .unwrap()
+    {
+        OutboundKind::Hysteria2(spec) => assert_eq!(spec.gecko, Some((512, 1200))),
+        other => panic!("{other:?}"),
+    }
+    match kind_of(&format!("{h2}, obfs: gecko, obfs-min-packet-size: 0, obfs-max-packet-size: 1400")).unwrap() {
+        OutboundKind::Hysteria2(spec) => assert_eq!(spec.gecko, Some((512, 1400))),
+        other => panic!("{other:?}"),
+    }
+    assert!(kind_of(&format!("{h2}, obfs: gecko, obfs-min-packet-size: -1")).is_err());
+    // 口令过短的报错按混淆类型命名
+    for (obfs, want) in [("gecko", "invalid gecko password"), ("salamander", "invalid salamander password")] {
+        let base = h2.replace("obfs-password: obfs", "obfs-password: abc");
+        let err = kind_of(&format!("{base}, obfs: {obfs}")).unwrap_err();
+        assert!(err.0.contains(want), "{obfs}: {}", err.0);
+    }
 
     // Realm：server / port 可省略
     let realm = "type: hysteria2, password: p, realm-opts: {enable: true, server-url: 'https://realm.example.com:8443/base/', token: t, realm-id: my-realm, stun-servers: ['stun.example.com', '1.2.3.4:19302', '[2001:db8::1]:3478']";
