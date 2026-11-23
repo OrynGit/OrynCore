@@ -110,7 +110,7 @@ wire = 8 字节随机盐 || (QUIC 包每个字节 xor BLAKE2b-256(password || �
 
 ## Gecko
 
-`obfs: gecko`、`obfs-password`（至少 4 字节）、`obfs-min-packet-size`（默认 512）、`obfs-max-packet-size`（默认 1200，最大 2048）。在套接字层实现（`oryn-quic/src/socket.rs`）：
+`obfs: gecko`、`obfs-password`（至少 4 字节）、`obfs-min-packet-size`（默认 512）、`obfs-max-packet-size`（默认 1200，最大 2048）；写 0 与不写相同，取默认值（与 sing-quic、mihomo 一致）。在套接字层实现（`oryn-quic/src/socket.rs`）：
 
 - 先按 Salamander 处理每个包。
 - QUIC 长首部包（握手阶段）再拆成 2–8 片，每片前加 5 字节首部（标志 0x80、消息 ID、`序号 << 4 | 总数`、填充长度 u16），并把每片填充到 [min, max] 之间的随机长度；短首部包不拆。
