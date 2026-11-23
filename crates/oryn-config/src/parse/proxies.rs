@@ -887,9 +887,10 @@ fn mux(p: &Yaml, name: &str, b: &mut Builder) -> Result<Option<MuxSpec>, ConfigE
         return Ok(None);
     }
     let protocol = match str_of(opts, "protocol").as_deref() {
-        None | Some("smux") => MuxProtocol::Smux,
+        // 缺省与 sing-mux / mihomo 一致为 h2mux（sing-mux client.go：`case "", "h2mux"`）
+        Some("smux") => MuxProtocol::Smux,
         Some("yamux") => MuxProtocol::Yamux,
-        Some("h2mux") => MuxProtocol::H2Mux,
+        None | Some("h2mux") => MuxProtocol::H2Mux,
         _ => return Err(error(name, "unsupported mux protocol")),
     };
     let number = |key: &str, default: i64, max: i64| -> Result<usize, ConfigError> {

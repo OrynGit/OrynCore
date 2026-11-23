@@ -10,3 +10,7 @@
 - UDP 默认首目标绑定；packetaddr / XUDP 已与独立对端验证多目标往返；packetaddr 只接受 IP。
 
 新增 md-5 / sha3 是规范要求的哈希，aes 与 crc32fast 已存在于依赖树。不会引入线程或全局缓存；静态大小及 RSS 在工作包验收时记录。独立对端通过 AEAD / 旧版、五种 cipher、四种传输与可选标志矩阵。认证负例覆盖错误 UUID、过期时钟、截断与首部破坏；AEAD 重放被对端过滤。参考服务端旧版路径不做重放过滤且跳过命令头 FNV 校验，Oryn 客户端不能保证旧服务端的抗重放；本机负例对旧版破坏版本字节，负载 FNV / AEAD 标签在 Oryn 读取侧仍验证。
+
+## 半关闭
+
+分块模式（AES-GCM / ChaCha20 / CFB，以及 none / zero 的 UDP）下，客户端写完请求时发送协议内的结束块（空负载块），承载保持打开继续接收响应，服务端据此半关闭到目标的连接；WebSocket 这类没有半关闭的传输因此也能「发完即关、等回应」。none / zero 的 TCP 不分块、没有结束标记，只能关闭传输的写方向：TCP / gRPC / h2 / HTTPUpgrade 正常，WebSocket 上等同于整条连接关闭。
