@@ -71,12 +71,7 @@ impl Body {
         request_key: &[u8],
         request_iv: &[u8],
     ) -> Self {
-        let security = match spec.cipher.as_str() {
-            "aes-128-cfb" => 1,
-            "aes-128-gcm" | "auto" => 3,
-            "chacha20-poly1305" => 4,
-            _ => 5,
-        };
+        let security = security_byte(&spec.cipher).unwrap_or(5);
         let mut shake = Shake128::default();
         shake.update(iv);
         let len_key = kdf(request_key, &[b"auth_len"]);
@@ -240,6 +235,37 @@ impl Body {
         Ok(Some(body.freeze()))
     }
 }
+/// 请求首部的 security 字节。`zero` 与 `none` 一样发 5（NONE）：sing-vmess（client.go
+/// `case "none", "zero": rawSecurity = SecurityTypeNone`）、V2Ray 客户端都把 zero 落成 NONE 并去掉分块，
+/// 线上没有 6（ZERO）；sing-vmess 服务端只接受 1 / 3 / 4 / 5，收到 6 报 `unknown security type`
+/// （OrynCore#60）。`auto` 按 AES-128-GCM。
+fn security_byte(cipher: &str) -> Option<u8> {
+    match cipher {
+        "aes-128-cfb" => Some(1),
+        "aes-128-gcm" | "auto" => Some(3),
+        "chacha20-poly1305" => Some(4),
+        "none" | "zero" => Some(5),
+        _ => None,
+    }
+}
+/// 请求选项：CFB 分块；AEAD 分块 + 长度掩码（可选全局填充、认证长度）；NONE 只在 UDP 分块，
+/// TCP 原样传输（与 sing-vmess client.go 一致）。
+fn request_options(spec: &VmessSpec, security: u8, command: u8) -> u8 {
+    match security {
+        1 => 1,
+        3 | 4 => {
+            5 | if spec.global_padding { 8 } else { 0 }
+                | if spec.authenticated_length { 16 } else { 0 }
+        }
+        _ => {
+            if command == 2 {
+                1
+            } else {
+                0
+            }
+        }
+    }
+}
 pub struct Session {
     key: [u8; 16],
     iv: [u8; 16],
@@ -272,27 +298,9 @@ impl Session {
         let iv = random::<16>()?;
         let response = random::<1>()?[0];
         let legacy = spec.alter_id > 0;
-        let security = match spec.cipher.as_str() {
-            "aes-128-cfb" => 1,
-            "aes-128-gcm" | "auto" => 3,
-            "chacha20-poly1305" => 4,
-            "none" | "zero" => 5,
-            _ => return Err(bad("unsupported VMess cipher")),
-        };
-        let options = match security {
-            1 => 1,
-            3 | 4 => {
-                5 | if spec.global_padding { 8 } else { 0 }
-                    | if spec.authenticated_length { 16 } else { 0 }
-            }
-            _ => {
-                if command == 2 {
-                    1
-                } else {
-                    0
-                }
-            }
-        };
+        let security =
+            security_byte(&spec.cipher).ok_or_else(|| bad("unsupported VMess cipher"))?;
+        let options = request_options(spec, security, command);
         let mut header = vec![1];
         header.extend(iv);
         header.extend(key);
@@ -622,6 +630,21 @@ mod tests {
             global_padding: pad,
             authenticated_length: auth,
         }
+    }
+    /// zero 与 none 线上相同：security 5、TCP 不分块、UDP 分块（OrynCore#60，对照 sing-vmess）。
+    #[test]
+    fn zero_maps_to_none_like_sing_vmess() {
+        assert_eq!(security_byte("zero"), Some(5));
+        assert_eq!(security_byte("none"), Some(5));
+        assert_eq!(security_byte("auto"), Some(3));
+        assert_eq!(security_byte("bogus"), None);
+        for cipher in ["zero", "none"] {
+            let spec = spec(cipher, true, true);
+            assert_eq!(request_options(&spec, 5, 1), 0, "{cipher} tcp");
+            assert_eq!(request_options(&spec, 5, 2), 1, "{cipher} udp");
+        }
+        assert_eq!(request_options(&spec("aes-128-gcm", false, false), 3, 1), 5);
+        assert!(Session::request(&spec("bogus", false, false), &TargetAddr::Domain("a.test".into(), 443), 1).is_err());
     }
     #[test]
     fn stream_ciphers_do_not_have_an_aead_nonce_limit() {
