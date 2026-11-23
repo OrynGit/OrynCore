@@ -1019,9 +1019,14 @@ fn handle_command(ctx: &Rc<EngineCtx>, req: &Value) -> Value {
             let timeout = health::clamp_manual_timeout(
                 req.get("timeout_ms").and_then(Value::as_u64).unwrap_or(5000),
             );
+            // 可选 url：App 里刚改的测试地址，不必等重连
+            let url = str_arg(req, "url")
+                .map(str::trim)
+                .filter(|u| u.starts_with("http://") || u.starts_with("https://"))
+                .unwrap_or_else(|| ctx.proxy_test_url())
+                .to_string();
             if health::begin_proxy_probe() {
                 let routing = state.routing.clone();
-                let url = ctx.proxy_test_url().to_string();
                 state.spawn(async move { health::run_proxy_probe(routing, url, timeout).await });
             }
             json!({ "ok": true })
