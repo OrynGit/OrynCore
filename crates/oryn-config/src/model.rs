@@ -654,6 +654,9 @@ pub struct WireGuardPeerSpec {
     pub preshared_key: Option<[u8; 32]>,
     pub allowed_ips: Vec<IpCidr>,
     pub reserved: [u8; 3],
+    /// 本对端的 persistent keepalive（秒，0 关闭），`None` 沿用接口级 `keepalive_secs`。
+    /// 配置文件没有对应字段；Tailscale 只给有直连端点的对端开启。
+    pub keepalive_secs: Option<u16>,
 }
 
 /// AmneziaWG 1.0：握手前垃圾包、握手填充与消息类型替换。

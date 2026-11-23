@@ -41,6 +41,7 @@ fn incoming_allowed_ips(v6: bool, duplicate: bool) {
             })
             .unwrap()],
             reserved: [0; 3],
+            keepalive_secs: None,
         })
         .collect();
     let spec = WireGuardSpec {
@@ -153,6 +154,7 @@ fn control_spec() -> WireGuardSpec {
             preshared_key: None,
             allowed_ips: vec![Cidr::parse("0.0.0.0/0").unwrap()],
             reserved: [0; 3],
+            keepalive_secs: None,
         }],
         private_key: [0x11; 32],
         address_v4: Some(("10.0.0.2".parse().unwrap(), 32)),

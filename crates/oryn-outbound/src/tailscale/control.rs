@@ -10,12 +10,33 @@ use std::{io, sync::Arc, time::Duration};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use ts_keys::{MachinePublicKey, NodeState};
 
-pub const MAX_MAP: usize = 256 * 1024;
+/// 单个 MapResponse 上限：须容下 256 个对端的完整 netmap（见 snapshot::MAX_PEERS）。
+pub const MAX_MAP: usize = 1024 * 1024;
 const MAX_HTTP: usize = 64 * 1024;
 const CAP: ts_capabilityversion::CapabilityVersion =
     ts_capabilityversion::CapabilityVersion::CURRENT;
 
+/// Hostinfo.OS：与 tailscale `version.OS()` 一致（GOOS，Apple 平台写作 iOS / macOS）。
+/// 原先固定上报 iOS，控制面按平台下发的能力与统计失真（OrynCore#43）。
+pub fn host_os() -> &'static str {
+    match std::env::consts::OS {
+        "ios" => "iOS",
+        "macos" => "macOS",
+        os => os,
+    }
+}
+
 pub async fn transport(dialer: &dyn Dialer, url: &url::Url) -> io::Result<BoxStream> {
+    transport_with(dialer, url, None).await
+}
+
+/// `cert` 是 DERP 节点的 `CertName`：`sha256-raw:<hex>` 固定自签叶证书（整张 DER 的 SHA-256，
+/// 不验证信任链，与 tailscale tlsdial.SetConfigExpectedCertHash 相同）；其它值是期望的证书名称。
+pub async fn transport_with(
+    dialer: &dyn Dialer,
+    url: &url::Url,
+    cert: Option<&str>,
+) -> io::Result<BoxStream> {
     if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
         return Err(err("Tailscale URL contains credentials or fragment"));
     }
@@ -36,18 +57,39 @@ pub async fn transport(dialer: &dyn Dialer, url: &url::Url) -> io::Result<BoxStr
     if url.scheme() != "https" {
         return Err(err("Tailscale requires HTTPS"));
     }
+    let pinned = match cert.and_then(|c| c.strip_prefix("sha256-raw:")) {
+        Some(hex) => Some(cert_hash(hex)?),
+        None => None,
+    };
+    let name = match cert {
+        Some(c) if pinned.is_none() => c,
+        _ => host,
+    };
     let spec = TlsSpec {
-        sni: Some(host.into()),
-        skip_cert_verify: false,
+        sni: Some(name.into()),
+        skip_cert_verify: pinned.is_some(),
         alpn: vec!["http/1.1".into()],
-        fingerprint: None,
+        fingerprint: pinned,
         client_fingerprint: None,
         reality: None,
         ech: None,
     };
     Ok(Box::new(
-        oryn_tls::connect_proxy(stream, host, &spec).await?,
+        oryn_tls::connect_proxy(stream, name, &spec).await?,
     ))
+}
+
+fn cert_hash(hex: &str) -> io::Result<[u8; 32]> {
+    let hex = hex.trim();
+    if hex.len() != 64 {
+        return Err(err("invalid DERP sha256-raw certificate hash"));
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
+            .map_err(|_| err("invalid DERP sha256-raw certificate hash"))?;
+    }
+    Ok(out)
 }
 
 /// 逐字节读取有限 HTTP 首部，不多读升级后的 Noise / DERP 数据。
@@ -220,7 +262,7 @@ impl Control {
             url,
         };
         let register = json!({"Version":u16::from(CAP),"NodeKey":keys.node_keys.public.to_string(),
-            "Hostinfo":{"Hostname":spec.hostname.as_deref().unwrap_or("oryn"),"OS":"iOS","IPNVersion":"Oryn/0.0.1"},
+            "Hostinfo":{"Hostname":spec.hostname.as_deref().unwrap_or("oryn"),"OS":host_os(),"IPNVersion":"Oryn/0.0.1"},
             "Auth":spec.auth_key.as_ref().map(|key| json!({"AuthKey":key})),"Ephemeral":spec.ephemeral});
         let mut response = ctl.post("/machine/register", register).await?;
         let result: Value =
@@ -272,7 +314,7 @@ impl Control {
     ) -> io::Result<Body> {
         self.post("/machine/map",json!({"Version":u16::from(CAP), "NodeKey": keys.node_keys.public.to_string(),
             "DiscoKey":keys.disco_keys.public.to_string(),"Stream":stream,"KeepAlive":true,"OmitPeers":!stream,
-            "Hostinfo":{"Hostname":spec.hostname.as_deref().unwrap_or("oryn"),"OS":"iOS","IPNVersion":"Oryn/0.0.1",
+            "Hostinfo":{"Hostname":spec.hostname.as_deref().unwrap_or("oryn"),"OS":host_os(),"IPNVersion":"Oryn/0.0.1",
                 "NetInfo":{"PreferredDERP":region.unwrap_or(0)}},"Endpoints":[]})).await
     }
 }
@@ -372,5 +414,30 @@ impl tokio::io::AsyncWrite for Prefixed {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<io::Result<()>> {
         std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+mod os_and_cert_tests {
+    use super::*;
+    #[test]
+    fn host_os_follows_platform_not_ios() {
+        let os = host_os();
+        if cfg!(target_os = "macos") {
+            assert_eq!(os, "macOS");
+        } else if cfg!(target_os = "linux") {
+            assert_eq!(os, "linux");
+        }
+        assert!(cfg!(target_os = "ios") || os != "iOS");
+    }
+    #[test]
+    fn sha256_raw_hash_is_hex_of_32_bytes() {
+        let hex = format!("{}{}", "00ff".repeat(15), "a1b2");
+        let hash = cert_hash(&hex).unwrap();
+        assert_eq!(hash[0], 0x00);
+        assert_eq!(hash[1], 0xff);
+        assert_eq!(hash[31], 0xb2);
+        assert!(cert_hash("abcd").is_err());
+        assert!(cert_hash(&"zz".repeat(32)).is_err());
     }
 }

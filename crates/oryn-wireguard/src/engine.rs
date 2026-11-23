@@ -606,11 +606,14 @@ struct Peer {
     dormant: bool,
     /// 还没有会话时暂存发往本对端的包。
     queued: VecDeque<Vec<u8>>,
+    /// 本对端的 persistent keepalive，覆盖接口级设置。
+    keepalive: Option<u16>,
 }
 
 impl Peer {
     fn new(spec: &WireGuardPeerSpec, private_key: [u8; 32], keepalive_secs: u16) -> Self {
         let index = (dns::random_u64() as u32) >> 8;
+        let keepalive_secs = spec.keepalive_secs.unwrap_or(keepalive_secs);
         Self {
             public_key: spec.public_key,
             preshared_key: spec.preshared_key,
@@ -628,11 +631,13 @@ impl Peer {
             handshake: None,
             dormant: false,
             queued: VecDeque::new(),
+            keepalive: spec.keepalive_secs,
         }
     }
 
     /// 丢掉会话与进行中的握手，下次发送时重新握手。
     fn reset(&mut self, private_key: [u8; 32], keepalive_secs: u16) {
+        let keepalive_secs = self.keepalive.unwrap_or(keepalive_secs);
         self.tunn = new_tunn(
             private_key,
             self.public_key,

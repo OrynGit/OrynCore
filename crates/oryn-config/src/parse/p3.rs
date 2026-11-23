@@ -523,6 +523,7 @@ fn wireguard(p: &Yaml, name: &str, b: &mut Builder) -> Result<Option<OutboundKin
             preshared_key,
             allowed_ips,
             reserved: reserved(peer, name)?,
+            keepalive_secs: None,
         });
     }
     let address_v4 = iface_addr(p, name, "ip", true)?;

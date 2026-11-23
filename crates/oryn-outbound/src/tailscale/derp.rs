@@ -25,6 +25,10 @@ use ts_keys::NodeState;
 const MAX_FRAME: usize = 65536;
 const MAX_WIRE: usize = 4096;
 const QUEUE: usize = 32;
+/// 直连路径的 WireGuard persistent keepalive（秒），与 WireGuard 常用值一致。
+const DIRECT_KEEPALIVE_SECS: u16 = 25;
+/// 同时保持的 DERP region 连接上限。
+const MAX_REGIONS: usize = 32;
 /// 客户端 Ping 间隔：空闲连接也有流量，不被服务端 / 中间代理按空闲掐断。
 const PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 /// 这么久没收到任何帧（服务端约每 60 秒发 KeepAlive，且会回 Pong）就判定连接已死：
@@ -52,8 +56,13 @@ async fn send(w: &mut (impl AsyncWrite + Unpin), kind: u8, body: &[u8]) -> io::R
     w.flush().await
 }
 
-async fn connect(url: &url::Url, keys: &NodeState, dialer: &dyn Dialer) -> io::Result<BoxStream> {
-    let mut stream = control::transport(dialer, url).await?;
+async fn connect(
+    url: &url::Url,
+    cert: Option<&str>,
+    keys: &NodeState,
+    dialer: &dyn Dialer,
+) -> io::Result<BoxStream> {
+    let mut stream = control::transport_with(dialer, url, cert).await?;
     let host = &url[url::Position::BeforeHost..url::Position::AfterPort];
     stream.write_all(format!("GET /derp HTTP/1.1\r\nHost: {host}\r\nConnection: Upgrade\r\nUpgrade: DERP\r\n\r\n").as_bytes()).await?;
     let (status, fields) = control::headers(&mut stream).await?;
@@ -144,8 +153,9 @@ impl Relay {
             routes.insert(endpoint(i), (peer.derp, peer.key));
             sources.insert(peer.key, endpoint(i));
         }
-        if regions.len() > 8 {
-            return Err(err("Tailscale requires more than 8 DERP regions"));
+        // 每个 region 一条 DERP 连接；对端分布在更多 region 时只是连接数增加（原上限 8，OrynCore#43）
+        if regions.len() > MAX_REGIONS {
+            return Err(err("Tailscale peers span too many DERP regions"));
         }
         let (incoming_tx, incoming) = mpsc::channel(QUEUE);
         let mut senders = BTreeMap::new();
@@ -161,7 +171,8 @@ impl Relay {
             let mut last = None;
             let mut stream = None;
             for url in urls.iter().take(8) {
-                match control::timed(connect(url, keys, dialer.as_ref())).await {
+                let cert = snapshot.derp_certs.get(url).map(String::as_str);
+                match control::timed(connect(url, cert, keys, dialer.as_ref())).await {
                     Ok(value) => {
                         stream = Some(value);
                         break;
@@ -379,6 +390,9 @@ pub fn wire_peer(
         preshared_key: None,
         allowed_ips,
         reserved: [0; 3],
+        // 有直连端点的对端每 25 s 保活，防止 NAT 映射老化断流（OrynCore#43）；
+        // 只走 DERP 的对端不需要，保持安静以省电
+        keepalive_secs: (!peer.endpoints.is_empty()).then_some(DIRECT_KEEPALIVE_SECS),
     }
 }
 
