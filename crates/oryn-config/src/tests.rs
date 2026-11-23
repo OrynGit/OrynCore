@@ -662,6 +662,26 @@ fn swift_generated_fixture() {
     assert_eq!(c.hosts.len(), 2);
 }
 
+/// 未写 protocol 时与 sing-mux / mihomo 一致为 h2mux（OrynCore#61：smux 的 FIN 是整流关闭，不能半关闭）。
+#[test]
+fn mux_protocol_defaults_to_h2mux() {
+    for (field, want) in [
+        ("", MuxProtocol::H2Mux),
+        (", protocol: smux", MuxProtocol::Smux),
+        (", protocol: yamux", MuxProtocol::Yamux),
+        (", protocol: h2mux", MuxProtocol::H2Mux),
+    ] {
+        let c = parse_config(&format!(
+            "proxies: [{{name: P, type: trojan, server: a.test, port: 443, password: p, smux: {{enabled: true{field}}}}}]"
+        ))
+        .unwrap();
+        let OutboundKind::Trojan { stream, .. } = &c.outbounds[c.outbound_index("P").unwrap()].kind else {
+            panic!()
+        };
+        assert_eq!(stream.mux.as_ref().unwrap().protocol, want, "{field}");
+    }
+}
+
 #[test]
 fn p1_options_and_unsupported_nodes() {
     let c = parse_config(r#"

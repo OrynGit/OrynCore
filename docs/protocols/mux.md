@@ -1,5 +1,9 @@
 # 多路复用
 
+未写 `protocol` 时为 h2mux，与 sing-mux / mihomo 的缺省一致。
+
+半关闭：h2mux（END_STREAM）与 yamux（FIN）支持，写方向关闭后仍能接收；smux 的 FIN 是整条流关闭（sagernet/smux 收到 FIN 后读写都结束），服务端无法再回送数据，依赖「发完即关、等回应」的应用应改用 h2mux 或 yamux。
+
 依据 sing-mux v0.3.3 的线格式：协议先连接 `sp.mux.sing-box.arpa:444`，会话握手为 version 1、protocol（smux=0、yamux=1、h2mux=2）、padding 开关。每个子流发送 u16 flags 与 SOCKS 地址，然后读取一字节状态；UDP 带 u16 长度，可选逐包地址。
 
 采用 smux v1、现成 yamux crate、已有 h2。池、待发送队列、单流接收缓冲均有硬上限；smux v1 没有逐流流控：某条流的接收缓冲（128 KiB）满时，读取任务等待它被消费（与 xtaci/smux 一样阻塞整个会话，由承载 TCP 窗口让对端减速）；会话里只有这条流时一直等待；同一会话还有其他流被挡住、且等待超过 10 秒时，才视为该流停止读取并只关闭该流。新建会话的握手不持有池锁，并发进行，握手中的会话计入连接上限。池满时（会话数与每会话流数都到上限）新请求等待空位，不再立即返回 `pool capacity reached`；有会话或流释放时通知等待者，整体受连接超时约束。yamux 的打开请求排队发给会话任务，流上限取 `max-streams × 2`，连接接收窗口随流数放大（yamux 要求不小于 `256 KiB × 流数`，否则库内部 panic）。流 `Drop` 时发 FIN 遇到队列满，后台有界等待 10 秒再决定是否中止会话，不会因一次关闭多条流而中止共享会话。min-streams 为优先复用门槛，max-streams 为每会话上限。空闲会话 30 秒后回收。yamux 库负责其流控与状态机，不新增网络工作线程。依赖许可与体积在验收时记录。

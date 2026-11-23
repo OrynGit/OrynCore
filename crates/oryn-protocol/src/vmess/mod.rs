@@ -528,10 +528,28 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for VmessStream<S> {
         ready!(self.drain(cx))?;
         Pin::new(&mut self.stream).poll_flush(cx)
     }
+    /// 半关闭。分块模式（options 第 0 位）用协议内的结束块（空负载块）告知服务端「请求发完了」，
+    /// 承载保持打开以继续接收响应，与 V2Ray 客户端一致；服务端（V2Ray / Xray / sing-vmess）读到它即
+    /// 半关闭到目标的连接。WebSocket、smux 等没有半关闭的承载上，关闭承载会连同响应一起丢掉
+    /// （OrynCore#61）。不分块（none / zero 的 TCP）没有结束标记，只能关闭承载的写方向。
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         ready!(self.drain(cx))?;
-        self.closed = true;
-        Pin::new(&mut self.stream).poll_shutdown(cx)
+        if self.session.write.options & 1 == 0 || self.failed {
+            self.closed = true;
+            return Pin::new(&mut self.stream).poll_shutdown(cx);
+        }
+        if !self.closed {
+            match self.session.write.encode(&[]) {
+                Ok(end) => self.pending = end,
+                Err(e) => {
+                    self.failed = true;
+                    return Poll::Ready(Err(e));
+                }
+            }
+            self.closed = true;
+        }
+        ready!(self.drain(cx))?;
+        Pin::new(&mut self.stream).poll_flush(cx)
     }
 }
 impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for VmessStream<S> {
@@ -694,5 +712,57 @@ mod tests {
         let mut wire = BytesMut::from(&w.encode(b"secret").unwrap()[..]);
         *wire.last_mut().unwrap() ^= 1;
         assert!(r.decode(&mut wire).is_err());
+    }
+    fn session(spec: &VmessSpec, options: u8) -> Session {
+        Session {
+            key: [1; 16],
+            iv: [2; 16],
+            response: 0,
+            packet: false,
+            legacy: false,
+            read: Body::new(spec, options, &[3; 16], &[4; 16], &[1; 16], &[2; 16]),
+            write: Body::new(spec, options, &[1; 16], &[2; 16], &[1; 16], &[2; 16]),
+        }
+    }
+    /// 分块模式的半关闭发结束块、不关闭承载；不分块时关闭承载写方向（OrynCore#61）。
+    #[tokio::test]
+    async fn half_close_sends_end_chunk_and_keeps_transport_open() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (cipher, options) in [("aes-128-gcm", 5 | 8 | 16), ("chacha20-poly1305", 5), ("aes-128-cfb", 1)] {
+            let spec = spec(cipher, options & 8 != 0, options & 16 != 0);
+            let (client, mut server) = tokio::io::duplex(64 * 1024);
+            let mut stream = session(&spec, options).stream(client);
+            stream.write_all(b"request").await.unwrap();
+            stream.shutdown().await.unwrap();
+            assert!(stream.write_all(b"late").await.is_err(), "{cipher}");
+            let mut wire = vec![0; 4096];
+            let n = server.read(&mut wire).await.unwrap();
+            let mut wire = BytesMut::from(&wire[..n]);
+            let mut read = Body::new(&spec, options, &[1; 16], &[2; 16], &[1; 16], &[2; 16]);
+            if let Some(cfb) = &mut read.cfb {
+                cfb.apply(&mut wire, true);
+            }
+            assert_eq!(read.decode(&mut wire).unwrap().unwrap().as_ref(), b"request");
+            assert!(read.decode(&mut wire).unwrap().unwrap().is_empty(), "{cipher} end chunk");
+            assert!(wire.is_empty());
+            // 承载没有关闭：对端读不到 EOF，仍可回写
+            let mut probe = [0; 1];
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(50), server.read(&mut probe))
+                    .await
+                    .is_err(),
+                "{cipher} transport must stay open"
+            );
+            server.write_all(b"x").await.unwrap();
+        }
+        // none 的 TCP 不分块：没有结束标记，关闭承载写方向
+        let spec = spec("none", false, false);
+        let (client, mut server) = tokio::io::duplex(64 * 1024);
+        let mut stream = session(&spec, 0).stream(client);
+        stream.write_all(b"raw").await.unwrap();
+        stream.shutdown().await.unwrap();
+        let mut got = Vec::new();
+        server.read_to_end(&mut got).await.unwrap();
+        assert_eq!(got, b"raw");
     }
 }

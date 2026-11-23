@@ -878,7 +878,7 @@ fn multiplex(f: &mut Obj, h: &mut Hash) -> Result<(), String> {
     }
     let mut opts = Hash::new();
     set(&mut opts, "enabled", Yaml::Boolean(true));
-    // sing-box 的缺省协议是 h2mux，mihomo 的缺省是 smux
+    // sing-box 与 mihomo（同用 sing-mux）的缺省协议都是 h2mux
     set_str(
         &mut opts,
         "protocol",
