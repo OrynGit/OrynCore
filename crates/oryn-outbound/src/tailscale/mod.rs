@@ -3,6 +3,7 @@
 mod control;
 mod derp;
 mod login;
+mod magic;
 mod snapshot;
 
 use crate::{BoxStream, Dialer, Outbound, PacketConn, Resolver, SessionControl, TailnetDnsAnswer};
@@ -55,6 +56,8 @@ struct Session {
     state: RwLock<State>,
     notify: Notify,
     login: Mutex<login::LoginState>,
+    /// 没有 dialer-proxy：允许直连 UDP 与 disco（OrynCore#41）。
+    direct_udp: bool,
 }
 pub struct TailscaleOutbound {
     tag: String,
@@ -68,6 +71,7 @@ impl TailscaleOutbound {
         resolver: Arc<dyn Resolver>,
         datagrams: Arc<dyn oryn_udp::DatagramFactory>,
         data_dir: Option<&Path>,
+        direct_udp: bool,
     ) -> Arc<Self> {
         Arc::new(Self {
             tag,
@@ -85,6 +89,7 @@ impl TailscaleOutbound {
                 }),
                 notify: Notify::new(),
                 login: Mutex::new(login::LoginState::default()),
+                direct_udp,
             }),
         })
     }
@@ -848,6 +853,30 @@ fn identity(spec: &TailscaleSpec, dir: Option<&Path>) -> io::Result<(PathBuf, Id
     }
 }
 
+fn report_endpoints(
+    mut poster: control::Poster,
+    spec: TailscaleSpec,
+    keys: NodeState,
+    region: u16,
+    mut endpoints: tokio::sync::watch::Receiver<derp::Endpoints>,
+) -> Task {
+    Task(tokio::spawn(async move {
+        loop {
+            let current = endpoints.borrow_and_update().clone();
+            if !current.is_empty() {
+                if let Err(e) =
+                    control::timed(poster.endpoints(&spec, &keys, Some(region), &current)).await
+                {
+                    log::debug!("tailscale: endpoint update failed: {e}");
+                }
+            }
+            if endpoints.changed().await.is_err() {
+                break;
+            }
+        }
+    }))
+}
+
 /// 跨控制会话保留的状态：控制连接断开重连时，DERP 仍连着就沿用现有隧道，
 /// 新会话的首个 netmap 与之相同（或只有软变化）时不重建、不杀既有 Flow。
 struct Carry {
@@ -993,7 +1022,7 @@ async fn run_once(
     weak: Weak<Session>,
     spec: TailscaleSpec,
     dialer: Arc<dyn Dialer>,
-    datagrams: Arc<dyn oryn_udp::DatagramFactory>,
+    _datagrams: Arc<dyn oryn_udp::DatagramFactory>,
     dir: Option<PathBuf>,
     carry: &mut Option<Carry>,
 ) -> io::Result<()> {
@@ -1055,7 +1084,9 @@ async fn run_once(
     .map(|b| format!("{b:02x}"))
     .collect::<String>();
     log::debug!("tailscale: registered");
-    let mut map = control::timed(ctl.map(&spec, &keys, None, true)).await?;
+    let mut map = control::timed(ctl.map(&spec, &keys, None, true, &[])).await?;
+    // 本机端点（STUN / 网卡）变化时经同一控制连接另发非流式 MapRequest 上报（OrynCore#41）
+    let mut reporter: Option<(usize, Task)> = None;
     let mut snapshot = carry
         .as_ref()
         .map(|c| c.snapshot.clone())
@@ -1064,6 +1095,19 @@ async fn run_once(
     // 每个控制会话都要向控制面报一次 home DERP
     let mut announced = false;
     loop {
+        if let Some(c) = carry.as_ref() {
+            let current = Arc::as_ptr(&c.relay) as usize;
+            if reporter.as_ref().is_none_or(|(p, _)| *p != current) {
+                let task = report_endpoints(
+                    ctl.poster(),
+                    spec.clone(),
+                    keys.clone(),
+                    c.home,
+                    c.relay.endpoints(),
+                );
+                reporter = Some((current, task));
+            }
+        }
         // 到期由外层 expiry_guard 独立处理，不伪装成控制同步超时。
         // 普通 timer tick 不取消此 frame future，read_exact 可安全跨 tick 继续。
         let read = tokio::time::timeout(Duration::from_secs(90), map.frame());
@@ -1106,7 +1150,12 @@ async fn run_once(
             let region = home
                 .or_else(|| next.regions.keys().next().copied())
                 .ok_or_else(|| err("Tailscale control returned no DERP region"))?;
-            let mut ack = control::timed(ctl.map(&spec, &keys, Some(region), false)).await?;
+            let endpoints = carry
+                .as_ref()
+                .map(|c| c.relay.endpoints().borrow().clone())
+                .unwrap_or_default();
+            let mut ack =
+                control::timed(ctl.map(&spec, &keys, Some(region), false, &endpoints)).await?;
             // 非流式更新无响应内容亦合法；有界消费。
             let _ = control::timed(ack.all(control::MAX_MAP)).await?;
             home = Some(region);
@@ -1153,8 +1202,13 @@ async fn run_once(
             ));
         }
         let region = home.ok_or_else(|| err("Tailscale control returned no DERP region"))?;
+        let Some(session) = weak.upgrade() else {
+            return Ok(());
+        };
+        let (resolver, direct) = (session.resolver.clone(), session.direct_udp);
+        drop(session);
         let relay =
-            derp::Relay::start(&snapshot, &keys, dialer.clone(), datagrams.clone(), region).await?;
+            derp::Relay::start(&snapshot, &keys, dialer.clone(), resolver, direct, region).await?;
         let exit_peer = select_exit(&snapshot, spec.exit_node.as_deref())?;
         let wire = WireGuardSpec {
             peers: snapshot
@@ -1281,6 +1335,7 @@ mod tests {
             resolver,
             datagrams,
             None,
+            true,
         );
         let public = TargetAddr::Domain("public.example".into(), 53);
         assert_eq!(
@@ -1326,6 +1381,7 @@ mod tests {
             resolver,
             Arc::new(oryn_udp::UdpFactory),
             None,
+            true,
         );
         assert_eq!(ts.status()["state"], "idle");
         ts.session.set_login(login::Phase::NeedsLogin, Some("https://login.example/a/1".into()));

@@ -1,24 +1,26 @@
 //! DERP v2：有界帧、有界 WireGuard 包队列和固定数量的区域连接。
 //! 协议参考 tailscale/tailscale-rs f4781c480e8d1376aed89f737beefe7425e8b866
 //! ts_derp/src/{client.rs,frame/}（BSD-3-Clause）；本文件为 Oryn 适配实现。
+use super::magic::{self, Magic, Out, Route, Via};
 use super::snapshot::{Peer, Snapshot};
 use super::{control, err, Task};
-use crate::{BoxStream, Dialer};
+use crate::{BoxStream, Dialer, Resolver};
 use async_trait::async_trait;
 use crypto_box::{
     aead::{Aead, AeadCore, OsRng},
     SalsaBox,
 };
-use oryn_udp::DatagramFactory;
 use std::{
     collections::BTreeMap,
     io,
     net::{Ipv4Addr, SocketAddr},
     sync::Arc,
+    time::Instant,
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    sync::{mpsc, Mutex},
+    net::UdpSocket,
+    sync::{mpsc, watch, Mutex},
 };
 use ts_keys::NodeState;
 
@@ -35,6 +37,13 @@ const PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 /// 没有 FIN 的静默黑洞也能检出。
 const READ_IDLE: std::time::Duration = std::time::Duration::from_secs(120);
 type WirePacket = (Vec<u8>, SocketAddr);
+/// 发给 disco 状态机的包：disco（经 UDP 或 DERP）与 STUN 响应。
+enum Inbound {
+    Disco(Vec<u8>, Via),
+    Stun(Vec<u8>),
+}
+/// 本机端点（地址、tailcfg.EndpointType），变化时由控制会话上报。
+pub type Endpoints = Vec<(SocketAddr, u8)>;
 
 async fn frame(r: &mut (impl AsyncRead + Unpin)) -> io::Result<(u8, Vec<u8>)> {
     let kind = r.read_u8().await?;
@@ -115,9 +124,57 @@ pub fn endpoint(index: usize) -> SocketAddr {
 pub struct Relay {
     routes: BTreeMap<SocketAddr, (u16, [u8; 32])>,
     senders: BTreeMap<u16, mpsc::Sender<WirePacket>>,
-    direct: BTreeMap<SocketAddr, (Arc<dyn oryn_udp::Datagrams>, SocketAddr)>,
     incoming: Mutex<mpsc::Receiver<WirePacket>>,
+    /// 直连状态机（OrynCore#41）；有 dialer-proxy 或套接字不可用时为 None，只走 DERP。
+    magic: Option<Arc<std::sync::Mutex<Magic>>>,
+    /// IPv4 / IPv6 共享 UDP 套接字：WireGuard、disco、STUN 共用，NAT 映射一致。
+    sockets: [Option<Arc<UdpSocket>>; 2],
+    endpoints: watch::Receiver<Endpoints>,
     _tasks: Vec<Task>,
+}
+/// 执行状态机产出的发送：UDP 走共享套接字，DERP 走对端所在 region 的写队列。
+#[derive(Clone)]
+struct Exec {
+    routes: BTreeMap<SocketAddr, (u16, [u8; 32])>,
+    senders: BTreeMap<u16, mpsc::Sender<WirePacket>>,
+    sockets: [Option<Arc<UdpSocket>>; 2],
+}
+fn send_udp(sockets: &[Option<Arc<UdpSocket>>; 2], addr: SocketAddr, buf: &[u8]) {
+    if let Some(socket) = &sockets[usize::from(addr.is_ipv6())] {
+        // 缓冲满或网络错误按丢包处理，由 WireGuard / disco 重传
+        let _ = socket.try_send_to(buf, addr);
+    }
+}
+impl Exec {
+    fn derp(&self, artificial: SocketAddr, buf: Vec<u8>) -> io::Result<()> {
+        let (region, _) = self
+            .routes
+            .get(&artificial)
+            .ok_or_else(|| err("unknown Tailscale peer endpoint"))?;
+        let tx = self
+            .senders
+            .get(region)
+            .ok_or_else(|| err("DERP region disconnected"))?;
+        match tx.try_send((buf, artificial)) {
+            Ok(()) => Ok(()),
+            // 突发时丢掉这个包（WireGuard / 隧道内 TCP 会重传），留一条诊断日志
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                log::debug!("tailscale: DERP send queue full, dropped a packet");
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(err("DERP connection closed")),
+        }
+    }
+    fn run(&self, outs: Vec<Out>) {
+        for out in outs {
+            match out {
+                Out::Udp(addr, buf) => send_udp(&self.sockets, addr, &buf),
+                Out::Derp(peer, buf) => {
+                    let _ = self.derp(endpoint(peer), buf);
+                }
+            }
+        }
+    }
 }
 impl Relay {
     /// 任一区域连接已断开。
@@ -132,11 +189,25 @@ impl Relay {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
     }
+    /// 本机端点变化（STUN 结果、网卡地址），由控制会话经 MapRequest 上报。
+    pub fn endpoints(&self) -> watch::Receiver<Endpoints> {
+        self.endpoints.clone()
+    }
+    fn exec(&self) -> Exec {
+        Exec {
+            routes: self.routes.clone(),
+            senders: self.senders.clone(),
+            sockets: self.sockets.clone(),
+        }
+    }
+    /// `direct` 为假（配置了 dialer-proxy）时不建直连套接字，只走 DERP：UDP 经前置代理后 NAT
+    /// 映射属于代理出口，打洞基本不可行，直连还会绕过用户的代理意图。
     pub async fn start(
         snapshot: &Snapshot,
         keys: &NodeState,
         dialer: Arc<dyn Dialer>,
-        datagrams: Arc<dyn DatagramFactory>,
+        resolver: Arc<dyn Resolver>,
+        direct: bool,
         home: u16,
     ) -> io::Result<Arc<Self>> {
         let mut regions = std::collections::BTreeSet::from([home]);
@@ -158,9 +229,9 @@ impl Relay {
             return Err(err("Tailscale peers span too many DERP regions"));
         }
         let (incoming_tx, incoming) = mpsc::channel(QUEUE);
+        let (disco_tx, mut disco_rx) = mpsc::channel::<Inbound>(QUEUE);
         let mut senders = BTreeMap::new();
         let mut tasks = Vec::new();
-        let mut direct = BTreeMap::new();
         for region in regions {
             let urls = snapshot
                 .region_nodes
@@ -182,44 +253,126 @@ impl Relay {
             }
             let stream = stream
                 .ok_or_else(|| last.unwrap_or_else(|| err("all Tailscale DERP nodes failed")))?;
-            let (tx, region_tasks) =
-                start_region(stream, incoming_tx.clone(), sources.clone(), routes.clone());
+            let (tx, region_tasks) = start_region(
+                stream,
+                incoming_tx.clone(),
+                sources.clone(),
+                routes.clone(),
+                direct.then(|| (disco_tx.clone(), region)),
+            );
             senders.insert(region, tx);
             tasks.extend(region_tasks);
         }
-        // 使用 peer 上报的 endpoint；本地尚未实现 STUN/disco。
-        // 数据报沿配置的 dialer-proxy 运行，不私自绕过前置代理。
-        for (i, peer) in snapshot.peers.iter().enumerate() {
-            let Some(remote) = peer.endpoints.first().copied() else {
-                continue;
-            };
-            let Ok(channel) = datagrams.bind(remote).await else {
-                continue; // 前置代理不支持 UDP 时沿 DERP 承载。
-            };
-            let artificial = endpoint(i);
-            let incoming = incoming_tx.clone();
-            let reader = channel.clone();
-            tasks.push(Task(tokio::spawn(async move {
-                let mut buf = vec![0; MAX_WIRE];
-                loop {
-                    let Ok((n, from)) = reader.recv_from(&mut buf).await else {
-                        break;
-                    };
-                    if from == remote {
-                        let _ = incoming.try_send((buf[..n].to_vec(), artificial));
-                    }
+        let mut sockets: [Option<Arc<UdpSocket>>; 2] = [None, None];
+        if direct {
+            for v6 in [false, true] {
+                match oryn_udp::iface::bind_udp(v6).await {
+                    Ok(socket) => sockets[usize::from(v6)] = Some(Arc::new(socket)),
+                    Err(e) => log::debug!("tailscale: direct UDP socket (ipv6={v6}) unavailable: {e}"),
                 }
-            })));
-            direct.insert(artificial, (channel, remote));
+            }
         }
-        Ok(Arc::new(Self {
+        let (endpoints_tx, endpoints) = watch::channel(Vec::new());
+        let mut magic = None;
+        if sockets.iter().any(Option::is_some) {
+            let mut state = Magic::new(
+                keys.disco_keys.private.to_crypto_box(),
+                *keys.node_keys.public.to_crypto_box().as_bytes(),
+                snapshot
+                    .peers
+                    .iter()
+                    .map(|p| (p.disco, p.endpoints.clone()))
+                    .collect(),
+                [sockets[0].is_some(), sockets[1].is_some()],
+            );
+            let mut local = Vec::new();
+            for ip in magic::local_addresses() {
+                let socket = &sockets[usize::from(ip.is_ipv6())];
+                if let Some(port) = socket.as_ref().and_then(|s| s.local_addr().ok()).map(|a| a.port()) {
+                    local.push(SocketAddr::new(ip, port));
+                }
+            }
+            state.set_local(local);
+            state.set_stun_servers(stun_servers(snapshot, home, resolver.as_ref()).await);
+            let _ = endpoints_tx.send(state.endpoints());
+            magic = Some(Arc::new(std::sync::Mutex::new(state)));
+        }
+        let relay = Self {
             routes,
             senders,
-            direct,
             incoming: Mutex::new(incoming),
+            magic: magic.clone(),
+            sockets: sockets.clone(),
+            endpoints,
+            _tasks: Vec::new(),
+        };
+        if let Some(magic) = magic {
+            let exec = relay.exec();
+            // 每个套接字一个接收任务：STUN 响应与 disco 交给状态机，其余是 WireGuard
+            for socket in sockets.into_iter().flatten() {
+                let (magic, incoming, disco) = (magic.clone(), incoming_tx.clone(), disco_tx.clone());
+                tasks.push(Task(tokio::spawn(async move {
+                    let mut buf = vec![0; MAX_WIRE];
+                    while let Ok((n, from)) = socket.recv_from(&mut buf).await {
+                        let packet = &buf[..n];
+                        if magic::stun_response(packet).is_some() {
+                            let _ = disco.try_send(Inbound::Stun(packet.to_vec()));
+                        } else if magic::is_disco(packet) {
+                            let _ = disco.try_send(Inbound::Disco(packet.to_vec(), Via::Udp(from)));
+                        } else if let Some(peer) = magic.lock().unwrap().peer_for(from) {
+                            let _ = incoming.try_send((packet.to_vec(), endpoint(peer)));
+                        }
+                    }
+                })));
+            }
+            tasks.push(Task(tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    let outs = tokio::select! {
+                        _ = tick.tick() => magic.lock().unwrap().tick(Instant::now()),
+                        inbound = disco_rx.recv() => match inbound {
+                            None => break,
+                            Some(Inbound::Disco(packet, via)) => {
+                                magic.lock().unwrap().on_disco(&packet, via, Instant::now())
+                            }
+                            Some(Inbound::Stun(packet)) => {
+                                let mut state = magic.lock().unwrap();
+                                if state.on_stun(&packet) {
+                                    let _ = endpoints_tx.send(state.endpoints());
+                                }
+                                Vec::new()
+                            }
+                        },
+                    };
+                    exec.run(outs);
+                }
+            })));
+        }
+        Ok(Arc::new(Self {
             _tasks: tasks,
+            ..relay
         }))
     }
+}
+
+/// home region 的 STUN 服务地址：优先 DERPMap 给出的 IP，否则经代理解析器解析主机名。
+async fn stun_servers(snapshot: &Snapshot, home: u16, resolver: &dyn Resolver) -> Vec<SocketAddr> {
+    let mut out = Vec::new();
+    for server in snapshot.stun.get(&home).into_iter().flatten().take(2) {
+        let mut ips = server.ips.clone();
+        if ips.is_empty() && !server.host.is_empty() {
+            if let Ok(Ok(resolved)) =
+                tokio::time::timeout(std::time::Duration::from_secs(3), resolver.resolve(&server.host)).await
+            {
+                ips = resolved;
+            }
+        }
+        for ip in ips.into_iter().take(2) {
+            out.push(SocketAddr::new(ip, server.port));
+        }
+    }
+    out
 }
 
 // 认证后的真实区域 pipeline；测试也经过同一组读写任务和有界队列。
@@ -228,6 +381,7 @@ fn start_region(
     incoming: mpsc::Sender<WirePacket>,
     sources: BTreeMap<[u8; 32], SocketAddr>,
     routes: BTreeMap<SocketAddr, (u16, [u8; 32])>,
+    disco: Option<(mpsc::Sender<Inbound>, u16)>,
 ) -> (mpsc::Sender<WirePacket>, Vec<Task>) {
     let mut tasks = Vec::new();
     let (mut reader, mut writer) = tokio::io::split(stream);
@@ -254,7 +408,17 @@ fn start_region(
                 5 if body.len() >= 32 && body.len() <= 32 + MAX_WIRE => {
                     let key: [u8; 32] = body[..32].try_into().expect("checked length");
                     if let Some(&from) = sources.get(&key) {
-                        let _ = incoming.try_send((body[32..].to_vec(), from));
+                        let payload = &body[32..];
+                        match &disco {
+                            // 经 DERP 的 disco：交给状态机（来源身份 = DERP 帧里的 node key）
+                            Some((tx, region)) if magic::is_disco(payload) => {
+                                let peer = usize::from(from.port()) - 1;
+                                let _ = tx.try_send(Inbound::Disco(payload.to_vec(), Via::Derp(peer, *region)));
+                            }
+                            _ => {
+                                let _ = incoming.try_send((payload.to_vec(), from));
+                            }
+                        }
                     }
                 }
                 // Ping：排队回 Pong；控制队列满说明写端卡住，断开重连
@@ -309,10 +473,22 @@ impl oryn_udp::Datagrams for Relay {
         if buf.len() > MAX_WIRE {
             return Err(err("Tailscale WireGuard packet exceeds limit"));
         }
-        if let Some((channel, remote)) = self.direct.get(&peer) {
-            // UDP 发送成功不证明可达；继续经 DERP 发送，避免 NAT 黑洞。
-            // WireGuard 重放保护丢弃重复密文。完整路径探测仍需 disco。
-            let _ = channel.try_send_to(buf, *remote);
+        // 可信直连只走 UDP；直连未确认时 UDP 与 DERP 都发（WireGuard 重放保护丢弃重复密文）；
+        // 没有直连时只走 DERP（OrynCore#41，与 magicsock addrForSendLocked 一致）
+        let route = match &self.magic {
+            Some(magic) => magic
+                .lock()
+                .unwrap()
+                .route(usize::from(peer.port()).wrapping_sub(1), Instant::now()),
+            None => Route::Derp,
+        };
+        match route {
+            Route::Udp(addr) => {
+                send_udp(&self.sockets, addr, buf);
+                return Ok(());
+            }
+            Route::Both(addr) => send_udp(&self.sockets, addr, buf),
+            Route::Derp => {}
         }
         let (region, _) = self
             .routes
