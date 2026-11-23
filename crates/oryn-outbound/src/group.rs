@@ -120,6 +120,15 @@ pub struct MemberStatus {
     pub tested: bool,
     pub udp_delay_ms: Option<u32>,
     pub udp_tested: bool,
+    /// 最近一次 TCP / UDP 延迟测试完成的时间（Unix 毫秒）；界面据此判断手动测试是否已出结果。
+    pub checked_at_ms: Option<u64>,
+    pub udp_checked_at_ms: Option<u64>,
+}
+
+fn unix_ms(at: SystemTime) -> u64 {
+    at.duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis().min(u64::MAX as u128) as u64)
+        .unwrap_or(0)
 }
 
 fn now_secs() -> u64 {
@@ -392,13 +401,16 @@ impl GroupOutbound {
                 .map(|i| {
                     let h = self.health(i);
                     let udp = self.store.get_udp(self.members[i].tag());
+                    let recorded = self.store.get(self.members[i].tag());
                     MemberStatus {
                         name: self.members[i].tag().to_string(),
                         kind: self.members[i].kind(),
                         delay_ms: h.and_then(|h| h.delay_ms),
-                        tested: h.is_some() && self.store.get(self.members[i].tag()).is_some(),
+                        tested: h.is_some() && recorded.is_some(),
                         udp_delay_ms: udp.and_then(|u| u.delay_ms),
                         udp_tested: udp.is_some(),
+                        checked_at_ms: recorded.map(|r| unix_ms(r.checked_at)),
+                        udp_checked_at_ms: udp.map(|u| unix_ms(u.checked_at)),
                     }
                 })
                 .collect(),

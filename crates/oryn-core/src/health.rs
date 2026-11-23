@@ -125,17 +125,30 @@ async fn group_loop(state: Weak<RuntimeState>, index: usize) {
 
 /// 并发测试策略组的所有成员，结果写入共享的健康状态。
 pub async fn test_group(state: &RuntimeState, group: &Arc<dyn Outbound>) {
-    test_group_member(state, group, None).await;
+    test_group_member(state, group, None, None).await;
 }
 
-/// 只测试策略组中名为 `only` 的成员（`None` 为全部成员）；使用该组的探测地址与超时。
+/// 手动延迟测试超时的允许范围（毫秒）。
+const MANUAL_TIMEOUT_MS: std::ops::RangeInclusive<u64> = 500..=30_000;
+
+/// 把 App 传来的手动测试超时限制在允许范围内。
+pub fn clamp_manual_timeout(ms: u64) -> Duration {
+    Duration::from_millis(ms.clamp(*MANUAL_TIMEOUT_MS.start(), *MANUAL_TIMEOUT_MS.end()))
+}
+
+/// 只测试策略组中名为 `only` 的成员（`None` 为全部成员）；使用该组的探测地址，
+/// 超时取 `timeout`（手动测试），缺省时用该组的健康检查超时。
 pub async fn test_group_member(
     state: &RuntimeState,
     group: &Arc<dyn Outbound>,
     only: Option<&str>,
+    timeout: Option<Duration>,
 ) {
     let Some(g) = group.as_group() else { return };
-    let spec = g.health_spec().clone();
+    let mut spec = g.health_spec().clone();
+    if let Some(timeout) = timeout {
+        spec.timeout_ms = timeout.as_millis() as u64;
+    }
     let members = g
         .members()
         .iter()
@@ -220,9 +233,10 @@ pub async fn test_group_udp(
     group: &Arc<dyn Outbound>,
     address: &str,
     only: Option<&str>,
+    timeout: Option<Duration>,
 ) {
     let Some(g) = group.as_group() else { return };
-    let timeout = Duration::from_millis(g.health_spec().timeout_ms);
+    let timeout = timeout.unwrap_or_else(|| Duration::from_millis(g.health_spec().timeout_ms));
     let Some((domain, target)) = parse_udp_test(address) else {
         return;
     };
@@ -351,5 +365,12 @@ mod tests {
         assert_eq!(target.to_string(), "dns.example:5353");
         assert!(parse_udp_test("apple.com").is_none());
         assert!(parse_udp_test("@1.1.1.1").is_none());
+    }
+
+    #[test]
+    fn manual_timeout_is_clamped() {
+        assert_eq!(clamp_manual_timeout(3000), Duration::from_millis(3000));
+        assert_eq!(clamp_manual_timeout(10), Duration::from_millis(500));
+        assert_eq!(clamp_manual_timeout(120_000), Duration::from_secs(30));
     }
 }

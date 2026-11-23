@@ -124,7 +124,7 @@ fn group(
 }
 async fn run(state: Rc<RuntimeState>, group: Arc<dyn Outbound>, udp: bool) {
     if udp {
-        test_group_udp(&state, &group, "example.invalid@127.0.0.1", None).await
+        test_group_udp(&state, &group, "example.invalid@127.0.0.1", None, None).await
     } else {
         test_group(&state, &group).await
     }

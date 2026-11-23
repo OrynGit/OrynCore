@@ -945,6 +945,8 @@ fn handle_command(ctx: &Rc<EngineCtx>, req: &Value) -> Value {
                             "tested": m.tested,
                             "udp_delay": m.udp_delay_ms,
                             "udp_tested": m.udp_tested,
+                            "checked_at": m.checked_at_ms,
+                            "udp_checked_at": m.udp_checked_at_ms,
                         })).collect::<Vec<_>>(),
                     })
                 })
@@ -992,17 +994,22 @@ fn handle_command(ctx: &Rc<EngineCtx>, req: &Value) -> Value {
             let st = state.clone();
             // 可选 member：只测该成员（长按节点）
             let only = str_arg(req, "member").map(str::to_string);
+            // 可选 timeout_ms：App 设置的手动测试超时，覆盖该组的健康检查超时
+            let timeout = req
+                .get("timeout_ms")
+                .and_then(Value::as_u64)
+                .map(health::clamp_manual_timeout);
             if req.get("udp").and_then(Value::as_bool).unwrap_or(false) {
                 let address = ctx.udp_test_address().to_string();
                 if health::parse_udp_test(&address).is_none() {
                     return json!({ "error": format!("invalid UDP test address `{address}`") });
                 }
                 state.spawn(async move {
-                    health::test_group_udp(&st, &g, &address, only.as_deref()).await
+                    health::test_group_udp(&st, &g, &address, only.as_deref(), timeout).await
                 });
             } else {
                 state.spawn(async move {
-                    health::test_group_member(&st, &g, only.as_deref()).await
+                    health::test_group_member(&st, &g, only.as_deref(), timeout).await
                 });
             }
             json!({ "ok": true })
