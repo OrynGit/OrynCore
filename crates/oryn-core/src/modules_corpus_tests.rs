@@ -48,11 +48,8 @@ fn diagnostic(text: impl std::fmt::Display) -> Value {
         .and_then(|s| s.split(':').nth(1))
         .and_then(|s| s.parse::<usize>().ok());
     let skipped = lower.contains("skipped:");
-    // 仅固定的产品资源预算提示允许原文；其他诊断可能包含正文/参数，保留指纹。
-    let safe_text = text
-        .find("Oryn script resource limits:")
-        .map(|n| &text[n..]);
-    json!({"category": category, "source_line":source_line,"skipped":skipped,"text":safe_text,"sha256": format!("{:x}", Sha256::digest(text.as_bytes()))})
+    // 诊断可能包含正文/参数，只保留指纹。
+    json!({"category": category, "source_line":source_line,"skipped":skipped,"text":null,"sha256": format!("{:x}", Sha256::digest(text.as_bytes()))})
 }
 fn warnings(items: &[String]) -> Vec<Value> {
     items.iter().map(diagnostic).collect()
@@ -196,11 +193,21 @@ fn audit(
     );
     match compiled {
         Ok(plan) => {
-            let source_lines: Vec<_> = plan
+            // 编译成功的脚本按源码顺序进入 plan.scripts；去掉被跳过的行即可对应源码行号。
+            let skipped_lines: Vec<_> = plan
                 .warnings
                 .iter()
-                .filter(|w| w.contains(": Oryn script resource limits:"))
+                .filter(|w| w.contains(": script skipped:"))
                 .map(|w| diagnostic(w)["source_line"].clone())
+                .collect();
+            let source_lines: Vec<_> = spec
+                .inline
+                .as_ref()
+                .unwrap()
+                .scripts
+                .iter()
+                .map(|s| json!(s.source.line))
+                .filter(|line| !skipped_lines.contains(line))
                 .collect();
             let script_details: Vec<_> = plan.scripts.iter().enumerate().map(|(i,s)| json!({"name":s.name,"source_line":source_lines.get(i),"script_enabled":s.enabled})).collect();
             let skipped_scripts: Vec<_> = plan

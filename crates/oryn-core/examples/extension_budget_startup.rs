@@ -169,8 +169,7 @@ mod survey {
     fn assert_modules(engine: &oryn_core::Engine, expected: usize) {
         let warnings = engine.command(br#"{"cmd":"warnings"}"#);
         let items = warnings["warnings"].as_array().unwrap();
-        assert_eq!(items.len(), expected, "{warnings}");
-        assert!(items.iter().all(|w| w.as_str() == Some("module:7: Oryn script resource limits: default timeout 5s, maximum 30s; body size capped at 1048576 bytes")), "{warnings}");
+        assert!(items.is_empty(), "{warnings}");
         let modules = engine.command(br#"{"cmd":"module_status"}"#);
         let list = modules["modules"].as_array().expect("modules command");
         assert_eq!(list.len(), expected);

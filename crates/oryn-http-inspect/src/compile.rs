@@ -1065,15 +1065,8 @@ pub fn compile_module_with_policies(
         let script_name = result.as_ref().map(|rule| rule.name.as_str()).unwrap_or("<invalid>");
         plan.warnings.extend(warnings.into_iter().map(|w| format!("{}:{}: script {script_name}: {w}", script.source.name, script.source.line)));
         match result {
-            Ok(rule) => {
-                let max_timeout = if matches!(rule.kind.as_str(), "http-request" | "http-response") {
-                    30
-                } else {
-                    300
-                };
-                plan.warnings.push(format!("{}:{}: Oryn script resource limits: default timeout 5s, maximum {max_timeout}s; body size capped at {MAX_BODY} bytes", script.source.name, script.source.line));
-                plan.scripts.push(rule)
-            }
+            // 超时与正文上限是固定的运行时约束（见 script_rule），每个脚本都一样，不作为告警输出。
+            Ok(rule) => plan.scripts.push(rule),
             Err(e)
                 if matches!(
                     e.kind(),

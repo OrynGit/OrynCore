@@ -100,9 +100,8 @@ fn prepared_script_env_and_compile_warnings_match_fresh() {
         assert_eq!(prepared.plans[0].1.scripts.len(), 1);
         assert!(prepared.plans[0].1.scripts[0].env.is_empty(), "env belongs only to apply");
         let compile_warnings = prepared.plans[0].1.warnings.clone();
-        assert_eq!(compile_warnings.len(), 2, "{compile_warnings:?}");
+        assert_eq!(compile_warnings.len(), 1, "{compile_warnings:?}");
         assert!(compile_warnings[0].starts_with("module:4: rewrite skipped: jq parse error:"));
-        assert_eq!(compile_warnings[1], "module:2: Oryn script resource limits: default timeout 5s, maximum 30s; body size capped at 1048576 bytes");
         let fresh_config = prepared.config.clone();
         ctx.apply_prepared(prepared);
         assert_eq!(ctx.state().http_plan.scripts[0].env["prepared_env"], "present");

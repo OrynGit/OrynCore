@@ -41,9 +41,9 @@ impl Url {
         };
         let path = path.split('#').next().unwrap_or("/");
         let path = if path.starts_with('/') {
-            path.to_string()
+            encode_target(path)
         } else {
-            format!("/{path}")
+            format!("/{}", encode_target(path))
         };
         let authority = authority.rsplit('@').next().unwrap_or(authority);
         let default_port = if https { 443 } else { 80 };
@@ -107,6 +107,21 @@ impl Url {
         let joined = format!("{dir}{location}");
         Url::parse(&format!("{base}{}", remove_dot_segments(&joined)))
     }
+}
+
+/// 请求行里的路径与查询串只能是可见 ASCII：非 ASCII（如中文文件名）、空白与控制字符
+/// 按 UTF-8 百分号编码，已有的 `%XX` 原样保留。原样发送 UTF-8 时 GitHub 等服务器回 400；
+/// 控制字符不编码还会让 CR/LF 拆出额外的请求头。
+fn encode_target(target: &str) -> String {
+    let mut out = String::with_capacity(target.len());
+    for &b in target.as_bytes() {
+        if b.is_ascii_graphic() && !matches!(b, b'"' | b'<' | b'>') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 /// RFC 3986 §5.2.4：去掉路径中的 `.` 与 `..` 段（查询串原样保留）。
@@ -892,6 +907,12 @@ mod tests {
         );
         assert_eq!(u.host_header(), "[2001:db8::1]:8080");
         assert!(Url::parse("ftp://a.com").is_err() && Url::parse("http://").is_err());
+        let u = Url::parse("https://a.com/S/中国 去.sgmodule?q=a%20b|c#x").unwrap();
+        assert_eq!(
+            u.path,
+            "/S/%E4%B8%AD%E5%9B%BD%20%E5%8E%BB.sgmodule?q=a%20b|c"
+        );
+        assert_eq!(Url::parse("https://a.com/x\r\nEvil: 1").unwrap().path, "/x%0D%0AEvil:%201");
         let base = Url::parse("https://a.com/dir/file.txt").unwrap();
         assert_eq!(base.join("other.txt").unwrap().path, "/dir/other.txt");
         assert_eq!(base.join("/root").unwrap().path, "/root");
