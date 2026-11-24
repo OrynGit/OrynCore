@@ -2,6 +2,7 @@
 //! 不监听入站；普通代理、身份 DNS 和 peer 流量分别沿现有接口运行。
 mod control;
 mod derp;
+mod login;
 mod snapshot;
 
 use crate::{BoxStream, Dialer, Outbound, PacketConn, Resolver, SessionControl, TailnetDnsAnswer};
@@ -53,6 +54,7 @@ struct Session {
     data_dir: Option<PathBuf>,
     state: RwLock<State>,
     notify: Notify,
+    login: Mutex<login::LoginState>,
 }
 pub struct TailscaleOutbound {
     tag: String,
@@ -82,11 +84,133 @@ impl TailscaleOutbound {
                     task: None,
                 }),
                 notify: Notify::new(),
+                login: Mutex::new(login::LoginState::default()),
             }),
         })
     }
 }
+impl TailscaleOutbound {
+    /// `tailscale_status`：登录状态、等待中的登录 URL、本机 key 到期时间与地址。
+    pub fn status(&self) -> serde_json::Value {
+        let session = &self.session;
+        let login = session.login.lock().unwrap();
+        let state = session.state.read().unwrap();
+        let (expiry, addresses) = state.ready.as_ref().map_or((None, Vec::new()), |r| {
+            (
+                r.snapshot.expiry,
+                r.snapshot.own_ips.iter().map(|ip| ip.to_string()).collect(),
+            )
+        });
+        let now = snapshot::now();
+        serde_json::json!({
+            "proxy": self.tag,
+            "enabled": session.spec.enabled,
+            "state": if session.spec.enabled { login.phase.name() } else { "disabled" },
+            "auth_url": (login.phase == login::Phase::NeedsLogin).then(|| login.auth_url.clone()).flatten(),
+            "expiry": expiry,
+            "expiring_soon": expiry.is_some_and(|e| e - now <= login::EXPIRING_SOON_SECS),
+            "node": {
+                "hostname": session.spec.hostname.as_deref().unwrap_or("oryn"),
+                "addresses": addresses,
+            },
+            "user": login.user,
+            "error": login.error.clone().or_else(|| state.error.clone()),
+        })
+    }
+    /// `tailscale_login`：启动注册；`force` 时换新 key、不带 auth key 走浏览器登录。
+    pub fn login(&self, force: bool) -> io::Result<()> {
+        if !self.session.spec.enabled {
+            return Err(err("Tailscale is disabled; set oryn-tailscale-enabled: true"));
+        }
+        {
+            let mut login = self.session.login.lock().unwrap();
+            login.force |= force;
+            login.logout = false;
+            if matches!(login.phase, login::Phase::LoggedOut | login::Phase::Failed) {
+                login.phase = login::Phase::Idle;
+            }
+        }
+        if force {
+            self.session.stop(false);
+        }
+        self.session.ensure_task();
+        Ok(())
+    }
+    /// `tailscale_logout`：向控制面登出并删除本地身份；之后不自动重新注册。
+    pub fn logout(&self) -> io::Result<()> {
+        if !self.session.spec.enabled {
+            return Err(err("Tailscale is disabled; set oryn-tailscale-enabled: true"));
+        }
+        {
+            let mut login = self.session.login.lock().unwrap();
+            login.logout = true;
+            login.force = false;
+            if login.phase == login::Phase::LoggedOut {
+                return Ok(());
+            }
+            login.phase = login::Phase::Idle;
+        }
+        self.session.stop(false);
+        self.session.ensure_task();
+        Ok(())
+    }
+}
 impl Session {
+    /// 等待浏览器登录或已登出时立即失败，不让 Flow 等到超时（OrynCore#42）。
+    fn login_gate(&self) -> io::Result<()> {
+        match self.login.lock().unwrap().phase {
+            login::Phase::NeedsLogin => Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Tailscale login required; open the login URL from tailscale_status",
+            )),
+            login::Phase::LoggedOut => Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Tailscale is logged out; run tailscale_login",
+            )),
+            _ => Ok(()),
+        }
+    }
+    /// 控制任务没有在跑就启动（首个 Flow 懒启动，或登录 / 登出命令主动启动）。
+    fn ensure_task(self: &Arc<Self>) {
+        let mut state = self.state.write().unwrap();
+        if state.asleep || !state.task.as_ref().is_none_or(|t| t.0.is_finished()) {
+            return;
+        }
+        state.error = None;
+        let weak = Arc::downgrade(self);
+        let spec = self.spec.clone();
+        let dialer = self.dialer.clone();
+        let dir = self.data_dir.clone();
+        let datagrams = self.datagrams.clone();
+        state.task = Some(Task(tokio::spawn(async move {
+            let result = run(weak.clone(), spec, dialer, datagrams, dir).await;
+            if let Some(s) = weak.upgrade() {
+                if let Err(error) = &result {
+                    let mut login = s.login.lock().unwrap();
+                    if error.kind() == io::ErrorKind::PermissionDenied
+                        && login.phase != login::Phase::LoggedOut
+                    {
+                        login.phase = login::Phase::Failed;
+                        login.error = Some(error.to_string());
+                    }
+                }
+                s.revoke(Some(match result {
+                    Err(e) => e.to_string(),
+                    Ok(()) => "Tailscale control stream stopped".into(),
+                }));
+            }
+        })));
+    }
+    fn set_login(&self, phase: login::Phase, auth_url: Option<String>) {
+        let mut login = self.login.lock().unwrap();
+        login.phase = phase;
+        login.auth_url = auth_url;
+        if phase != login::Phase::Failed {
+            login.error = None;
+        }
+        drop(login);
+        self.notify.notify_waiters();
+    }
     fn stop(&self, asleep: bool) {
         let mut state = self.state.write().unwrap();
         if let Some(ready) = state.ready.take() {
@@ -112,34 +236,20 @@ impl Session {
                 "Tailscale is disabled; set oryn-tailscale-enabled: true",
             ));
         }
+        self.login_gate()?;
         {
-            let mut state = self.state.write().unwrap();
+            let state = self.state.read().unwrap();
             if state.asleep {
                 return Err(err("Tailscale is suspended"));
             }
-            if state.task.as_ref().is_none_or(|t| t.0.is_finished()) {
-                state.error = None;
-                let weak = Arc::downgrade(self);
-                let spec = self.spec.clone();
-                let dialer = self.dialer.clone();
-                let dir = self.data_dir.clone();
-                let datagrams = self.datagrams.clone();
-                state.task = Some(Task(tokio::spawn(async move {
-                    let result = run(weak.clone(), spec, dialer, datagrams, dir).await;
-                    if let Some(s) = weak.upgrade() {
-                        s.revoke(Some(match result {
-                            Err(e) => e.to_string(),
-                            Ok(()) => "Tailscale control stream stopped".into(),
-                        }));
-                    }
-                })));
-            }
         }
+        self.ensure_task();
         control::timed(async {
             loop {
                 let notified = self.notify.notified();
                 tokio::pin!(notified);
                 notified.as_mut().enable();
+                self.login_gate()?;
                 {
                     let state = self.state.read().unwrap();
                     if state.asleep {
@@ -311,6 +421,9 @@ impl Outbound for TailscaleOutbound {
     }
     fn kind(&self) -> &'static str {
         "tailscale"
+    }
+    fn as_tailscale(&self) -> Option<&TailscaleOutbound> {
+        Some(self)
     }
     fn session_control(&self) -> Option<Arc<dyn SessionControl>> {
         Some(self.session.clone())
@@ -647,9 +760,31 @@ struct Identity {
     version: u8,
     control_url: String,
     keys: PersistState,
+    /// 最近一次换下的 node 公钥（版本 2 起）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    old_node_key: Option<String>,
 }
-fn identity(spec: &TailscaleSpec, dir: Option<&Path>) -> io::Result<NodeState> {
-    use std::io::{Read, Write};
+const IDENTITY_VERSION: u8 = 2;
+/// 原子写身份文件：临时文件 0600 后改名。
+fn save_identity(path: &Path, identity: &Identity) -> io::Result<()> {
+    use std::io::Write;
+    let temp = path.with_extension("json.tmp");
+    let _ = std::fs::remove_file(&temp);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temp)?;
+    file.write_all(&serde_json::to_vec(identity).map_err(io::Error::other)?)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&temp, path)
+}
+fn identity(spec: &TailscaleSpec, dir: Option<&Path>) -> io::Result<(PathBuf, Identity)> {
+    use std::io::Read;
     let root = dir.ok_or_else(|| err("Tailscale requires a persistent data directory"))?;
     std::fs::create_dir_all(root)?;
     let mut namespace = root.to_path_buf();
@@ -688,35 +823,26 @@ fn identity(spec: &TailscaleSpec, dir: Option<&Path>) -> io::Result<NodeState> {
             }
             let identity: Identity = serde_json::from_slice(&bytes)
                 .map_err(|_| err("invalid Tailscale identity; refusing automatic reset"))?;
-            if identity.version != 1 || identity.control_url != spec.control_url {
+            // 版本 1 没有 old_node_key，按版本 2 读入，下次写入时升级
+            if !(1..=IDENTITY_VERSION).contains(&identity.version) {
+                return Err(err("unsupported Tailscale identity version"));
+            }
+            if identity.control_url != spec.control_url {
                 return Err(err("Tailscale state belongs to a different control server"));
             }
-            Ok(NodeState::from(identity.keys))
+            Ok((path, identity))
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            let keys = PersistState::default();
             let identity = Identity {
-                version: 1,
+                version: IDENTITY_VERSION,
                 control_url: spec.control_url.clone(),
-                keys: keys.clone(),
+                keys: PersistState::default(),
+                old_node_key: None,
             };
             // 先写临时文件再原子改名：中途崩溃只会留下临时文件，不会留下截断的 identity.json
             // （截断文件会被当成损坏而永久拒绝启动）
-            let temp = namespace.join("identity.json.tmp");
-            let _ = std::fs::remove_file(&temp);
-            let mut options = std::fs::OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            let mut file = options.open(&temp)?;
-            file.write_all(&serde_json::to_vec(&identity).map_err(io::Error::other)?)?;
-            file.sync_all()?;
-            drop(file);
-            std::fs::rename(&temp, &path)?;
-            Ok(NodeState::from(keys))
+            save_identity(&path, &identity)?;
+            Ok((path, identity))
         }
         Err(e) => Err(e),
     }
@@ -758,6 +884,15 @@ async fn expiry_guard<F: std::future::Future<Output = io::Result<()>>>(
                     })
                 };
                 if expired {
+                    let own = {
+                        let state = session.state.read().unwrap();
+                        let now = snapshot::now();
+                        state.ready.as_ref().is_some_and(|r| r.snapshot.expiry.is_some_and(|e| e <= now))
+                    };
+                    if own {
+                        // 本机 node key 到期：下次注册换新 key 并带上 OldNodeKey（OrynCore#42）
+                        session.login.lock().unwrap().rotate = true;
+                    }
                     // 当前 WireGuard 仅支持整代撤销，保守关闭所有既有 Flow。
                     // 返回会丢弃整个控制 future（含连接与 carry），绝不在取消
                     // frame/read_exact 后继续使用同一个流。下一代重编译会滤掉
@@ -863,7 +998,54 @@ async fn run_once(
     carry: &mut Option<Carry>,
 ) -> io::Result<()> {
     log::debug!("tailscale: opening identity");
-    let keys = identity(&spec, dir.as_deref())?;
+    let (path, mut ident) = identity(&spec, dir.as_deref())?;
+    let mut keys = NodeState::from(&ident.keys);
+    let Some(session) = weak.upgrade() else {
+        return Ok(());
+    };
+    let (logout, force, rotate) = {
+        let mut login = session.login.lock().unwrap();
+        (
+            std::mem::take(&mut login.logout),
+            std::mem::take(&mut login.force),
+            std::mem::take(&mut login.rotate),
+        )
+    };
+    session.set_login(login::Phase::Starting, None);
+    let mut ctl = control::timed(control::Control::connect(&spec, &keys, dialer.clone())).await?;
+    if logout {
+        login::logout(&mut ctl, &spec, &keys).await?;
+        std::fs::remove_file(&path)?;
+        *carry = None;
+        session.set_login(login::Phase::LoggedOut, None);
+        log::info!("tailscale: logged out");
+        return Ok(());
+    }
+    // 强制重新认证：换新 key、不带 auth key，走浏览器登录（与官方交互登录总是换 key 一致）
+    let notify = Arc::downgrade(&session);
+    drop(session);
+    let needs_login = move |url: String| {
+        if let Some(session) = notify.upgrade() {
+            log::info!("tailscale: waiting for browser login (see tailscale_status)");
+            session.set_login(login::Phase::NeedsLogin, Some(url));
+        }
+    };
+    let registered =
+        login::register(&mut ctl, &spec, &mut keys, rotate || force, !force, &needs_login).await?;
+    if let Some(old) = registered.rotated {
+        // 新 key 注册成功后才写回（官方同样只在成功后提交）；旧身份的隧道与路由随之作废
+        ident.version = IDENTITY_VERSION;
+        ident.keys = PersistState::from(&keys);
+        ident.old_node_key = Some(old);
+        save_identity(&path, &ident)?;
+        *carry = None;
+    }
+    let Some(session) = weak.upgrade() else {
+        return Ok(());
+    };
+    session.set_login(login::Phase::Running, None);
+    session.login.lock().unwrap().user = registered.user;
+    drop(session);
     let scope = ring::digest::digest(
         &ring::digest::SHA256,
         format!("{}|{}", spec.control_url, keys.node_keys.public).as_bytes(),
@@ -872,7 +1054,6 @@ async fn run_once(
     .iter()
     .map(|b| format!("{b:02x}"))
     .collect::<String>();
-    let mut ctl = control::timed(control::Control::connect(&spec, &keys, dialer.clone())).await?;
     log::debug!("tailscale: registered");
     let mut map = control::timed(ctl.map(&spec, &keys, None, true)).await?;
     let mut snapshot = carry
@@ -1127,6 +1308,47 @@ mod tests {
             .is_err());
         tunnel.close();
     }
+    /// 等待浏览器登录 / 已登出时 Flow 立即失败；状态只在 needs-login 时给出 URL（OrynCore#42）
+    #[tokio::test]
+    async fn login_gate_and_status() {
+        let config = oryn_config::parse_config(
+            "proxies: [{name: T, type: tailscale, oryn-tailscale-enabled: true, hostname: lab}]",
+        )
+        .unwrap();
+        let oryn_config::OutboundKind::Tailscale(spec) = config.outbounds[0].kind.clone() else {
+            panic!()
+        };
+        let resolver = Arc::new(TestResolver);
+        let ts = TailscaleOutbound::new(
+            "T".into(),
+            spec,
+            Arc::new(crate::DirectDialer::new(resolver.clone())),
+            resolver,
+            Arc::new(oryn_udp::UdpFactory),
+            None,
+        );
+        assert_eq!(ts.status()["state"], "idle");
+        ts.session.set_login(login::Phase::NeedsLogin, Some("https://login.example/a/1".into()));
+        let status = ts.status();
+        assert_eq!(status["state"], "needs-login");
+        assert_eq!(status["auth_url"], "https://login.example/a/1");
+        assert_eq!(status["node"]["hostname"], "lab");
+        let start = std::time::Instant::now();
+        let e = ts
+            .connect_tcp(&TargetAddr::Domain("peer".into(), 80))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+        assert!(start.elapsed() < Duration::from_secs(1), "must not wait for a timeout");
+        ts.session.set_login(login::Phase::Running, None);
+        assert!(ts.status()["auth_url"].is_null());
+        ts.session.set_login(login::Phase::LoggedOut, None);
+        assert!(ts.connect_tcp(&TargetAddr::Domain("peer".into(), 80)).await.is_err());
+        // login 清除已登出状态（没有数据目录，任务随即失败，这里只看状态迁移）
+        ts.login(false).unwrap();
+        assert_ne!(ts.status()["state"], "logged-out");
+    }
     #[test]
     fn persistent_identity_and_control_binding() {
         let dir = std::env::temp_dir().join(format!(
@@ -1145,9 +1367,39 @@ mod tests {
         else {
             panic!()
         };
-        let a = identity(&spec, Some(&dir)).unwrap();
-        let b = identity(&spec, Some(&dir)).unwrap();
-        assert_eq!(a.node_keys.public, b.node_keys.public);
+        let (path, a) = identity(&spec, Some(&dir)).unwrap();
+        let (_, b) = identity(&spec, Some(&dir)).unwrap();
+        let public = |i: &Identity| NodeState::from(&i.keys).node_keys.public;
+        assert_eq!(public(&a), public(&b));
+        assert_eq!(a.version, IDENTITY_VERSION);
+        // 版本 1 文件（没有 old_node_key）照常读入（OrynCore#42）
+        let mut v1 = serde_json::to_value(&a).unwrap();
+        v1["version"] = 1.into();
+        std::fs::write(&path, serde_json::to_vec(&v1).unwrap()).unwrap();
+        let (_, c) = identity(&spec, Some(&dir)).unwrap();
+        assert_eq!(public(&c), public(&a));
+        assert!(c.old_node_key.is_none());
+        // 换 key 后原子写回：新 key 与旧公钥都保留，权限 0600
+        let mut rotated = c;
+        let mut keys = NodeState::from(&rotated.keys);
+        let old = keys.node_keys.public.to_string();
+        keys.node_keys = ts_keys::NodeKeyPair::random();
+        rotated.keys = PersistState::from(&keys);
+        rotated.old_node_key = Some(old.clone());
+        rotated.version = IDENTITY_VERSION;
+        save_identity(&path, &rotated).unwrap();
+        let (_, d) = identity(&spec, Some(&dir)).unwrap();
+        assert_eq!(public(&d), keys.node_keys.public);
+        assert_eq!(d.old_node_key.as_deref(), Some(old.as_str()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        let mut future = serde_json::to_value(&d).unwrap();
+        future["version"] = 9.into();
+        std::fs::write(&path, serde_json::to_vec(&future).unwrap()).unwrap();
+        assert!(identity(&spec, Some(&dir)).is_err());
         spec.control_url = "https://other.invalid".into();
         assert!(identity(&spec, Some(&dir)).is_err());
         spec.control_url = "https://controlplane.tailscale.com".into();
