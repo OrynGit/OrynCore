@@ -248,6 +248,7 @@ mod tests {
                     preshared_key: None,
                     allowed_ips: vec![IpCidr::parse("10.0.0.0/24").unwrap()],
                     reserved: [0; 3],
+                    keepalive_secs: None,
                 })
                 .collect(),
             private_key: [2; 32],

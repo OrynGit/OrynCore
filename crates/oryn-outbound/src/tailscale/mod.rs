@@ -169,7 +169,6 @@ impl Session {
         &self,
         ready: &Ready,
         target: &TargetAddr,
-        protocol: u8,
     ) -> io::Result<SocketAddr> {
         let socket = match resolve(ready, target) {
             Ok(socket) => socket,
@@ -212,18 +211,13 @@ impl Session {
                     .map(|ip| SocketAddr::new(ip, *port))
                     .find(|socket| {
                         resolve(ready, &TargetAddr::Ip(*socket)).is_ok()
-                            && ready.snapshot.allows(socket.ip(), socket.port(), protocol)
                     })
                     .ok_or(error)?
             }
             Err(error) => return Err(error),
         };
-        if !ready.snapshot.allows(socket.ip(), socket.port(), protocol) {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "Tailscale packet filter denied destination",
-            ));
-        }
+        // PacketFilter 是入站规则（tailscale filter.RunIn），出站恒放行（RunOut），这里不据此拦截；
+        // 对端是否接受由对端自己的过滤器决定（OrynCore#39）
         Ok(socket)
     }
     fn current(&self, ready: &Ready) -> bool {
@@ -323,7 +317,7 @@ impl Outbound for TailscaleOutbound {
     }
     async fn connect_tcp(&self, target: &TargetAddr) -> io::Result<BoxStream> {
         let ready = self.session.ready().await?;
-        let target = self.session.resolve_target(&ready, target, 6).await?;
+        let target = self.session.resolve_target(&ready, target).await?;
         let stream = ready.tunnel.connect_tcp(&ready.endpoints, target).await?;
         if !self.session.current(&ready) {
             return Err(err("Tailscale routes changed during connection"));
@@ -335,7 +329,7 @@ impl Outbound for TailscaleOutbound {
             return Err(crate::unsupported("Tailscale application UDP is disabled"));
         }
         let ready = self.session.ready().await?;
-        self.session.resolve_target(&ready, target, 17).await?;
+        self.session.resolve_target(&ready, target).await?;
         let udp = ready.tunnel.bind_udp(&ready.endpoints).await?;
         Ok(Box::new(Packets {
             session: self.session.clone(),
@@ -454,7 +448,6 @@ async fn tunnel_dns(
         .copied()
         .filter(|r| {
             resolve(ready, &TargetAddr::Ip(*r)).is_ok()
-                && ready.snapshot.allows(r.ip(), r.port(), 17)
         })
         .take(MAX_DNS_ATTEMPTS)
         .collect();
@@ -619,7 +612,7 @@ impl PacketConn for Packets {
         if !self.session.current(&self.ready) {
             return Err(err("Tailscale UDP identity or routes changed"));
         }
-        let target = self.session.resolve_target(&self.ready, target, 17).await?;
+        let target = self.session.resolve_target(&self.ready, target).await?;
         if !self.session.current(&self.ready) {
             return Err(err(
                 "Tailscale UDP identity or routes changed during resolution",
@@ -1110,30 +1103,26 @@ mod tests {
         );
         let public = TargetAddr::Domain("public.example".into(), 53);
         assert_eq!(
-            ts.session
-                .resolve_target(&ready, &public, 17)
-                .await
-                .unwrap(),
+            ts.session.resolve_target(&ready, &public).await.unwrap(),
             "8.8.8.8:53".parse().unwrap()
         );
-        assert!(ts.session.resolve_target(&ready, &public, 6).await.is_err());
+        // PacketFilter 只管入站：过滤器只放行 8.8.8.8:53/udp，出站到其它端口仍允许（OrynCore#39）
+        assert_eq!(
+            ts.session
+                .resolve_target(&ready, &TargetAddr::Ip("8.8.8.8:54".parse().unwrap()))
+                .await
+                .unwrap(),
+            "8.8.8.8:54".parse().unwrap()
+        );
+        // exit node 允许本地 LAN 时，LAN 地址不经隧道；尾网里不存在的名字不外泄
         assert!(ts
             .session
-            .resolve_target(&ready, &TargetAddr::Ip("8.8.8.8:54".parse().unwrap()), 17)
+            .resolve_target(&ready, &TargetAddr::Domain("lan.example".into(), 53))
             .await
             .is_err());
         assert!(ts
             .session
-            .resolve_target(&ready, &TargetAddr::Domain("lan.example".into(), 53), 17)
-            .await
-            .is_err());
-        assert!(ts
-            .session
-            .resolve_target(
-                &ready,
-                &TargetAddr::Domain("missing.example.ts.net".into(), 53),
-                17
-            )
+            .resolve_target(&ready, &TargetAddr::Domain("missing.example.ts.net".into(), 53))
             .await
             .is_err());
         tunnel.close();
