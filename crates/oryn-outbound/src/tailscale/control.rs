@@ -282,31 +282,14 @@ impl Control {
         serde_json::from_slice(&response.all(MAX_HTTP).await?).map_err(io::Error::other)
     }
     async fn post(&mut self, path: &str, body: Value) -> io::Result<Body> {
-        let bytes = Bytes::from(serde_json::to_vec(&body).map_err(io::Error::other)?);
-        let uri = self.url.join(path).map_err(io::Error::other)?.to_string();
-        let req = http::Request::post(uri)
-            .header("content-type", "application/json")
-            .body(())
-            .map_err(io::Error::other)?;
-        self.sender = self
-            .sender
-            .clone()
-            .ready()
-            .await
-            .map_err(io::Error::other)?;
-        let (response, mut tx) = self
-            .sender
-            .send_request(req, false)
-            .map_err(io::Error::other)?;
-        tx.send_data(bytes, true).map_err(io::Error::other)?;
-        let response = response.await.map_err(io::Error::other)?;
-        if !response.status().is_success() {
-            return Err(err("Tailscale control HTTP request failed"));
+        post(&mut self.sender, &self.url, path, body).await
+    }
+    /// 共用同一条 h2 连接、可在另一个任务里发请求（端点更新不能打断 map 流的读取）。
+    pub fn poster(&self) -> Poster {
+        Poster {
+            sender: self.sender.clone(),
+            url: self.url.clone(),
         }
-        Ok(Body {
-            stream: response.into_body(),
-            pending: Bytes::new(),
-        })
     }
     pub async fn map(
         &mut self,
@@ -314,10 +297,75 @@ impl Control {
         keys: &NodeState,
         region: Option<u16>,
         stream: bool,
+        endpoints: &[(std::net::SocketAddr, u8)],
     ) -> io::Result<Body> {
-        self.post("/machine/map",json!({"Version":u16::from(CAP), "NodeKey": keys.node_keys.public.to_string(),
-            "DiscoKey":keys.disco_keys.public.to_string(),"Stream":stream,"KeepAlive":true,"OmitPeers":!stream,
-            "Hostinfo":hostinfo(spec, Some(region.unwrap_or(0))),"Endpoints":[]})).await
+        self.post("/machine/map", map_body(spec, keys, region, stream, endpoints)).await
+    }
+}
+
+/// MapRequest。`Endpoints` 与 `EndpointTypes` 是平行数组（tailcfg.MapRequest，类型为整数）。
+pub fn map_body(
+    spec: &TailscaleSpec,
+    keys: &NodeState,
+    region: Option<u16>,
+    stream: bool,
+    endpoints: &[(std::net::SocketAddr, u8)],
+) -> Value {
+    json!({"Version":u16::from(CAP), "NodeKey": keys.node_keys.public.to_string(),
+        "DiscoKey":keys.disco_keys.public.to_string(),"Stream":stream,"KeepAlive":true,"OmitPeers":!stream,
+        "Hostinfo":hostinfo(spec, Some(region.unwrap_or(0))),
+        "Endpoints": endpoints.iter().map(|(a, _)| a.to_string()).collect::<Vec<_>>(),
+        "EndpointTypes": endpoints.iter().map(|(_, t)| *t).collect::<Vec<_>>()})
+}
+
+async fn post(
+    sender: &mut h2::client::SendRequest<Bytes>,
+    url: &url::Url,
+    path: &str,
+    body: Value,
+) -> io::Result<Body> {
+    let bytes = Bytes::from(serde_json::to_vec(&body).map_err(io::Error::other)?);
+    let uri = url.join(path).map_err(io::Error::other)?.to_string();
+    let req = http::Request::post(uri)
+        .header("content-type", "application/json")
+        .body(())
+        .map_err(io::Error::other)?;
+    *sender = sender.clone().ready().await.map_err(io::Error::other)?;
+    let (response, mut tx) = sender.send_request(req, false).map_err(io::Error::other)?;
+    tx.send_data(bytes, true).map_err(io::Error::other)?;
+    let response = response.await.map_err(io::Error::other)?;
+    if !response.status().is_success() {
+        return Err(err("Tailscale control HTTP request failed"));
+    }
+    Ok(Body {
+        stream: response.into_body(),
+        pending: Bytes::new(),
+    })
+}
+
+/// 在控制连接上另发请求（端点更新）。
+pub struct Poster {
+    sender: h2::client::SendRequest<Bytes>,
+    url: url::Url,
+}
+impl Poster {
+    /// 非流式 MapRequest 上报新端点（OmitPeers），响应体读完丢弃。
+    pub async fn endpoints(
+        &mut self,
+        spec: &TailscaleSpec,
+        keys: &NodeState,
+        region: Option<u16>,
+        endpoints: &[(std::net::SocketAddr, u8)],
+    ) -> io::Result<()> {
+        let mut body = post(
+            &mut self.sender,
+            &self.url,
+            "/machine/map",
+            map_body(spec, keys, region, false, endpoints),
+        )
+        .await?;
+        let _ = body.all(MAX_MAP).await;
+        Ok(())
     }
 }
 

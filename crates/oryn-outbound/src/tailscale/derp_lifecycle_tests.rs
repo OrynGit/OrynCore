@@ -61,12 +61,15 @@ fn pipeline(flush_pending: bool) -> (Relay, DuplexStream, Arc<AtomicBool>) {
         incoming_tx,
         BTreeMap::from([([7; 32], endpoint(0))]),
         routes.clone(),
+        None,
     );
     (
         Relay {
             routes,
             senders: BTreeMap::from([(1, tx)]),
-            direct: BTreeMap::new(),
+            magic: None,
+            sockets: [None, None],
+            endpoints: tokio::sync::watch::channel(Vec::new()).1,
             incoming: Mutex::new(incoming),
             _tasks: tasks,
         },

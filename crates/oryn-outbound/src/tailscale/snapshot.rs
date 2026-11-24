@@ -37,6 +37,15 @@ pub struct Peer {
     pub routes: Vec<oryn_config::IpCidr>,
     pub endpoints: Vec<std::net::SocketAddr>,
     pub online: bool,
+    /// 对端的 disco 公钥（`discokey:<hex>`），没有则不做 disco 探测（OrynCore#41）。
+    pub disco: Option<[u8; 32]>,
+}
+/// DERP 节点上的 STUN 服务：IP（DERPMap 给出的 IPv4 / IPv6）或主机名，端口缺省 3478。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StunServer {
+    pub host: String,
+    pub ips: Vec<IpAddr>,
+    pub port: u16,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AclRule {
@@ -68,6 +77,8 @@ pub struct Snapshot {
     pub region_nodes: BTreeMap<u16, Vec<url::Url>>,
     /// DERP 节点的 `CertName`：证书期望名称，或 `sha256-raw:<hex>` 固定自签证书（自建 derper）。
     pub derp_certs: BTreeMap<url::Url, String>,
+    /// 每个 region 的 STUN 服务（含 STUNOnly 节点；STUNPort 为 -1 的节点不在其中）。
+    pub stun: BTreeMap<u16, Vec<StunServer>>,
     pub dns_resolvers: Vec<std::net::SocketAddr>,
     pub dns_routes: BTreeMap<String, Vec<std::net::SocketAddr>>,
     pub dns_fallback: Vec<std::net::SocketAddr>,
@@ -361,6 +372,32 @@ fn parse_dns(value: &Value) -> io::Result<DnsConfigParts> {
     }
     Ok((defaults, routes, fallback))
 }
+fn disco_key(node: &Value) -> Option<[u8; 32]> {
+    let hex = node["DiscoKey"].as_str()?.strip_prefix("discokey:")?;
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    (out != [0; 32]).then_some(out)
+}
+fn stun_server(node: &Value) -> Option<StunServer> {
+    let port = match node["STUNPort"].as_i64().unwrap_or(0) {
+        0 => 3478,
+        n @ 1..=65535 => n as u16,
+        _ => return None, // -1 关闭 STUN
+    };
+    let host = node["HostName"].as_str().unwrap_or("").to_string();
+    let ips: Vec<IpAddr> = ["IPv4", "IPv6"]
+        .iter()
+        .filter_map(|k| node[*k].as_str())
+        .filter(|v| *v != "none")
+        .filter_map(|v| v.parse().ok())
+        .collect();
+    (!host.is_empty() || !ips.is_empty()).then_some(StunServer { host, ips, port })
+}
 fn name(node: &Value) -> io::Result<String> {
     let name = node["Name"]
         .as_str()
@@ -604,6 +641,7 @@ impl Snapshot {
         self.regions.clear();
         self.region_nodes.clear();
         self.derp_certs.clear();
+        self.stun.clear();
         let own_name = name(&self.own)?;
         if !own_name.is_empty() {
             self.records.insert(own_name, self.own_ips.clone());
@@ -672,6 +710,7 @@ impl Snapshot {
                     routes,
                     endpoints,
                     online: node["Online"].as_bool().unwrap_or(true),
+                    disco: disco_key(node),
                 });
             }
         }
@@ -732,6 +771,12 @@ impl Snapshot {
                 if let Some(nodes) = region["Nodes"].as_array() {
                     let mut urls = Vec::new();
                     for node in nodes {
+                        if let Some(server) = stun_server(node) {
+                            let list = self.stun.entry(id).or_default();
+                            if list.len() < 4 {
+                                list.push(server);
+                            }
+                        }
                         if node["STUNOnly"].as_bool() == Some(true) {
                             continue;
                         }

@@ -197,6 +197,8 @@ pub(crate) fn build_leaf(
 ) -> Option<Arc<dyn Outbound>> {
     let name = spec.name.clone();
     let data_dir = deps.data_dir;
+    // 有 dialer-proxy 时 Tailscale 不做直连 UDP，只走 DERP（Oryn_dev/docs/oryncore/plans/plan-tailscale-disco.md）
+    let direct_udp = spec.dialer.is_none();
     let o: Arc<dyn Outbound> = match &spec.kind {
         OutboundKind::Group(_) => return None,
         OutboundKind::Tailscale(spec) => tailscale::TailscaleOutbound::new(
@@ -206,6 +208,7 @@ pub(crate) fn build_leaf(
             deps.proxy_resolver.clone(),
             datagrams.clone(),
             data_dir,
+            direct_udp,
         ),
         OutboundKind::Direct => Arc::new(DirectOutbound::new(name, deps.direct_dialer.clone())),
         OutboundKind::Reject => Arc::new(RejectOutbound::new(name)),

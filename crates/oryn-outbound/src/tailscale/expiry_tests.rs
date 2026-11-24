@@ -22,6 +22,7 @@ fn fixture() -> (Arc<Session>, Arc<Ready>) {
         resolver,
         datagrams.clone(),
         None,
+        true,
     );
     let mut snapshot = Snapshot::default();
     snapshot
