@@ -1,8 +1,10 @@
 //! JS 在有界 blocking worker 运行，lwIP 事件循环不执行脚本计算。
 use oryn_http_inspect::{Message, ScriptRule};
 use oryn_outbound::Outbound;
+use oryn_script::{BodyData, HostReply, HttpReply};
 use serde_json::{json, Value};
 use std::{
+    borrow::Cow,
     collections::BTreeMap,
     io,
     sync::{Arc, Mutex},
@@ -13,6 +15,7 @@ use tokio::sync::Semaphore;
 pub struct ScriptDone {
     pub message: Option<Message>,
     pub policy: Option<String>,
+    pub body_modified: bool,
 }
 
 pub struct ScriptHost {
@@ -22,21 +25,42 @@ pub struct ScriptHost {
     pub notifications: Mutex<std::collections::VecDeque<Value>>,
     slots: Arc<Semaphore>,
     pending: Arc<Semaphore>,
-    store: Mutex<BTreeMap<String, String>>,
+    store: Mutex<Arc<BTreeMap<String, String>>>,
     path: Option<std::path::PathBuf>,
+    max_heap: usize,
+    max_body: usize,
+    max_scripts: usize,
 }
 impl ScriptHost {
     pub fn new(dir: Option<&std::path::Path>) -> Self {
+        Self::new_with_limits(
+            dir,
+            oryn_script::HEAP_LIMIT,
+            oryn_http_inspect::MAX_BODY,
+            256,
+        )
+    }
+    pub fn new_with_limits(
+        dir: Option<&std::path::Path>,
+        max_heap: usize,
+        max_body: usize,
+        max_scripts: usize,
+    ) -> Self {
         let path = dir.map(|d| d.join("script-store.json"));
-        let store = path
+        let store: BTreeMap<String, String> = path
             .as_ref()
             .and_then(|p| {
                 std::fs::metadata(p)
                     .ok()
-                    .filter(|m| m.len() <= 524288)
+                    .filter(|m| m.len() <= (oryn_script::MAX_STORE_BYTES * 2) as u64)
                     .and_then(|_| std::fs::read(p).ok())
             })
-            .and_then(|v| serde_json::from_slice(&v).ok())
+            .and_then(|v| serde_json::from_slice::<BTreeMap<String, String>>(&v).ok())
+            .filter(|m| {
+                m.len() <= oryn_script::MAX_STORE_KEYS
+                    && m.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>()
+                        <= oryn_script::MAX_STORE_BYTES
+            })
             .unwrap_or_default();
         Self {
             generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -45,13 +69,19 @@ impl ScriptHost {
             notifications: Mutex::new(Default::default()),
             slots: Arc::new(Semaphore::new(1)),
             pending: Arc::new(Semaphore::new(64)),
-            store: Mutex::new(store),
+            store: Mutex::new(Arc::new(store)),
             path,
+            max_heap,
+            max_body,
+            max_scripts,
         }
+    }
+    pub fn max_scripts(&self) -> usize {
+        self.max_scripts
     }
     fn record_result(&self, name: &str, result: Value) {
         let mut results = self.results.lock().unwrap();
-        if results.len() >= 64 && !results.contains_key(name) {
+        if results.len() >= 128 && !results.contains_key(name) {
             if let Some(first) = results.keys().next().cloned() {
                 results.remove(&first);
             }
@@ -77,7 +107,8 @@ impl ScriptHost {
         response: Option<&mut Message>,
         outbound: Arc<dyn Outbound>,
     ) -> io::Result<ScriptDone> {
-        if spec.requires_body && response.as_deref().unwrap_or(request).body.len() > spec.max_size {
+        let max_size = spec.max_size.min(self.max_body);
+        if spec.requires_body && response.as_deref().unwrap_or(request).body.len() > max_size {
             return Err(io::Error::other("script max-size exceeded"));
         }
         let epoch = self.generation.load(std::sync::atomic::Ordering::Relaxed);
@@ -86,8 +117,8 @@ impl ScriptHost {
             .clone()
             .try_acquire_owned()
             .map_err(|_| io::Error::other("script pending queue is full"))?;
-        // 只有一个 worker（每个脚本堆最多 8 MiB，Extension 内存预算放不下并发）。排队最多等一个
-        // timeout；拿到槽位后才开始计脚本自身的 timeout，排队时间不挤占执行预算。
+        // 只有一个 worker（避免多份脚本堆叠加）。排队最多等一个 timeout；
+        // 拿到槽位后才开始计脚本自身的 timeout，排队时间不挤占执行预算。
         let permit = tokio::time::timeout(
             Duration::from_secs(spec.timeout),
             self.slots.clone().acquire_owned(),
@@ -112,33 +143,25 @@ impl ScriptHost {
             if let Some(status) = m.status {
                 v["status"] = status.into();
             }
-            if spec.requires_body {
-                v["body"] = if spec.binary {
-                    json!(m.body)
-                } else {
-                    String::from_utf8_lossy(&m.body).into_owned().into()
-                };
-            }
             v
         };
-        let decoded_request = if spec.requires_body {
-            let mut r = request.clone();
-            r.body = oryn_http_inspect::decode_body(&r)?;
-            Some(r)
+        let request_body = if spec.requires_body {
+            if response.is_some() && request.body.len() > max_size {
+                BodyData::None
+            } else {
+                body_for_script(request, max_size, spec.binary)?
+            }
         } else {
-            None
+            BodyData::None
         };
-        let decoded_response = if spec.requires_body {
+        let response_body = if spec.requires_body {
             response
                 .as_deref()
-                .map(|r| {
-                    let mut r = r.clone();
-                    r.body = oryn_http_inspect::decode_body(&r)?;
-                    Ok::<_, io::Error>(r)
-                })
+                .map(|r| body_for_script(r, max_size, spec.binary))
                 .transpose()?
+                .unwrap_or(BodyData::None)
         } else {
-            None
+            BodyData::None
         };
         let input = oryn_script::Input {
             cancellation: Some((self.generation.clone(), epoch)),
@@ -150,20 +173,21 @@ impl ScriptHost {
             cron: spec.cron.clone(),
             kind: spec.kind.clone(),
             loon: spec.dialect == oryn_module::ModuleFormat::Loon,
-            request: to_json(decoded_request.as_ref().unwrap_or(request)),
-            response: decoded_response
-                .as_ref()
-                .or(response.as_deref())
-                .map(to_json)
-                .unwrap_or(Value::Null),
+            request: to_json(request),
+            response: response.as_deref().map(to_json).unwrap_or(Value::Null),
+            request_body,
+            response_body,
             argument: spec.argument.clone(),
-            env: spec.env.clone(),
+            env: Arc::clone(&spec.env),
             binary: spec.binary,
             timeout: deadline.saturating_duration_since(std::time::Instant::now()),
             name: spec.name.clone(),
-            store: self.store.lock().unwrap().clone(),
+            store: Arc::clone(&*self.store.lock().unwrap()),
+            max_heap: self.max_heap,
+            max_body: self.max_body,
         };
         let code = spec.code.clone();
+        let host_max_body = self.max_body;
         let handle = tokio::runtime::Handle::current();
         let (routing, dns) = self
             .network
@@ -173,7 +197,7 @@ impl ScriptHost {
             .map(|(r, d)| (Some(r), Some(d)))
             .unwrap_or((None, None));
         let (output,_permit)=tokio::task::spawn_blocking(move||{let result=oryn_script::run(code.as_str(),input,move |options|{
-            if let Some(name)=options["control"].as_str(){return control(routing.as_deref(),name,&options)}
+            if let Some(name)=options["control"].as_str(){return control(routing.as_deref(),name,&options).map(HostReply::Control)}
             let url=options["url"].as_str().ok_or("script HTTP URL missing")?;
             let mut headers=options["headers"].as_object().map(|o|o.iter().filter_map(|(k,v)|Some((k.as_str(),v.as_str()?))).collect::<Vec<_>>()).unwrap_or_default();
             // 脚本未指定 UA 时与 Surge 一致，带上模块下载同款 UA（部分站点只放行 Surge / Loon / Clash 系）。
@@ -190,30 +214,58 @@ impl ScriptHost {
                 selected=oryn_outbound::resolve(&routing.outbounds[index],&oryn_outbound::PickMeta{source:None,target:&target,network:oryn_router::Network::Tcp}).ok_or("script HTTP route rejected")?.leaf;
             }
             let req=oryn_http::Request{method:options["method"].as_str().unwrap_or("GET"),url,headers:&headers,body:&body};
-            let response=handle.block_on(oryn_http::fetch(&oryn_http::OutboundConnector(selected),req,&oryn_http::Options{max_body:1024*1024,timeout:deadline.saturating_duration_since(std::time::Instant::now()).min(Duration::from_secs(5)),max_redirects:3,skip_verify:false})).map_err(|e|e.to_string())?;
-            Ok(json!({"response":{"status":response.status,"headers":response.headers.into_iter().collect::<BTreeMap<_,_>>()},"binary":options["binary-mode"].as_bool().unwrap_or(false),"data":if options["binary-mode"].as_bool()==Some(true){json!(response.body)}else{Value::String(String::from_utf8_lossy(&response.body).into_owned())}}))
+            let response=handle.block_on(oryn_http::fetch(&oryn_http::OutboundConnector(selected),req,&oryn_http::Options{max_body:host_max_body,timeout:deadline.saturating_duration_since(std::time::Instant::now()).min(Duration::from_secs(30)),max_redirects:3,skip_verify:false})).map_err(|e|e.to_string())?;
+            let binary=options["binary-mode"].as_bool()==Some(true);
+            let body=if binary{
+                BodyData::Binary(response.body)
+            }else{
+                let text=match String::from_utf8(response.body){
+                    Ok(s)=>s,
+                    Err(e)=>String::from_utf8_lossy(e.as_bytes()).into_owned(),
+                };
+                BodyData::Text(text)
+            };
+            Ok(HostReply::Http(HttpReply{status:response.status,headers:response.headers.into_iter().collect(),body,binary}))
         });
-        // 脚本堆（最多 8 MiB）在本线程分配，用完就把空页还给系统
+        // 脚本堆在本线程分配，用完就把空页还给系统
         crate::alloc::trim();
         (result,permit)}).await.map_err(io::Error::other)?;
         let output = output.map_err(io::Error::other)?;
         if self.generation.load(std::sync::atomic::Ordering::Relaxed) != epoch {
             return Err(io::Error::other("script cancelled by reload"));
         }
-        // 多数脚本不写 $persistentStore：内容没变时不落盘，避免每个请求一次同步磁盘写。
-        let changed = {
-            let mut store = self.store.lock().unwrap();
-            let changed = *store != output.store;
-            if changed {
-                *store = output.store;
+        // 仅在发生写/删键时才拷贝持久存储并落盘，避免每次执行全量拷贝与写盘。
+        if !output.store_delta.is_empty() {
+            let snapshot = {
+                let mut guard = self.store.lock().unwrap();
+                let mut next = (**guard).clone();
+                for (k, v) in output.store_delta {
+                    match v {
+                        Some(val) => {
+                            next.insert(k, val);
+                        }
+                        None => {
+                            next.remove(&k);
+                        }
+                    }
+                }
+                let total_bytes: usize = next.iter().map(|(k, v)| k.len() + v.len()).sum();
+                if next.len() <= oryn_script::MAX_STORE_KEYS
+                    && total_bytes <= oryn_script::MAX_STORE_BYTES
+                {
+                    let arc = Arc::new(next);
+                    *guard = Arc::clone(&arc);
+                    Some(arc)
+                } else {
+                    None
+                }
+            };
+            if let (Some(store), Some(path)) = (snapshot, &self.path) {
+                let bytes = serde_json::to_vec(&*store)?;
+                let temp = path.with_extension("tmp");
+                std::fs::write(&temp, bytes)?;
+                std::fs::rename(temp, path)?;
             }
-            changed
-        };
-        if let (true, Some(path)) = (changed, &self.path) {
-            let bytes = serde_json::to_vec(&*self.store.lock().unwrap())?;
-            let temp = path.with_extension("tmp");
-            std::fs::write(&temp, bytes)?;
-            std::fs::rename(temp, path)?;
         }
         for line in output.logs {
             log::info!("script {}: {line}", spec.name);
@@ -235,19 +287,30 @@ impl ScriptHost {
                 "script aborted HTTP request",
             ));
         }
-        let mut m = response
-            .as_deref()
-            .cloned()
-            .unwrap_or_else(|| request.clone());
         let local = result.get("response").is_some();
-        if local {
+        let returned_body = if local {
+            output.response_body
+        } else {
+            output.body
+        };
+        let has_new_body = !matches!(returned_body, BodyData::None);
+        let mut m = if local {
             result = result["response"].clone();
-            m = request.response(
+            request.response(
                 result["status"].as_u64().unwrap_or(200) as u16,
                 vec![],
                 "text/plain",
-            );
-        }
+            )
+        } else {
+            let meta = response.as_deref().unwrap_or(request);
+            Message {
+                url: meta.url.clone(),
+                method: meta.method.clone(),
+                status: meta.status,
+                headers: meta.headers.clone(),
+                body: Vec::new(),
+            }
+        };
         let new_url = result["url"].as_str().filter(|u| *u != m.url).map(str::to_owned);
         if let Some(url) = &new_url {
             m.url = url.clone();
@@ -303,7 +366,7 @@ impl ScriptHost {
         {
             return Err(io::Error::other("script headers exceed limit"));
         }
-        if !local && result.get("body").is_none() {
+        if !local && !has_new_body {
             let original = response.as_deref().unwrap_or(request);
             for key in ["Content-Length", "Transfer-Encoding"] {
                 if m.header(key) != original.header(key) {
@@ -313,26 +376,18 @@ impl ScriptHost {
                 }
             }
         }
-        if let Some(body) = result.get("body") {
+        if has_new_body {
             if !spec.requires_body && !local {
                 return Err(io::Error::other(
                     "script returned body without requires-body",
                 ));
             }
-            m.body = if let Some(s) = body.as_str() {
-                s.as_bytes().to_vec()
-            } else {
-                body.as_array()
-                    .ok_or_else(|| io::Error::other("script body is not string/bytes"))?
-                    .iter()
-                    .map(|v| {
-                        v.as_u64()
-                            .and_then(|n| u8::try_from(n).ok())
-                            .ok_or_else(|| io::Error::other("invalid script body byte"))
-                    })
-                    .collect::<io::Result<Vec<_>>>()?
+            m.body = match returned_body {
+                BodyData::Text(s) => s.into_bytes(),
+                BodyData::Binary(b) => b,
+                BodyData::None => unreachable!(),
             };
-            if m.body.len() > oryn_http_inspect::MAX_BODY {
+            if m.body.len() > self.max_body {
                 return Err(io::Error::other("script output body exceeds limit"));
             }
             m.delete_header("Content-Encoding");
@@ -345,14 +400,24 @@ impl ScriptHost {
             strip_policy_headers(&mut m);
             None
         };
-        if let Some(response) = response {
-            *response = m;
-            Ok(ScriptDone { message: None, policy: None })
+        if let Some(resp) = response {
+            if !has_new_body && !local {
+                m.body = std::mem::take(&mut resp.body);
+            }
+            *resp = m;
+            Ok(ScriptDone {
+                message: None,
+                policy: None,
+                body_modified: has_new_body || local,
+            })
         } else {
-            Ok(ScriptDone { message: Some(m), policy })
+            Ok(ScriptDone {
+                message: Some(m),
+                policy,
+                body_modified: has_new_body || local,
+            })
         }
     }
-
     /// 按策略组或节点名选出这条请求的叶子出站。名称必须与 `tag` 完全一致。
     pub fn policy_outbound(&self, policy: &str, host: &str, port: u16) -> io::Result<Arc<dyn Outbound>> {
         let guard = self.network.read().unwrap();
@@ -363,6 +428,21 @@ impl ScriptHost {
             .map(|resolved| resolved.leaf)
             .ok_or_else(|| io::Error::other(format!("script policy {policy} rejected the connection")))
     }
+}
+
+fn body_for_script(message: &Message, max_size: usize, binary: bool) -> io::Result<BodyData> {
+    let decoded = oryn_http_inspect::decode_body_cow(message, max_size)?;
+    if binary {
+        return Ok(BodyData::Binary(decoded.into_owned()));
+    }
+    let text = match decoded {
+        Cow::Borrowed(slice) => String::from_utf8_lossy(slice).into_owned(),
+        Cow::Owned(bytes) => match String::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+        },
+    };
+    Ok(BodyData::Text(text))
 }
 
 const POLICY_HEADERS: &[&str] = &["X-Surge-Policy", "X-Surge-Proxy", "X-Stash-Selected-Proxy"];
@@ -417,7 +497,7 @@ pub fn event(state: &std::rc::Rc<crate::context::RuntimeState>, name: &str) {
         .scripts
         .iter()
         .filter(|s| s.enabled && s.kind == "event" && s.event.as_deref() == Some(name))
-        .take(64)
+        .take(state.scripts.max_scripts())
     {
         let st = state.clone();
         let spec = spec.clone();
@@ -431,7 +511,7 @@ pub fn schedule(state: &std::rc::Rc<crate::context::RuntimeState>) {
         .scripts
         .iter()
         .filter(|s| s.enabled && s.kind == "cron")
-        .take(64)
+        .take(state.scripts.max_scripts())
     {
         let Some(expression) = &spec.cron else {
             continue;

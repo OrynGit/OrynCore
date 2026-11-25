@@ -199,3 +199,38 @@ fn mieru_session_limits_follow_resource_profile() {
     #[cfg(target_os = "ios")]
     assert_eq!(ResourceProfile::MobilePlus.limits().mieru_sessions, 256);
 }
+
+#[test]
+fn script_and_http_inspection_limits_follow_resource_profile() {
+    let constrained = ResourceProfile::Constrained.limits();
+    assert_eq!(constrained.http_body_budget, 6 << 20);
+    assert_eq!(constrained.http_max_body, 4 << 20);
+    assert_eq!(constrained.script_heap_limit, 16 << 20);
+    assert_eq!(constrained.max_modules, 128);
+    assert_eq!(constrained.max_scripts, 256);
+    assert_eq!(constrained.max_module_resources, 16 << 20);
+    assert_eq!(constrained.inspect_limits().max_body, 4 << 20);
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let desktop = ResourceProfile::DesktopHigh.limits();
+        assert_eq!(desktop.http_body_budget, 24 << 20);
+        assert_eq!(desktop.http_max_body, 8 << 20);
+        assert_eq!(desktop.script_heap_limit, 32 << 20);
+        assert_eq!(desktop.max_modules, 256);
+        assert_eq!(desktop.max_scripts, 512);
+        assert_eq!(desktop.max_module_resources, 64 << 20);
+        assert_eq!(desktop.inspect_limits().max_body, 8 << 20);
+    }
+
+    #[cfg(target_os = "ios")]
+    {
+        let mobile = ResourceProfile::MobilePlus.limits();
+        assert_eq!(mobile.http_body_budget, 6 << 20);
+        assert_eq!(mobile.http_max_body, 4 << 20);
+        assert_eq!(mobile.script_heap_limit, 16 << 20);
+        assert_eq!(mobile.max_modules, 128);
+        assert_eq!(mobile.max_scripts, 256);
+        assert_eq!(mobile.max_module_resources, 16 << 20);
+    }
+}

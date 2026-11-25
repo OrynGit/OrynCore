@@ -443,7 +443,7 @@ fn corpus_modules() {
         r["group_admitted"] = json!(admitted);
         let count = r["plan"]["scripts"].as_u64().unwrap_or(0);
         let retained = if admitted {
-            count.min(64u64.saturating_sub(scripts))
+            count.min(256u64.saturating_sub(scripts))
         } else {
             0
         };
@@ -456,7 +456,7 @@ fn corpus_modules() {
                 detail["group_drop_reason"] = json!(if !admitted {
                     "module_not_admitted"
                 } else if (i as u64) >= retained {
-                    "script_limit_64"
+                    "script_limit_256"
                 } else {
                     "retained"
                 });
@@ -474,7 +474,7 @@ fn corpus_modules() {
             .map(|r| r[field].as_u64().unwrap_or(0))
             .sum::<u64>()
     };
-    let report = json!({"mode":mode,"modules":reports,"summary":{"resource_bytes":sum("resource_bytes",false),"enabled_resource_bytes":sum("resource_bytes",true),"enabled_module_bytes":sum("module_bytes",true),"resource_limit_bytes":MAX_RESOURCES,"enabled_over_8mib":sum("module_bytes",true)>MAX_RESOURCES as u64,"admitted_module_bytes":admitted_bytes,"admitted_scripts":scripts,"script_limit":64,"scripts_over_limit":scripts>64,"scripts_after_truncation":scripts.min(64)}});
+    let report = json!({"mode":mode,"modules":reports,"summary":{"resource_bytes":sum("resource_bytes",false),"enabled_resource_bytes":sum("resource_bytes",true),"enabled_module_bytes":sum("module_bytes",true),"resource_limit_bytes":MAX_RESOURCES,"enabled_over_limit":sum("module_bytes",true)>MAX_RESOURCES as u64,"admitted_module_bytes":admitted_bytes,"admitted_scripts":scripts,"script_limit":256,"scripts_over_limit":scripts>256,"scripts_after_truncation":scripts.min(256)}});
     if !evaluate {
         std::fs::write(
             root.join("refs.json"),

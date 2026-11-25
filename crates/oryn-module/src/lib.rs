@@ -1,7 +1,7 @@
 //! Surge/Loon 文本输入。保留来源顺序、方言和参数；不执行网络请求或脚本。
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-pub const MAX_MODULE_BYTES: usize = 2 * 1024 * 1024;
+pub const MAX_MODULE_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_LINES: usize = 32768;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ModuleFormat {

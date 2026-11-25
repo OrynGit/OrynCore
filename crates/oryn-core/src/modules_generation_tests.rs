@@ -39,7 +39,12 @@ fn prepared_sidecar_equivalence_bounds_allowed_and_cancel() {
         let prepared = prepare_for_apply(&ctx, jq_config()).await;
         assert_eq!(prepared.plans.len(), 1);
         assert!(Rc::ptr_eq(&before, &ctx.state()));
-        let fresh = validate(&prepared.config.modules[0]).unwrap();
+        let fresh = validate_with(
+            &prepared.config.modules[0],
+            ctx.resource_limits().max_module_resources,
+            ctx.resource_limits().inspect_limits(),
+        )
+        .unwrap();
         assert_eq!(format!("{:?}", prepared.plans[0].1), format!("{fresh:?}"));
         let released = program_released(&prepared.plans[0].1);
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -68,11 +73,11 @@ fn prepared_sidecar_equivalence_bounds_allowed_and_cancel() {
         let spec = candidate.modules[0].clone();
         candidate.modules = vec![spec.clone(); 200];
         for m in &mut candidate.modules { m.enabled = false; }
-        candidate.modules.extend(vec![spec; 65]);
+        candidate.modules.extend(vec![spec; 257]);
         let prepared = prepare_for_apply(&ctx, candidate).await;
-        assert_eq!(prepared.plans.len(), 64);
+        assert_eq!(prepared.plans.len(), 256);
         assert_eq!(prepared.plans[0].0, 200);
-        assert_eq!(prepared.plans.last().unwrap().0, 263);
+        assert_eq!(prepared.plans.last().unwrap().0, 455);
         assert!(prepare_inner(&ctx, jq_config(), false).await.plans.is_empty());
     });
 }
@@ -100,8 +105,19 @@ fn prepared_script_env_and_compile_warnings_match_fresh() {
         assert_eq!(prepared.plans[0].1.scripts.len(), 1);
         assert!(prepared.plans[0].1.scripts[0].env.is_empty(), "env belongs only to apply");
         let compile_warnings = prepared.plans[0].1.warnings.clone();
-        assert_eq!(compile_warnings.len(), 1, "{compile_warnings:?}");
-        assert!(compile_warnings[0].starts_with("module:4: rewrite skipped: jq parse error:"));
+        assert_eq!(compile_warnings.len(), 2, "{compile_warnings:?}");
+        assert!(
+            compile_warnings
+                .iter()
+                .any(|w| w.starts_with("module:4: rewrite skipped: jq parse error:")),
+            "{compile_warnings:?}"
+        );
+        assert!(
+            compile_warnings
+                .iter()
+                .any(|w| w.contains("Oryn script resource limits:")),
+            "{compile_warnings:?}"
+        );
         let fresh_config = prepared.config.clone();
         ctx.apply_prepared(prepared);
         assert_eq!(ctx.state().http_plan.scripts[0].env["prepared_env"], "present");
@@ -296,4 +312,46 @@ fn startup_prepare_uses_stale_cache_and_defers_missing_without_network() {
         assert!(!dir.join("modules/.validated").exists() || std::fs::read_dir(dir.join("modules/.validated")).unwrap().next().is_none());
     });
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn duplicate_external_resources_are_deduplicated_across_modules() {
+    let _lock = crate::udp::performance_survey::STACK_LOCK.lock().unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    tokio::task::LocalSet::new().block_on(&rt, async {
+        let dir = std::env::temp_dir().join(format!("oryn-dedup-modules-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let url = "https://dedup.invalid/shared.js";
+        let downloads = dir.join("modules/.downloads");
+        std::fs::create_dir_all(&downloads).unwrap();
+        let file = downloads.join(format!("{:x}", Sha256::digest(url.as_bytes())));
+        // 每份 ~3 MiB；Constrained 下限为 16 MiB，若不去重 6 个模块合计 >18 MiB 会拒绝第 6 个。
+        let mut script = b"$done({});//".to_vec();
+        script.resize(3 * 1024 * 1024, b'a');
+        std::fs::write(&file, &script).unwrap();
+        let ctx = EngineCtx::new(
+            oryn_netstack::LwipStack::new(1500).unwrap(),
+            config(),
+            crate::options::EngineOptions {
+                resource_profile: crate::options::ResourceProfile::Constrained,
+                data_dir: Some(dir.clone()),
+                ..Default::default()
+            },
+            std::sync::Arc::new(crate::stats::Stats::default()),
+        );
+        let mut yaml = String::from("rules: ['MATCH,DIRECT']\nmodules:\n");
+        for i in 0..6 {
+            yaml.push_str(&format!(
+                "  - format: surge\n    inline: |\n      #!name=shared-{i}\n      [Script]\n      s-{i} = type=http-request, pattern=^http://dedup\\.invalid/{i}$, script-path={url}\n"
+            ));
+        }
+        let candidate = crate::proxy_providers::compile(&yaml, None, None).unwrap();
+        let prepared = prepare_for_apply(&ctx, candidate).await;
+        assert!(prepared.config.modules.iter().all(|m| m.enabled), "{:?}", prepared.config.warnings);
+        let first_ptr = std::sync::Arc::as_ptr(&prepared.config.modules[0].resources[url]);
+        for m in &prepared.config.modules {
+            assert_eq!(std::sync::Arc::as_ptr(&m.resources[url]), first_ptr);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    });
 }

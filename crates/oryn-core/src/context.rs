@@ -251,12 +251,19 @@ impl EngineCtx {
             resource_revision: Cell::new(0),
             proxy_provider_overrides: RefCell::new(HashMap::new()),
             mitm_ca_cache: RefCell::new(None),
-            script_host: Arc::new(crate::scripts::ScriptHost::new(options.data_dir.as_deref())),
+            script_host: Arc::new(crate::scripts::ScriptHost::new_with_limits(
+                options.data_dir.as_deref(),
+                limits.script_heap_limit,
+                limits.http_max_body,
+                limits.max_scripts,
+            )),
             http_transactions: limits
                 .http_transactions
                 .map(tokio::sync::Semaphore::new)
                 .map(Arc::new),
-            http_bodies: Arc::new(tokio::sync::Semaphore::new(limits.http_bodies)),
+            http_bodies: Arc::new(tokio::sync::Semaphore::new(
+                crate::http::body_budget_pages(limits.http_body_budget),
+            )),
             http_connections: limits
                 .http_connections
                 .map(tokio::sync::Semaphore::new)
@@ -302,6 +309,10 @@ impl EngineCtx {
 
     pub fn data_dir(&self) -> Option<&Path> {
         self.options.data_dir.as_deref()
+    }
+
+    pub(crate) fn resource_limits(&self) -> crate::options::ResourceLimits {
+        self.options.resource_profile.limits()
     }
 
     /// 代理测试地址（首页「代理」一段与策略组测速共用），未设置时用配置格式的默认值。
@@ -534,8 +545,13 @@ impl EngineCtx {
                     }
                 }
             }
+            let limits = self.options.resource_profile.limits();
+            let inspect_limits = limits.inspect_limits();
             let mut plans = plans.into_iter().peekable();
-            let mut plan = HttpPlan::default();
+            let mut plan = HttpPlan {
+                max_body: limits.http_max_body,
+                ..HttpPlan::default()
+            };
             for (index, spec) in config
                 .modules
                 .iter_mut()
@@ -554,19 +570,21 @@ impl EngineCtx {
                     };
                     let compiled = match cached {
                         Some(plan) => Ok(plan),
-                        None => oryn_http_inspect::compile_module_with_policies(
+                        None => oryn_http_inspect::compile_module_with_limits(
                             ir,
                             &spec.arguments.iter().cloned().collect(),
                             &spec.resources,
                             &spec.policy_map,
+                            inspect_limits,
                         ),
                     };
                     match compiled {
                         Ok(p) => {
+                            let env = Arc::new(spec.env.clone());
                             plan.request.extend(p.request);
                             plan.response.extend(p.response);
                             plan.scripts.extend(p.scripts.into_iter().map(|mut s| {
-                                s.env = spec.env.clone();
+                                s.env = Arc::clone(&env);
                                 s
                             }));
                             module_compile_warnings.extend(p.warnings.iter().cloned());
@@ -582,9 +600,9 @@ impl EngineCtx {
                 }
             }
             drop(plans);
-            if plan.scripts.len() > 64 {
-                plan.scripts.truncate(64);
-                let msg = "script count exceeds 64".to_string();
+            if plan.scripts.len() > limits.max_scripts {
+                plan.scripts.truncate(limits.max_scripts);
+                let msg = format!("script count exceeds {}", limits.max_scripts);
                 module_compile_warnings.push(msg.clone());
                 config.warnings.push(msg);
             }
@@ -798,7 +816,13 @@ fn empty_state(config: &RuntimeConfig, health: &Arc<HealthStore>) -> RuntimeStat
         scripts: Arc::new(crate::scripts::ScriptHost::new(None)),
         mitm_ca: None,
         http_transactions: Some(Arc::new(tokio::sync::Semaphore::new(32))),
-        http_bodies: Arc::new(tokio::sync::Semaphore::new(2)),
+        http_bodies: Arc::new(tokio::sync::Semaphore::new(
+            crate::http::body_budget_pages(
+                crate::options::ResourceProfile::default()
+                    .limits()
+                    .http_body_budget,
+            ),
+        )),
         geo_started: Cell::new(true),
         needs_geo: false,
         tasks: RefCell::new(Vec::new()),

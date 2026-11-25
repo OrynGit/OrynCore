@@ -14,11 +14,11 @@ use std::{
 };
 
 /// 只编译不执行时的堆上限。
-pub const COMPILE_HEAP_LIMIT: usize = 16 * 1024 * 1024;
+pub const COMPILE_HEAP_LIMIT: usize = 24 * 1024 * 1024;
 /// 小于此大小的脚本在执行堆内总能解析，不查缓存。
 const MIN_SOURCE: usize = 128 * 1024;
-const MAX_BYTECODE: usize = 8 * 1024 * 1024;
-const MAX_CACHE: u64 = 48 * 1024 * 1024;
+const MAX_BYTECODE: usize = 12 * 1024 * 1024;
+const MAX_CACHE: u64 = 64 * 1024 * 1024;
 /// 缓存文件头：魔数 + 键哈希（QuickJS 版本与源码）+ 字节码内容哈希。读取时两者都核对，
 /// 被截断、篡改或跨版本残留的文件不会进入 `JS_ReadObject`。
 const MAGIC: &[u8; 8] = b"ORYNQBC1";
@@ -185,7 +185,7 @@ fn compile(code: &str) -> std::io::Result<Vec<u8>> {
             let len = len as usize;
             let out = (len <= MAX_BYTECODE).then(|| std::slice::from_raw_parts(buf, len).to_vec());
             qjs::js_free(raw, buf as _);
-            out.ok_or_else(|| Error::new(ErrorKind::Unsupported, "script bytecode exceeds 8 MiB"))
+            out.ok_or_else(|| Error::new(ErrorKind::Unsupported, "script bytecode exceeds 12 MiB"))
         }
     })
 }
@@ -199,7 +199,7 @@ fn compile_error(ctx: &Ctx) -> Error {
     if message.contains("out of memory") || message.contains("stack overflow") {
         Error::new(
             ErrorKind::Unsupported,
-            "script exceeds the 16 MiB compile heap",
+            "script exceeds the 24 MiB compile heap",
         )
     } else {
         Error::new(
@@ -242,7 +242,7 @@ pub(crate) fn eval(ctx: &Ctx, bytes: &[u8]) -> Eval {
     Eval::Ran(Ok(()))
 }
 
-/// 按修改时间淘汰旧字节码，目录总量不超过 48 MiB；保留刚写入的文件。
+/// 按修改时间淘汰旧字节码，目录总量不超过 64 MiB；保留刚写入的文件。
 fn trim(dir: &Path, keep: &Path) -> std::io::Result<()> {
     let mut files = std::fs::read_dir(dir)?
         .filter_map(Result::ok)

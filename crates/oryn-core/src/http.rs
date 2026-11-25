@@ -9,7 +9,7 @@ use hyper::{
 };
 use hyper_util::rt::{TokioIo, TokioTimer};
 use oryn_config::TargetAddr;
-use oryn_http_inspect::{Message, Plan, MAX_BODY};
+use oryn_http_inspect::{Message, Plan};
 use oryn_outbound::Outbound;
 use std::{
     collections::VecDeque,
@@ -28,6 +28,11 @@ use tokio::{
     task::JoinHandle,
 };
 type BoxBody = UnsyncBoxBody<Bytes, io::Error>;
+/// 正文预算按 4 KiB 页计费，小正文可高并发共享同一预算池，大正文按实际页数扣减。
+pub(crate) const BODY_PAGE: usize = 4096;
+pub(crate) fn body_budget_pages(bytes: usize) -> usize {
+    bytes.max(1).div_ceil(BODY_PAGE)
+}
 fn err(e: impl std::fmt::Display) -> io::Error {
     io::Error::other(e.to_string())
 }
@@ -51,6 +56,7 @@ pub struct Inspector {
     pub transactions: Option<Arc<Semaphore>>,
     pub upstream_establish: Arc<Semaphore>,
     pub bodies: Arc<Semaphore>,
+    pub max_body: usize,
 }
 impl Inspector {
     pub async fn serve<S: AsyncRead + AsyncWrite + Unpin + 'static>(
@@ -62,7 +68,7 @@ impl Inspector {
             let this = self.clone();
             async move {
                 let response =
-                    match tokio::time::timeout(Duration::from_secs(60), this.exchange(req)).await {
+                    match tokio::time::timeout(Duration::from_secs(120), this.exchange(req)).await {
                         Ok(Ok(r)) => r,
                         Ok(Err(e)) if e.kind() == io::ErrorKind::ConnectionAborted => {
                             return Err(e)
@@ -165,8 +171,8 @@ impl Inspector {
             return Ok(error_response(421));
         }
         let need = self.plan.needs_body_after_rewrite(&message, None);
-        let (mut body, buffer, permit, request_trailers) =
-            buffer_if_needed(body, need, self.bodies.clone()).await?;
+        let (passthrough_body, buffer, permit, request_trailers) =
+            buffer_if_needed(body, need, self.bodies.clone(), self.max_body).await?;
         let buffered = buffer.is_some();
         let request_trailer_names = trailer_names(request_trailers.as_ref());
         if need && !buffered {
@@ -175,7 +181,6 @@ impl Inspector {
         if let Some(data) = buffer {
             message.body = data;
         }
-        let original = message.body.clone();
         // 完整Rewrite只执行一次；请求脚本按改写后的URL/headers选择。
         let (mock, body_rewritten) = self.plan.apply_request_with_effects(&mut message)?;
         if let Some(mock) = mock {
@@ -205,7 +210,10 @@ impl Inspector {
                     return self.local_response(done.message.unwrap(), _transaction, permit)
                 }
                 Ok(done) => {
-                    if let Some(updated) = done.message {
+                    if let Some(mut updated) = done.message {
+                        if !done.body_modified {
+                            updated.body = std::mem::take(&mut message.body);
+                        }
                         message = updated;
                     }
                     if done.policy.is_some() {
@@ -216,13 +224,27 @@ impl Inspector {
                 Err(e) => log::warn!("HTTP request script {} skipped: {e}", spec.name),
             }
         }
-        if message.body != original {
-            body = full_trailers(message.body.clone(), request_trailers);
-        }
-        // 请求正文和 response 脚本的请求快照共享同一配额，直到本次 exchange 完成。
-        let _request_body_permit = permit;
-        let request_meta = message.clone();
-        let target: Uri = message.url.parse().map_err(err)?;
+        // 无 response 正文脚本时无需跨网络等待期保留请求正文与页面配额，发送完毕即由 GuardedBody 释放。
+        let keep_req_body = buffered && self.plan.has_response_body_scripts();
+        let (body, _request_body_permit, request_meta) = if buffered {
+            if keep_req_body {
+                let body = full_trailers(message.body.clone(), request_trailers);
+                (body, permit, message)
+            } else {
+                let req_body = std::mem::take(&mut message.body);
+                let inner = full_trailers(req_body, request_trailers);
+                let body = GuardedBody {
+                    inner,
+                    _permit: permit,
+                }
+                .boxed_unsync();
+                (body, None, message)
+            }
+        } else {
+            let body = passthrough_body.expect("unbuffered request must have passthrough body");
+            (body, None, message)
+        };
+        let target: Uri = request_meta.url.parse().map_err(err)?;
         let host = target.host().ok_or_else(|| err("HTTP URL missing host"))?;
         let https = target.scheme_str() == Some("https");
         let port = target.port_u16().unwrap_or(if https { 443 } else { 80 });
@@ -267,9 +289,9 @@ impl Inspector {
             (tcp, false)
         };
         let mut outgoing = Request::builder()
-            .method(message.method.as_str())
+            .method(request_meta.method.as_str())
             .uri(if h2 {
-                message.url.clone()
+                request_meta.url.clone()
             } else {
                 target
                     .path_and_query()
@@ -284,7 +306,7 @@ impl Inspector {
             })
             .body(body)
             .map_err(err)?;
-        *outgoing.headers_mut() = headers_with(&message.headers, Some(&parts.headers))?;
+        *outgoing.headers_mut() = headers_with(&request_meta.headers, Some(&parts.headers))?;
         if !upgrading {
             strip_hop(outgoing.headers_mut());
         }
@@ -370,8 +392,8 @@ impl Inspector {
             body: vec![],
         };
         let need = self.plan.needs_body_after_rewrite(&msg, Some(&request_meta));
-        let (body, buffer, permit, response_trailers) =
-            buffer_if_needed(body, need, self.bodies.clone()).await?;
+        let (passthrough_body, buffer, permit, response_trailers) =
+            buffer_if_needed(body, need, self.bodies.clone(), self.max_body).await?;
         let response_trailer_names = trailer_names(response_trailers.as_ref());
         let buffered = buffer.is_some();
         if let Some(data) = buffer {
@@ -402,9 +424,9 @@ impl Inspector {
             }
         }
         let body = if buffered {
-            full_trailers(msg.body.clone(), response_trailers)
+            full_trailers(std::mem::take(&mut msg.body), response_trailers)
         } else {
-            body
+            passthrough_body.expect("unbuffered response must have passthrough body")
         };
         let mut response = response_from_message(msg, body, false, Some(&parts.headers))?;
         if !downstream_h2 {
@@ -435,9 +457,19 @@ impl Inspector {
         transaction: Option<OwnedSemaphorePermit>,
         permit: Option<OwnedSemaphorePermit>,
     ) -> io::Result<Response<BoxBody>> {
+        let need_pages = u32::try_from(body_budget_pages(message.body.len())).unwrap_or(u32::MAX);
         let permit = match permit {
-            Some(p) => p,
-            None => match self.bodies.clone().try_acquire_owned() {
+            Some(mut p) => {
+                if p.num_permits() < need_pages as usize {
+                    let extra = need_pages - p.num_permits() as u32;
+                    let Ok(more) = self.bodies.clone().try_acquire_many_owned(extra) else {
+                        return Ok(error_response(503));
+                    };
+                    p.merge(more);
+                }
+                p
+            }
+            None => match self.bodies.clone().try_acquire_many_owned(need_pages) {
                 Ok(p) => p,
                 Err(_) => return Ok(error_response(503)),
             },
@@ -553,24 +585,43 @@ async fn buffer_if_needed(
     mut body: Incoming,
     need: bool,
     budget: Arc<Semaphore>,
+    max_body: usize,
 ) -> io::Result<(
-    BoxBody,
+    Option<BoxBody>,
     Option<Vec<u8>>,
     Option<OwnedSemaphorePermit>,
     Option<http::HeaderMap>,
 )> {
     if !need {
-        return Ok((body.map_err(err).boxed_unsync(), None, None, None));
+        return Ok((Some(body.map_err(err).boxed_unsync()), None, None, None));
     }
-    // 缓冲额度很贵（整份正文驻留内存），只有 2 份：先短暂等待，仍拿不到才不缓冲直通
-    let Ok(Ok(permit)) = tokio::time::timeout(crate::admission::patience(3), budget.acquire_owned()).await else {
-        return Ok((body.map_err(err).boxed_unsync(), None, None, None));
+    let Ok(Ok(mut permit)) =
+        tokio::time::timeout(crate::admission::patience(3), budget.clone().acquire_many_owned(1))
+            .await
+    else {
+        return Ok((Some(body.map_err(err).boxed_unsync()), None, None, None));
     };
-    let mut frames = VecDeque::new();
-    let mut n = 0;
+    let mut covered_pages = 1usize;
+    let mut first: Option<Bytes> = None;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut n = 0usize;
     let mut trailers = None;
     // 每帧之间最多等 5 秒，整体最多 30 秒：慢速但持续的上传不会因总时长被判为超时。
     let total = tokio::time::Instant::now() + Duration::from_secs(30);
+    let make_prefix = |first: Option<Bytes>, buf: Vec<u8>, extra: Option<Frame<Bytes>>| {
+        let mut prefix = VecDeque::new();
+        if let Some(b) = first {
+            if !b.is_empty() {
+                prefix.push_back(Frame::data(b));
+            }
+        } else if !buf.is_empty() {
+            prefix.push_back(Frame::data(Bytes::from(buf)));
+        }
+        if let Some(f) = extra {
+            prefix.push_back(f);
+        }
+        prefix
+    };
     loop {
         let deadline = (tokio::time::Instant::now() + Duration::from_secs(5)).min(total);
         let frame = match tokio::time::timeout_at(deadline, body.frame()).await {
@@ -578,50 +629,117 @@ async fn buffer_if_needed(
             Ok(None) => break,
             Err(_) => {
                 return Ok((
-                    ReplayBody {
-                        prefix: frames,
-                        inner: body,
-                        permit: Some(permit),
-                    }
-                    .boxed_unsync(),
+                    Some(
+                        ReplayBody {
+                            prefix: make_prefix(first, buf, None),
+                            inner: body,
+                            permit: Some(permit),
+                        }
+                        .boxed_unsync(),
+                    ),
                     None,
                     None,
                     None,
                 ))
             }
         };
-        if let Some(data) = frame.data_ref() {
-            n += data.len();
+        if frame.is_data() {
+            let chunk_len = frame.data_ref().map_or(0, |d| d.len());
+            let next_n = n.saturating_add(chunk_len);
+            if next_n > max_body {
+                return Ok((
+                    Some(
+                        ReplayBody {
+                            prefix: make_prefix(first, buf, Some(frame)),
+                            inner: body,
+                            permit: Some(permit),
+                        }
+                        .boxed_unsync(),
+                    ),
+                    None,
+                    None,
+                    None,
+                ));
+            }
+            let target_pages = body_budget_pages(next_n);
+            if target_pages > covered_pages {
+                let extra = u32::try_from(target_pages - covered_pages).unwrap_or(u32::MAX);
+                match tokio::time::timeout(
+                    crate::admission::patience(2),
+                    budget.clone().acquire_many_owned(extra),
+                )
+                .await
+                {
+                    Ok(Ok(more)) => {
+                        permit.merge(more);
+                        covered_pages = target_pages;
+                    }
+                    _ => {
+                        return Ok((
+                            Some(
+                                ReplayBody {
+                                    prefix: make_prefix(first, buf, Some(frame)),
+                                    inner: body,
+                                    permit: Some(permit),
+                                }
+                                .boxed_unsync(),
+                            ),
+                            None,
+                            None,
+                            None,
+                        ))
+                    }
+                }
+            }
+            let bytes = frame.into_data().expect("is_data");
+            if !bytes.is_empty() {
+                if first.is_none() && buf.is_empty() {
+                    first = Some(bytes);
+                } else {
+                    if let Some(b) = first.take() {
+                        buf = Vec::from(b);
+                    }
+                    let new_len = buf.len() + bytes.len();
+                    if new_len > buf.capacity() {
+                        let target = (buf.capacity().saturating_mul(2))
+                            .max(new_len)
+                            .min(max_body);
+                        buf.reserve_exact(target - buf.len());
+                    }
+                    buf.extend_from_slice(&bytes);
+                }
+            }
+            n = next_n;
         } else if let Some(h) = frame.trailers_ref() {
             trailers = Some(h.clone());
         }
-        frames.push_back(frame);
-        if n > MAX_BODY {
-            return Ok((
-                ReplayBody {
-                    prefix: frames,
-                    inner: body,
-                    permit: Some(permit),
-                }
-                .boxed_unsync(),
-                None,
-                None,
-                None,
-            ));
-        }
     }
-    let mut data = Vec::with_capacity(n);
-    for frame in frames {
-        if let Ok(b) = frame.into_data() {
-            data.extend_from_slice(&b)
-        }
+    let data = if let Some(b) = first {
+        Vec::from(b)
+    } else {
+        buf
+    };
+    Ok((None, Some(data), Some(permit), trailers))
+}
+struct GuardedBody {
+    inner: BoxBody,
+    _permit: Option<OwnedSemaphorePermit>,
+}
+impl Body for GuardedBody {
+    type Data = Bytes;
+    type Error = io::Error;
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, io::Error>>> {
+        Pin::new(&mut self.inner).poll_frame(cx)
     }
-    Ok((
-        full_trailers(data.clone(), trailers.clone()),
-        Some(data),
-        Some(permit),
-        trailers,
-    ))
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
 }
 struct ReplayBody {
     prefix: VecDeque<Frame<Bytes>>,
@@ -876,8 +994,10 @@ mod tests {
                     plan: Rc::new(oryn_http_inspect::compile_module(&ir, &Default::default(), &Default::default()).unwrap()),
                     outbound: Arc::new(SlowTls(counts.clone())),
                     origin: "https://fixture.test".into(), skip_verify: true,
-                    transactions: Some(transactions.clone()), bodies: Arc::new(Semaphore::new(2)),
+                    transactions: Some(transactions.clone()),
+                    bodies: Arc::new(Semaphore::new(body_budget_pages(6 * 1024 * 1024))),
                     upstream_establish: upstream_establish.clone(),
+                    max_body: oryn_http_inspect::MAX_BODY,
                 };
                 let admission = crate::admission::Admission::default();
                 let entries: Vec<_> = (0..8).map(|_| admission.try_tcp().unwrap()).collect();
@@ -981,7 +1101,8 @@ mod tests {
                     plan: Rc::new(oryn_http_inspect::compile_module(&ir, &Default::default(), &Default::default()).unwrap()),
                     outbound: Arc::new(Peer(addr)), origin: "http://fixture.test".into(), skip_verify: false,
                     transactions: Some(transactions.clone()), upstream_establish: upstream_establish.clone(),
-                    bodies: Arc::new(Semaphore::new(2)),
+                    bodies: Arc::new(Semaphore::new(body_budget_pages(6 * 1024 * 1024))),
+                    max_body: oryn_http_inspect::MAX_BODY,
                 };
                 let mut servers = Vec::new();
                 let mut drivers = Vec::new();
@@ -1037,8 +1158,10 @@ request if ${request.header['X-Select']} == "new" then script("new.js") with req
                 scripts: Arc::new(crate::scripts::ScriptHost::new(None)), plan: Rc::new(plan),
                 outbound: Arc::new(Peer("127.0.0.1:1".parse().unwrap())),
                 origin:"http://fixture.test".into(), skip_verify:false,
-                transactions:Some(Arc::new(Semaphore::new(32))), bodies:Arc::new(Semaphore::new(2)),
+                transactions:Some(Arc::new(Semaphore::new(32))),
+                bodies:Arc::new(Semaphore::new(body_budget_pages(6 * 1024 * 1024))),
                 upstream_establish: Arc::new(Semaphore::new(8)),
+                max_body: oryn_http_inspect::MAX_BODY,
             };
             let (app, server) = tokio::io::duplex(65536);
             let serving = tokio::task::spawn_local(inspector.serve(server, false));
@@ -1061,7 +1184,7 @@ request if ${request.header['X-Select']} == "new" then script("new.js") with req
                 let (socket,_) = listener.accept().await.unwrap();
                 let service=service_fn(|req:Request<Incoming>| async move {
                     let b=req.into_body().collect().await.unwrap().to_bytes();
-                    assert_eq!(b.len(), MAX_BODY+1);
+                    assert_eq!(b.len(), oryn_http_inspect::MAX_BODY+1);
                     Ok::<_,Infallible>(Response::builder().header("X-State","old")
                         .body(full(b"original-body".to_vec())).unwrap())
                 });
@@ -1078,13 +1201,13 @@ response if ${url} ~= /fixture/ && ${response.header['X-State']} == "new" then s
             let resources=[("old.js".into(),b"$done({body:$response.body+'|'+$response.headers['X-State']});".as_slice().into()),
                 ("new.js".into(),b"$done({body:'wrong'});".as_slice().into())].into();
             let plan=oryn_http_inspect::compile_module(&ir,&Default::default(),&resources).unwrap();
-            let inspector=Inspector { scripts:Arc::new(crate::scripts::ScriptHost::new(None)),plan:Rc::new(plan),outbound:Arc::new(Peer(addr)),origin:"http://fixture.test".into(),skip_verify:false,transactions:Some(Arc::new(Semaphore::new(32))),bodies:Arc::new(Semaphore::new(2)),upstream_establish:Arc::new(Semaphore::new(8)) };
+            let inspector=Inspector { scripts:Arc::new(crate::scripts::ScriptHost::new(None)),plan:Rc::new(plan),outbound:Arc::new(Peer(addr)),origin:"http://fixture.test".into(),skip_verify:false,transactions:Some(Arc::new(Semaphore::new(32))),bodies:Arc::new(Semaphore::new(body_budget_pages(6*1024*1024))),upstream_establish:Arc::new(Semaphore::new(8)),max_body:oryn_http_inspect::MAX_BODY };
             let (app,server)=tokio::io::duplex(65536);
             let serving=tokio::task::spawn_local(inspector.serve(server,false));
             let (mut client,driver)=hyper::client::conn::http1::handshake(TokioIo::new(app)).await.unwrap();
             let driving=tokio::task::spawn_local(driver);
             let response=client.send_request(Request::builder().method("POST").uri("http://fixture.test/api")
-                .body(full(vec![b'x';MAX_BODY+1])).unwrap()).await.unwrap();
+                .body(full(vec![b'x';oryn_http_inspect::MAX_BODY+1])).unwrap()).await.unwrap();
             assert_eq!(response.status(),200);
             assert_eq!(response.into_body().collect().await.unwrap().to_bytes(),"original-body|new");
             drop(client); driving.abort(); serving.abort(); peer.abort();
@@ -1160,7 +1283,8 @@ response if ${url} ~= /fixture/ && ${response.header['X-State']} == "new" then s
             skip_verify: upstream_h2, // 测试上游是独立自签 CA；产品默认严格验证。
             transactions: Some(Arc::new(Semaphore::new(32))),
             upstream_establish: Arc::new(Semaphore::new(8)),
-            bodies: Arc::new(Semaphore::new(2)),
+            bodies: Arc::new(Semaphore::new(body_budget_pages(6 * 1024 * 1024))),
+            max_body: oryn_http_inspect::MAX_BODY,
         };
         let (app, local) = tokio::io::duplex(65536);
         let mut ca = oryn_mitm::CertificateAuthority::generate("Oryn Test CA").unwrap();
@@ -1389,7 +1513,8 @@ response if ${url} ~= /fixture/ && ${response.header['X-State']} == "new" then s
                         skip_verify: false,
                         transactions: Some(Arc::new(Semaphore::new(4))),
                         upstream_establish: Arc::new(Semaphore::new(4)),
-                        bodies: Arc::new(Semaphore::new(2)),
+                        bodies: Arc::new(Semaphore::new(body_budget_pages(6 * 1024 * 1024))),
+                        max_body: oryn_http_inspect::MAX_BODY,
                     };
                     let (mut client, server) = tokio::io::duplex(8192);
                     let serve = tokio::task::spawn_local(async move {
@@ -1417,5 +1542,145 @@ response if ${url} ~= /fixture/ && ${response.header['X-State']} == "new" then s
                 .unwrap();
             })
             .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn four_mib_text_and_binary_response_scripts_succeed() {
+        tokio::task::LocalSet::new().run_until(async {
+            for binary in [false, true] {
+                let payload = if binary {
+                    vec![0x5au8; oryn_http_inspect::MAX_BODY]
+                } else {
+                    vec![b'a'; oryn_http_inspect::MAX_BODY]
+                };
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                let upstream_body = payload.clone();
+                let peer = tokio::task::spawn_local(async move {
+                    let (socket, _) = listener.accept().await.unwrap();
+                    let service = service_fn(move |_req: Request<Incoming>| {
+                        let body = upstream_body.clone();
+                        async move {
+                            Ok::<_, Infallible>(Response::builder().body(full(body)).unwrap())
+                        }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(socket), service)
+                        .await;
+                });
+                let module = if binary {
+                    "[Script]\ntransform = type=http-response, pattern=^http://fixture\\.test/big$, script-path=s.js, requires-body=true, binary-body-mode=true"
+                } else {
+                    "[Script]\ntransform = type=http-response, pattern=^http://fixture\\.test/big$, script-path=s.js, requires-body=true"
+                };
+                let ir = oryn_module::parse(module, Some(oryn_module::ModuleFormat::Surge)).unwrap();
+                let script_code: &[u8] = if binary {
+                    b"let b = new Uint8Array($response.body); b[0] = 0xa5; $done({body: b});"
+                } else {
+                    b"let s = $response.body; $done({body: 'Z' + s.slice(1)});"
+                };
+                let resources = [("s.js".into(), script_code.into())].into();
+                let plan = oryn_http_inspect::compile_module(&ir, &Default::default(), &resources).unwrap();
+                let inspector = Inspector {
+                    scripts: Arc::new(crate::scripts::ScriptHost::new(None)),
+                    plan: Rc::new(plan),
+                    outbound: Arc::new(Peer(addr)),
+                    origin: "http://fixture.test".into(),
+                    skip_verify: false,
+                    transactions: Some(Arc::new(Semaphore::new(32))),
+                    upstream_establish: Arc::new(Semaphore::new(8)),
+                    bodies: Arc::new(Semaphore::new(body_budget_pages(6 * 1024 * 1024))),
+                    max_body: oryn_http_inspect::MAX_BODY,
+                };
+                let (app, server) = tokio::io::duplex(65536);
+                let serving = tokio::task::spawn_local(inspector.serve(server, false));
+                let (mut client, driver) = hyper::client::conn::http1::handshake(TokioIo::new(app)).await.unwrap();
+                let driving = tokio::task::spawn_local(driver);
+                let response = client
+                    .send_request(
+                        Request::builder()
+                            .method("GET")
+                            .uri("http://fixture.test/big")
+                            .body(full(vec![]))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), 200);
+                let got = response.into_body().collect().await.unwrap().to_bytes();
+                assert_eq!(got.len(), oryn_http_inspect::MAX_BODY);
+                assert_eq!(got[0], if binary { 0xa5 } else { b'Z' });
+                assert_eq!(got[1], if binary { 0x5a } else { b'a' });
+                drop(client);
+                driving.abort();
+                serving.abort();
+                peer.abort();
+            }
+        }).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn page_weighted_budget_allows_many_concurrent_small_bodies() {
+        tokio::task::LocalSet::new().run_until(async {
+            let budget = Arc::new(Semaphore::new(body_budget_pages(6 * 1024 * 1024)));
+            // 与旧固定 2 条计数相比，6 MiB 页预算应允许 >2 条小正文并发占用；同时阻止两条 4 MiB 并发缓冲。
+            let small_count = 8usize;
+            let mut responses = Vec::new();
+            let mut guards = Vec::new();
+            let ir = oryn_module::parse(
+                "[Script]\ns = type=http-response, pattern=^http://fixture\\.test/small$, script-path=s.js, requires-body=true",
+                Some(oryn_module::ModuleFormat::Surge),
+            )
+            .unwrap();
+            let resources = [("s.js".into(), b"$done({body: $response.body + '!'});".as_slice().into())].into();
+            let plan = Rc::new(oryn_http_inspect::compile_module(&ir, &Default::default(), &resources).unwrap());
+
+            for _ in 0..small_count {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                let peer = tokio::task::spawn_local(async move {
+                    let (socket, _) = listener.accept().await.unwrap();
+                    let service = service_fn(|_req: Request<Incoming>| async move {
+                        Ok::<_, Infallible>(Response::builder().body(full(vec![b'x'; 16 * 1024])).unwrap())
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(socket), service)
+                        .await;
+                });
+                let inspector = Inspector {
+                    scripts: Arc::new(crate::scripts::ScriptHost::new(None)),
+                    plan: plan.clone(),
+                    outbound: Arc::new(Peer(addr)),
+                    origin: "http://fixture.test".into(),
+                    skip_verify: false,
+                    transactions: Some(Arc::new(Semaphore::new(32))),
+                    upstream_establish: Arc::new(Semaphore::new(32)),
+                    bodies: budget.clone(),
+                    max_body: oryn_http_inspect::MAX_BODY,
+                };
+                let (app, server) = tokio::io::duplex(65536);
+                let serving = tokio::task::spawn_local(inspector.serve(server, false));
+                let (mut client, driver) = hyper::client::conn::http1::handshake(TokioIo::new(app)).await.unwrap();
+                let driving = tokio::task::spawn_local(driver);
+                let response = client
+                    .send_request(Request::builder().method("GET").uri("http://fixture.test/small").body(full(vec![])).unwrap())
+                    .await
+                    .unwrap();
+                responses.push(response);
+                guards.push((client, driving, serving, peer));
+            }
+            for response in responses {
+                let bytes = response.into_body().collect().await.unwrap().to_bytes();
+                assert_eq!(bytes.len(), 16 * 1024 + 1);
+                assert!(bytes.ends_with(b"!"));
+            }
+            drop(guards);
+
+            let four_mib_pages = u32::try_from(body_budget_pages(4 * 1024 * 1024)).unwrap();
+            let first = budget.clone().try_acquire_many_owned(four_mib_pages).unwrap();
+            assert!(budget.clone().try_acquire_many_owned(four_mib_pages).is_err());
+            drop(first);
+            assert!(budget.clone().try_acquire_many_owned(four_mib_pages).is_ok());
+        }).await;
     }
 }

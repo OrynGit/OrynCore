@@ -939,6 +939,17 @@ pub fn compile_module_with_policies(
     res: &Resources,
     policy_map: &[(String, String)],
 ) -> io::Result<Plan> {
+    compile_module_with_limits(m, overrides, res, policy_map, InspectLimits::default())
+}
+
+/// 同 [`compile_module_with_policies`]，允许按运行档位指定脚本与正文限额。
+pub fn compile_module_with_limits(
+    m: &ModuleIR,
+    overrides: &BTreeMap<String, String>,
+    res: &Resources,
+    policy_map: &[(String, String)],
+    limits: InspectLimits,
+) -> io::Result<Plan> {
     if let Some(warning) = m
         .warnings
         .iter()
@@ -982,7 +993,10 @@ pub fn compile_module_with_policies(
         };
         args.insert(a.name.clone(), v);
     }
-    let mut plan = Plan::default();
+    let mut plan = Plan {
+        max_body: limits.max_body,
+        ..Plan::default()
+    };
     for r in &m.rewrites {
         let mut rw_warnings = Vec::new();
         let compiled = if r.text.starts_with("request if ") || r.text.starts_with("response if ") {
@@ -1061,12 +1075,30 @@ pub fn compile_module_with_policies(
     }
     for script in &m.scripts {
         let mut warnings = Vec::new();
-        let result = script_rule(&script.text, m.format, &args, &arg_types, res, &mut warnings);
+        let result = script_rule(
+            &script.text,
+            m.format,
+            &args,
+            &arg_types,
+            res,
+            limits,
+            &mut warnings,
+        );
         let script_name = result.as_ref().map(|rule| rule.name.as_str()).unwrap_or("<invalid>");
         plan.warnings.extend(warnings.into_iter().map(|w| format!("{}:{}: script {script_name}: {w}", script.source.name, script.source.line)));
         match result {
-            // 超时与正文上限是固定的运行时约束（见 script_rule），每个脚本都一样，不作为告警输出。
-            Ok(rule) => plan.scripts.push(rule),
+            Ok(rule) => {
+                let max_timeout = if matches!(rule.kind.as_str(), "http-request" | "http-response") {
+                    limits.http_max_timeout
+                } else {
+                    limits.bg_max_timeout
+                };
+                plan.warnings.push(format!(
+                    "{}:{}: Oryn script resource limits: default timeout {}s, maximum {max_timeout}s; body size capped at {} bytes",
+                    script.source.name, script.source.line, limits.default_timeout, limits.max_body
+                ));
+                plan.scripts.push(rule);
+            }
             Err(e)
                 if matches!(
                     e.kind(),
@@ -1100,6 +1132,7 @@ fn script_rule(
     args: &BTreeMap<String, Value>,
     arg_types: &BTreeMap<String, String>,
     resources: &Resources,
+    limits: InspectLimits,
     warnings: &mut Vec<String>,
 ) -> io::Result<ScriptRule> {
     let mut options = BTreeMap::<String, String>::new();
@@ -1194,7 +1227,7 @@ fn script_rule(
                             let default = match key.as_str() {
                                 "enable" => Value::Bool(true),
                                 "debug" => Value::Bool(false),
-                                _ => Value::from(5),
+                                _ => Value::from(limits.default_timeout),
                             };
                             warnings.push(format!("script option {k}: missing argument {name}; using Oryn default {default}"));
                             v = Expr::Literal(default);
@@ -1231,7 +1264,7 @@ fn script_rule(
                         matches!(&v, Expr::Literal(Value::Number(_) | Value::String(_)))
                     }
                     "max-size" => {
-                        matches!(&v, Expr::Literal(Value::Number(n)) if n.as_u64().is_some_and(|n| n > 0))
+                        matches!(&v, Expr::Literal(Value::Number(n)) if n.as_i64().is_some_and(|n| n == -1 || n >= 0))
                     }
                     "tag" | "img-url" | "engine" | "ability" => {
                         matches!(&v, Expr::Template(_) | Expr::Literal(Value::String(_)))
@@ -1323,9 +1356,13 @@ fn script_rule(
                         }
                         value = match args.get(name) {
                             Some(Value::Null) => {
-                                let default = match key.as_str() { "enable" => "true", "debug" => "false", _ => "5" };
+                                let default = match key.as_str() {
+                                    "enable" => "true".to_string(),
+                                    "debug" => "false".to_string(),
+                                    _ => limits.default_timeout.to_string(),
+                                };
                                 warnings.push(format!("script option {key}: missing argument {name}; using Oryn default {default}"));
-                                default.into()
+                                default
                             }
                             Some(v) => string(v.clone()),
                             None => return Err(invalid(format!("undeclared plugin argument {name}"))),
@@ -1405,7 +1442,7 @@ fn script_rule(
                 }
             }
             "max-size" => {
-                if v.parse::<u64>().is_err() {
+                if !v.parse::<i64>().is_ok_and(|n| n == -1 || n >= 0) {
                     return Err(invalid(format!("invalid script option {k}")));
                 }
             }
@@ -1458,15 +1495,14 @@ fn script_rule(
             warnings.push(format!("script option {key} is unsupported by Oryn runtime and has no effect"));
         }
     }
-    // 验证后仅做显式转换，不能把小数/字符串解析失败偷偷回退到 5 秒。
-    // HTTP 请求/响应脚本保持 30s 上限以免阻塞连接；cron / generic / event 后台脚本放宽至 300s。
+    // 验证后仅做显式转换，不能把小数/字符串解析失败偷偷回退到默认值。
     let max_timeout: u64 = if matches!(kind.as_str(), "http-request" | "http-response") {
-        30
+        limits.http_max_timeout
     } else {
-        300
+        limits.bg_max_timeout
     };
     let timeout = match options.get("timeout") {
-        None => 5,
+        None => limits.default_timeout,
         Some(raw) => {
             let seconds = raw.parse::<f64>().map_err(|_| invalid("timeout requires a finite positive number"))?;
             if !seconds.is_finite() || seconds <= 0.0 {
@@ -1486,6 +1522,32 @@ fn script_rule(
         // 预算不足仍只跳过该脚本；真正源码损坏才保留整模块快照回退。
         if e.kind() == io::ErrorKind::Unsupported { e } else { resource_error(e) }
     })?;
+    let max_size = match options.get("max-size") {
+        None => limits.max_body,
+        Some(raw) => match raw.parse::<i64>() {
+            Ok(-1) => {
+                warnings.push(format!(
+                    "script max-size {raw} capped to Oryn limit: {} bytes",
+                    limits.max_body
+                ));
+                limits.max_body
+            }
+            Ok(0) => limits.max_body,
+            Ok(n) if n > 0 => {
+                let n = usize::try_from(n).unwrap_or(usize::MAX);
+                if n > limits.max_body {
+                    warnings.push(format!(
+                        "script max-size {raw} capped to Oryn limit: {} bytes",
+                        limits.max_body
+                    ));
+                    limits.max_body
+                } else {
+                    n
+                }
+            }
+            _ => limits.max_body,
+        },
+    };
     let boolean = |k: &str| {
         options
             .get(k)
@@ -1507,12 +1569,7 @@ fn script_rule(
         requires_body: boolean("requires-body"),
         binary: boolean("binary-body-mode"),
         full_headers: boolean("full-header-mode"),
-        max_size: options
-            .get("max-size")
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|n| *n > 0)
-            .unwrap_or(MAX_BODY)
-            .min(MAX_BODY),
+        max_size,
         timeout,
         dialect,
     })
@@ -1576,7 +1633,7 @@ http-request ^http://a\\.test/ script-path=a.js, timeout=200, tag=req
         let plan = compile_module(&ir, &BTreeMap::new(), &resources).unwrap();
         assert_eq!(plan.scripts.len(), 2, "{:?}", plan.warnings);
         assert_eq!(plan.scripts[0].timeout, 200);
-        assert_eq!(plan.scripts[1].timeout, 30);
+        assert_eq!(plan.scripts[1].timeout, 60);
         let mut msg = Message {
             url: "http://drop.test/x".into(),
             method: "GET".into(),
@@ -1665,5 +1722,64 @@ s2 = type=http-request, pattern=^https://b\\.test/, script-path=a.js, timeout=ba
         assert!(plan.warnings.iter().any(|w| w.contains("future-flag")), "{:?}", plan.warnings);
         assert!(plan.warnings.iter().any(|w| w.contains("wake-system")), "{:?}", plan.warnings);
         assert!(plan.warnings.iter().any(|w| w.contains("script skipped")), "{:?}", plan.warnings);
+    }
+
+    #[test]
+    fn resource_limits_notice_and_max_size_clamping() {
+        let text = "\
+[Script]
+unbounded = type=http-response, pattern=^https://a\\.test/, script-path=a.js, max-size=-1
+oversize = type=http-response, pattern=^https://b\\.test/, script-path=a.js, max-size=10485760
+cronjob = type=cron, cronexp=\"0 * * * *\", script-path=a.js
+";
+        let ir = oryn_module::parse(text, Some(ModuleFormat::Surge)).unwrap();
+        let mut resources = Resources::new();
+        resources.insert("a.js".into(), Arc::<[u8]>::from(&b"$done({});"[..]));
+        let plan = compile_module(&ir, &BTreeMap::new(), &resources).unwrap();
+        assert_eq!(plan.scripts.len(), 3, "{:?}", plan.warnings);
+        assert_eq!(plan.scripts[0].timeout, DEFAULT_SCRIPT_TIMEOUT);
+        assert_eq!(plan.scripts[0].max_size, MAX_BODY);
+        assert_eq!(plan.scripts[1].max_size, MAX_BODY);
+        assert!(plan.warnings.iter().any(|w| {
+            w.contains("Oryn script resource limits: default timeout 10s, maximum 60s; body size capped at 4194304 bytes")
+        }), "{:?}", plan.warnings);
+        assert!(plan.warnings.iter().any(|w| {
+            w.contains("Oryn script resource limits: default timeout 10s, maximum 300s; body size capped at 4194304 bytes")
+        }), "{:?}", plan.warnings);
+        assert!(plan.warnings.iter().any(|w| w.contains("script max-size -1 capped to Oryn limit: 4194304 bytes")), "{:?}", plan.warnings);
+        assert!(plan.warnings.iter().any(|w| w.contains("script max-size 10485760 capped to Oryn limit: 4194304 bytes")), "{:?}", plan.warnings);
+
+        let desktop = InspectLimits {
+            max_body: DESKTOP_MAX_BODY,
+            ..Default::default()
+        };
+        let dplan = compile_module_with_limits(&ir, &BTreeMap::new(), &resources, &[], desktop).unwrap();
+        assert_eq!(dplan.max_body, DESKTOP_MAX_BODY);
+        assert_eq!(dplan.scripts[0].max_size, DESKTOP_MAX_BODY);
+        assert_eq!(dplan.scripts[1].max_size, DESKTOP_MAX_BODY);
+        assert!(dplan.warnings.iter().any(|w| w.contains("body size capped at 8388608 bytes")), "{:?}", dplan.warnings);
+    }
+
+    #[test]
+    fn decode_body_cow_borrows_identity_and_respects_custom_limit() {
+        let mut msg = Message {
+            url: "https://a.test/".into(),
+            method: "GET".into(),
+            status: Some(200),
+            headers: vec![],
+            body: vec![b'x'; 2 * 1024 * 1024],
+        };
+        let cow = crate::decode_body_cow(&msg, MAX_BODY).unwrap();
+        assert!(matches!(cow, crate::Cow::Borrowed(_)));
+        assert_eq!(cow.len(), 2 * 1024 * 1024);
+        assert!(crate::decode_body_cow(&msg, 1024 * 1024).is_err());
+
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        std::io::Write::write_all(&mut enc, &vec![b'y'; 2 * 1024 * 1024]).unwrap();
+        msg.body = enc.finish().unwrap();
+        msg.set_header("Content-Encoding", "gzip".into());
+        let cow = crate::decode_body_cow(&msg, MAX_BODY).unwrap();
+        assert!(matches!(cow, crate::Cow::Owned(_)));
+        assert_eq!(cow.len(), 2 * 1024 * 1024);
     }
 }

@@ -7,8 +7,10 @@ use oryn_outbound::{resolve, PickMeta};
 use oryn_router::{DomainSource, FlowContext, Network};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::{HashMap, HashSet},
     path::Path,
     rc::Rc,
+    sync::Arc,
     time::{Duration, SystemTime},
 };
 
@@ -23,9 +25,10 @@ mod corpus_tests;
 #[path = "modules_generation_tests.rs"]
 mod generation_tests;
 
-const MAX_RESOURCES: usize = 8 * 1024 * 1024;
-const MAX_SNAPSHOT: usize = 16 * 1024 * 1024;
-const MAX_DISK_CACHE: u64 = 64 * 1024 * 1024;
+#[cfg(test)]
+const MAX_RESOURCES: usize = 16 * 1024 * 1024;
+const MAX_SNAPSHOT: usize = 24 * 1024 * 1024;
+const MAX_DISK_CACHE: u64 = 128 * 1024 * 1024;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ValidatedModule {
@@ -36,34 +39,128 @@ fn snapshot_key(spec: &oryn_config::ModuleSpec) -> String {
     let key = serde_json::to_vec(&(&spec.url, spec.format, &spec.arguments)).unwrap();
     format!("{:x}", Sha256::digest(key))
 }
+/// 零分配估算已解析模块 IR 的文本体积，避免每个模块反复序列化为 JSON 字节向量。
+fn ir_bytes(ir: &oryn_module::ModuleIR) -> usize {
+    let opt = |s: &Option<String>| s.as_ref().map_or(0, String::len);
+    let slice_len = |xs: &[String]| xs.iter().map(String::len).sum::<usize>();
+    opt(&ir.meta.name)
+        + opt(&ir.meta.description)
+        + opt(&ir.meta.author)
+        + opt(&ir.meta.homepage)
+        + opt(&ir.meta.icon)
+        + opt(&ir.meta.system)
+        + opt(&ir.meta.system_version)
+        + opt(&ir.meta.core_requirement)
+        + opt(&ir.meta.module_type)
+        + opt(&ir.meta.arguments_desc)
+        + ir.meta
+            .raw
+            .iter()
+            .map(|(k, v)| k.len() + v.len())
+            .sum::<usize>()
+        + ir.arguments
+            .iter()
+            .map(|a| {
+                a.name.len()
+                    + a.kind.len()
+                    + opt(&a.default)
+                    + slice_len(&a.options)
+                    + opt(&a.typed)
+                    + opt(&a.tag)
+                    + opt(&a.desc)
+                    + a.raw.len()
+                    + a.source.name.len()
+            })
+            .sum::<usize>()
+        + slice_len(&ir.general)
+        + slice_len(&ir.rules)
+        + slice_len(&ir.hosts)
+        + ir.rewrites
+            .iter()
+            .map(|r| r.section.len() + r.text.len() + r.source.name.len())
+            .sum::<usize>()
+        + ir.scripts
+            .iter()
+            .map(|s| s.text.len() + s.source.name.len())
+            .sum::<usize>()
+        + slice_len(&ir.mitm)
+        + ir.raw_sections
+            .iter()
+            .map(|(k, v)| k.len() + slice_len(v))
+            .sum::<usize>()
+        + slice_len(&ir.warnings)
+}
 fn module_size(spec: &oryn_config::ModuleSpec) -> usize {
     spec.resources.values().map(|v| v.len()).sum::<usize>()
-        + spec
-            .inline
-            .as_ref()
-            .map(|ir| {
-                serde_json::to_vec(ir)
-                    .map(|v| v.len())
-                    .unwrap_or(MAX_RESOURCES + 1)
-            })
-            .unwrap_or(0)
+        + spec.inline.as_ref().map_or(0, ir_bytes)
 }
-fn validate(spec: &oryn_config::ModuleSpec) -> Result<oryn_http_inspect::Plan, String> {
-    let ir = spec.inline.as_ref().ok_or("module has no valid source")?;
-    if module_size(spec) > MAX_RESOURCES {
-        return Err("module resource total exceeds 8 MiB".into());
+fn resource_digest(data: &[u8]) -> [u8; 32] {
+    Sha256::digest(data).into()
+}
+fn incremental_module_size(
+    spec: &oryn_config::ModuleSpec,
+    shared: &HashMap<[u8; 32], Arc<[u8]>>,
+) -> usize {
+    let mut seen_local = HashSet::new();
+    let mut unique_res = 0usize;
+    for bytes in spec.resources.values() {
+        let digest = resource_digest(bytes);
+        if !shared.contains_key(&digest) && seen_local.insert(digest) {
+            unique_res += bytes.len();
+        }
     }
-    oryn_http_inspect::compile_module_with_policies(
+    unique_res + spec.inline.as_ref().map_or(0, ir_bytes)
+}
+fn deduplicate_resources(
+    spec: &mut oryn_config::ModuleSpec,
+    shared: &mut HashMap<[u8; 32], Arc<[u8]>>,
+) {
+    if spec.resources.is_empty() {
+        return;
+    }
+    let resources = Arc::make_mut(&mut spec.resources);
+    for bytes in resources.values_mut() {
+        let digest = resource_digest(bytes);
+        if let Some(existing) = shared.get(&digest) {
+            *bytes = Arc::clone(existing);
+        } else {
+            shared.insert(digest, Arc::clone(bytes));
+        }
+    }
+}
+fn validate_with(
+    spec: &oryn_config::ModuleSpec,
+    max_resources: usize,
+    inspect_limits: oryn_http_inspect::InspectLimits,
+) -> Result<oryn_http_inspect::Plan, String> {
+    let ir = spec.inline.as_ref().ok_or("module has no valid source")?;
+    if module_size(spec) > max_resources {
+        return Err(format!(
+            "module resource total exceeds {} MiB",
+            max_resources / (1024 * 1024)
+        ));
+    }
+    oryn_http_inspect::compile_module_with_limits(
         ir,
         &spec.arguments.iter().cloned().collect(),
         &spec.resources,
         &spec.policy_map,
+        inspect_limits,
     )
     .map_err(|e| e.to_string())
 }
-fn save_validated(dir: &Path, spec: &oryn_config::ModuleSpec) -> Result<(), String> {
+#[cfg(test)]
+fn validate(spec: &oryn_config::ModuleSpec) -> Result<oryn_http_inspect::Plan, String> {
+    validate_with(spec, MAX_RESOURCES, Default::default())
+}
+fn save_validated_with(
+    dir: &Path,
+    spec: &oryn_config::ModuleSpec,
+    max_resources: usize,
+    inspect_limits: oryn_http_inspect::InspectLimits,
+) -> Result<(), String> {
     use base64::Engine as _;
-    validate(spec)?;
+    validate_with(spec, max_resources, inspect_limits)?;
     let record = ValidatedModule {
         ir: spec.inline.clone().unwrap(),
         resources: spec
@@ -90,7 +187,16 @@ fn save_validated(dir: &Path, spec: &oryn_config::ModuleSpec) -> Result<(), Stri
     trim_cache(dir, &file)?;
     Ok(())
 }
-fn restore_validated(dir: &Path, spec: &mut oryn_config::ModuleSpec) -> Result<(), String> {
+#[cfg(test)]
+fn save_validated(dir: &Path, spec: &oryn_config::ModuleSpec) -> Result<(), String> {
+    save_validated_with(dir, spec, MAX_RESOURCES, Default::default())
+}
+fn restore_validated_with(
+    dir: &Path,
+    spec: &mut oryn_config::ModuleSpec,
+    max_resources: usize,
+    inspect_limits: oryn_http_inspect::InspectLimits,
+) -> Result<(), String> {
     use base64::Engine as _;
     let bytes = read_bounded(&dir.join(snapshot_key(spec)), MAX_SNAPSHOT)?;
     let record: ValidatedModule = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
@@ -105,13 +211,17 @@ fn restore_validated(dir: &Path, spec: &mut oryn_config::ModuleSpec) -> Result<(
                 .map_err(|e| e.to_string())?
                 .into(),
         );
-        if module_size(&restored) > MAX_RESOURCES {
+        if module_size(&restored) > max_resources {
             return Err("module cache exceeds resource limit".into());
         }
     }
-    validate(&restored)?;
+    validate_with(&restored, max_resources, inspect_limits)?;
     *spec = restored;
     Ok(())
+}
+#[cfg(test)]
+fn restore_validated(dir: &Path, spec: &mut oryn_config::ModuleSpec) -> Result<(), String> {
+    restore_validated_with(dir, spec, MAX_RESOURCES, Default::default())
 }
 /// 只清理专属下载/已验证缓存目录，绝不删除用户导入的模块文件。
 fn trim_cache(dir: &Path, keep: &Path) -> Result<(), String> {
@@ -222,33 +332,48 @@ async fn prepare_inner_with(
     let mut plans = Vec::new();
     #[cfg(test)]
     let _lifecycle_probe = crate::reload_lifecycle_tests::PrepareProbe::new(&config);
+    let limits = ctx.resource_limits();
+    let max_resources = limits.max_module_resources;
+    let inspect_limits = limits.inspect_limits();
+    let mut shared_resources: HashMap<[u8; 32], Arc<[u8]>> = HashMap::new();
     let mut total = 0;
     let previous = ctx.state();
     let snapshots = ctx.data_dir().map(|d| d.join("modules/.validated"));
     // 执行堆内解析不了的大脚本在校验时编译为字节码，执行时直接读取。
     oryn_script::set_bytecode_cache_dir(ctx.data_dir().map(|d| d.join("modules/.bytecode")));
-    for (index, spec) in config.modules.iter_mut().enumerate().filter(|(_, m)| m.enabled).take(64) {
+    for (index, spec) in config
+        .modules
+        .iter_mut()
+        .enumerate()
+        .filter(|(_, m)| m.enabled)
+        .take(limits.max_modules)
+    {
         // inline/缓存资源可能全程同步完成；入口让出也覆盖资源超限的 continue。
         tokio::task::yield_now().await;
         let mut candidate = spec.clone();
-        let result = load_candidate(ctx, &mut candidate, mode).await;
+        let result =
+            load_candidate(ctx, &mut candidate, mode, max_resources, inspect_limits).await;
         match result {
             Ok(plan) => {
                 // Extension 保持原瞬时生命周期，save_validated 再验证前先释放。
                 let plan = if retain { Some(plan) } else { drop(plan); None };
-                if total + module_size(&candidate) > MAX_RESOURCES {
+                let delta = incremental_module_size(&candidate, &shared_resources);
+                if total + delta > max_resources {
                     spec.enabled = false;
                     spec.resources = Default::default();
                     spec.inline = None;
-                    config
-                        .warnings
-                        .push("module resource total exceeds 8 MiB; module disabled".into());
+                    config.warnings.push(format!(
+                        "module resource total exceeds {} MiB; module disabled",
+                        max_resources / (1024 * 1024)
+                    ));
                     continue;
                 }
                 // 离线启动读的就是缓存，没有新内容可存
                 if spec.url.is_some() && !mode.offline {
                     if let Some(dir) = &snapshots {
-                        if let Err(e) = save_validated(dir, &candidate) {
+                        if let Err(e) =
+                            save_validated_with(dir, &candidate, max_resources, inspect_limits)
+                        {
                             config.warnings.push(format!("module validated cache: {e}"));
                         }
                     }
@@ -259,14 +384,15 @@ async fn prepare_inner_with(
                 }
             }
             Err(e) => {
-                let restored = snapshots
-                    .as_ref()
-                    .is_some_and(|dir| spec.url.is_some() && restore_validated(dir, spec).is_ok());
+                let restored = snapshots.as_ref().is_some_and(|dir| {
+                    spec.url.is_some()
+                        && restore_validated_with(dir, spec, max_resources, inspect_limits).is_ok()
+                });
                 if !restored {
                     let old = previous.config.modules.iter().find(|old| {
                         old.url.is_some()
                             && snapshot_key(old) == snapshot_key(spec)
-                            && validate(old).is_ok()
+                            && validate_with(old, max_resources, inspect_limits).is_ok()
                     });
                     if let Some(old) = old {
                         spec.inline = old.inline.clone();
@@ -276,24 +402,30 @@ async fn prepare_inner_with(
                     }
                 }
                 // 离线启动时尚无缓存：随后联网补齐，不当作失败告警。
-                if e != DEFERRED { config.warnings.push(format!(
-                    "module {} update rejected: {e}; {}",
-                    spec.url.as_deref().unwrap_or("inline"),
-                    if spec.enabled {
-                        "previous validated module retained"
-                    } else {
-                        "module disabled"
-                    }
-                )); }
+                if e != DEFERRED {
+                    config.warnings.push(format!(
+                        "module {} update rejected: {e}; {}",
+                        spec.url.as_deref().unwrap_or("inline"),
+                        if spec.enabled {
+                            "previous validated module retained"
+                        } else {
+                            "module disabled"
+                        }
+                    ));
+                }
             }
         }
         if spec.enabled {
-            total += module_size(spec);
-            if total > MAX_RESOURCES {
+            let delta = incremental_module_size(spec, &shared_resources);
+            if total + delta > max_resources {
                 spec.enabled = false;
-                config
-                    .warnings
-                    .push("module resource total exceeds 8 MiB; module disabled".into());
+                config.warnings.push(format!(
+                    "module resource total exceeds {} MiB; module disabled",
+                    max_resources / (1024 * 1024)
+                ));
+            } else {
+                deduplicate_resources(spec, &mut shared_resources);
+                total += delta;
             }
         }
         if !spec.enabled {
@@ -307,6 +439,8 @@ async fn load_candidate(
     ctx: &Rc<EngineCtx>,
     spec: &mut oryn_config::ModuleSpec,
     mode: &Fetch,
+    max_resources: usize,
+    inspect_limits: oryn_http_inspect::InspectLimits,
 ) -> Result<oryn_http_inspect::Plan, String> {
     if let Some(source) = &spec.url {
         let bytes = resource(ctx, source, spec.update_interval, MAX_MODULE_BYTES, mode).await?;
@@ -365,11 +499,14 @@ async fn load_candidate(
             }
         };
         std::sync::Arc::make_mut(&mut spec.resources).insert(path, data.into());
-        if module_size(spec) > MAX_RESOURCES {
-            return Err("module resource total exceeds 8 MiB".into());
+        if module_size(spec) > max_resources {
+            return Err(format!(
+                "module resource total exceeds {} MiB",
+                max_resources / (1024 * 1024)
+            ));
         }
     }
-    validate(spec)
+    validate_with(spec, max_resources, inspect_limits)
 }
 /// `key=` 之后的值：以 `"` 或 `'` 开头时取到配对引号（可含逗号），否则取到逗号或空白。
 fn option_value<'a>(s: &'a str, key: &str) -> Option<&'a str> {

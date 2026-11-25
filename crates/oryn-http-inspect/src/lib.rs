@@ -2,12 +2,38 @@
 mod compile;
 mod json_path;
 mod syntax;
-pub use compile::{compile_module, compile_module_with_policies, Resources};
+pub use compile::{
+    compile_module, compile_module_with_limits, compile_module_with_policies, Resources,
+};
 use oryn_module::ModuleFormat;
 use serde_json::Value;
-use std::{collections::BTreeMap, io, io::Read, rc::Rc};
+use std::{borrow::Cow, collections::BTreeMap, io, io::Read, rc::Rc};
 
-pub const MAX_BODY: usize = 1024 * 1024;
+pub const DEFAULT_SCRIPT_TIMEOUT: u64 = 10;
+pub const DEFAULT_HTTP_SCRIPT_MAX_TIMEOUT: u64 = 60;
+pub const DEFAULT_BG_SCRIPT_MAX_TIMEOUT: u64 = 300;
+pub const MAX_BODY: usize = 4 * 1024 * 1024;
+pub const DESKTOP_MAX_BODY: usize = 8 * 1024 * 1024;
+
+/// 脚本与 HTTP 检查的资源限额（默认按受限/移动扩展档构造，桌面档可通过 `compile_module_with_limits` 放宽）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InspectLimits {
+    pub default_timeout: u64,
+    pub http_max_timeout: u64,
+    pub bg_max_timeout: u64,
+    pub max_body: usize,
+}
+
+impl Default for InspectLimits {
+    fn default() -> Self {
+        Self {
+            default_timeout: DEFAULT_SCRIPT_TIMEOUT,
+            http_max_timeout: DEFAULT_HTTP_SCRIPT_MAX_TIMEOUT,
+            bg_max_timeout: DEFAULT_BG_SCRIPT_MAX_TIMEOUT,
+            max_body: MAX_BODY,
+        }
+    }
+}
 pub fn invalid(e: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, e.to_string())
 }
@@ -166,12 +192,12 @@ impl Pattern {
             }
         }
     }
-    fn replace(&self, s: &str, r: &str, all: bool) -> io::Result<String> {
+    fn replace_bounded(&self, s: &str, r: &str, all: bool, max_body: usize) -> io::Result<String> {
         let mut out = String::new();
         let mut end = 0;
         // 输出超限即报错；只替换第一处时返回 false 结束循环。
         let next = |out: &String| -> io::Result<bool> {
-            if out.len() > MAX_BODY {
+            if out.len() > max_body {
                 return Err(invalid("rewrite output exceeds limit"));
             }
             Ok(all)
@@ -205,7 +231,7 @@ impl Pattern {
             }
         }
         out.push_str(&s[end..]);
-        if out.len() > MAX_BODY {
+        if out.len() > max_body {
             return Err(invalid("rewrite output exceeds limit"));
         }
         Ok(out)
@@ -337,13 +363,27 @@ pub struct CompiledRule {
     pub dialect: ModuleFormat,
     pub source: String,
 }
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Plan {
     pub request: Vec<CompiledRule>,
     pub response: Vec<CompiledRule>,
     pub scripts: Vec<ScriptRule>,
+    /// 单条消息正文改写上限（由模块编译传入，默认 [`MAX_BODY`]）。
+    pub max_body: usize,
     /// 被跳过的行，由加载方并入配置警告。
     pub warnings: Vec<String>,
+}
+
+impl Default for Plan {
+    fn default() -> Self {
+        Self {
+            request: Vec::new(),
+            response: Vec::new(),
+            scripts: Vec::new(),
+            max_body: MAX_BODY,
+            warnings: Vec::new(),
+        }
+    }
 }
 /// 脚本源码：模块资源本身（已校验为 UTF-8），不另存一份字符串。
 #[derive(Clone)]
@@ -386,8 +426,8 @@ pub struct ScriptRule {
     /// 脚本源码，与模块资源共享同一块内存；交给 worker 线程时也不复制。
     pub code: ScriptCode,
     pub argument: Value,
-    /// 所属模块的环境变量（`ctx.env`），编译后由加载方填入。
-    pub env: std::collections::BTreeMap<String, String>,
+    /// 所属模块的环境变量（`ctx.env`），编译后由加载方填入并跨脚本共享。
+    pub env: std::sync::Arc<std::collections::BTreeMap<String, String>>,
     pub requires_body: bool,
     pub binary: bool,
     pub full_headers: bool,
@@ -473,6 +513,12 @@ impl Plan {
     pub fn is_empty(&self) -> bool {
         self.request.is_empty() && self.response.is_empty() && self.scripts.is_empty()
     }
+
+    pub fn has_response_body_scripts(&self) -> bool {
+        self.scripts
+            .iter()
+            .any(|s| s.enabled && s.kind == "http-response" && s.requires_body)
+    }
     pub fn from_modules(modules: &[oryn_module::ModuleIR], warnings: &mut Vec<String>) -> Self {
         let mut plan = Self::default();
         for m in modules {
@@ -539,7 +585,7 @@ impl Plan {
             for action in &rule.actions {
                 if action.needs_body() { return true; }
                 if rule.dialect == ModuleFormat::Surge && url_rewritten && matches!(action, Action::Url(..)) { continue; }
-                match perform(action, &mut preview, request, &captures) {
+                match perform(action, &mut preview, request, &captures, self.max_body) {
                     Ok(Some(_)) => return false,
                     Ok(None) => { if matches!(action, Action::Url(..)) { url_rewritten = true; } },
                     Err(_) => {},
@@ -621,10 +667,10 @@ impl Plan {
                     }
                 )
             }) {
-                if let Some(mut response) = perform(mock, m, request, &captures)? {
+                if let Some(mut response) = perform(mock, m, request, &captures, self.max_body)? {
                     for a in &rule.actions {
                         if !matches!(a, Action::Mock { .. }) {
-                            if let Err(e) = perform(a, &mut response, Some(m), &captures) {
+                            if let Err(e) = perform(a, &mut response, Some(m), &captures, self.max_body) {
                                 log::warn!("{}: rewrite action skipped: {e}", rule.source);
                             }
                         }
@@ -642,7 +688,7 @@ impl Plan {
                 {
                     continue;
                 }
-                match perform(action, m, request, &captures) {
+                match perform(action, m, request, &captures, self.max_body) {
                     Ok(Some(response)) => return Ok(Some(response)),
                     Ok(None) => {
                         if matches!(action, Action::Url(..)) {
@@ -817,6 +863,7 @@ fn perform(
     m: &mut Message,
     req: Option<&Message>,
     caps: &BTreeMap<String, String>,
+    max_body: usize,
 ) -> io::Result<Option<Message>> {
     // 在修改消息前验证；可选组没参与时仅此动作失败，前后动作仍保留。
     match a {
@@ -858,7 +905,7 @@ fn perform(
             let mut updated = m.headers.clone();
             for (name, value) in updated.iter_mut() {
                 if name.eq_ignore_ascii_case(k) {
-                    let v = p.replace(value, &replacement, true)?;
+                    let v = p.replace_bounded(value, &replacement, true, max_body)?;
                     check_header(k, &v)?;
                     *value = v;
                 }
@@ -869,7 +916,7 @@ fn perform(
             m.headers = updated;
         }
         Action::Url(p, v) => {
-            let url = p.replace(&m.url, &text(v), false)?;
+            let url = p.replace_bounded(&m.url, &text(v), false, max_body)?;
             let u: http::Uri = url.parse().map_err(invalid)?;
             if !matches!(u.scheme_str(), Some("http" | "https" | "ws")) {
                 return Err(invalid("invalid rewritten URL scheme"));
@@ -883,7 +930,7 @@ fn perform(
             m.set_header("Host", authority);
         }
         Action::Redirect(status, p, v) => {
-            let location = p.replace(&m.url, &text(v), false)?;
+            let location = p.replace_bounded(&m.url, &text(v), false, max_body)?;
             check_header("Location", &location)?;
             let mut r = m.response(*status, vec![], "text/plain");
             r.set_header("Location", location);
@@ -941,16 +988,17 @@ fn perform(
             m.length()
         }
         _ => {
-            if m.body.len() > MAX_BODY {
+            if m.body.len() > max_body {
                 return Err(invalid("body exceeds rewrite limit"));
             }
-            let original = decode_body(m)?;
+            let original = decode_body_cow(m, max_body)?;
             let output = match a {
                 Action::BodyRegex(p, r) => p
-                    .replace(
+                    .replace_bounded(
                         std::str::from_utf8(&original).map_err(invalid)?,
                         &text(r),
                         true,
+                        max_body,
                     )?
                     .into_bytes(),
                 Action::Jq(program) => {
@@ -969,7 +1017,7 @@ fn perform(
                 }
                 _ => unreachable!(),
             };
-            if output.len() > MAX_BODY {
+            if output.len() > max_body {
                 return Err(invalid("rewritten body exceeds limit"));
             }
             m.body = output;
@@ -992,14 +1040,19 @@ fn check_header(k: &str, v: &str) -> io::Result<()> {
     http::header::HeaderValue::from_str(v).map_err(invalid)?;
     Ok(())
 }
-pub fn decode_body(m: &Message) -> io::Result<Vec<u8>> {
-    let mut reader: Box<dyn Read + '_> = match m
+/// 按需零拷贝读取正文；未压缩（`identity` 或无 `Content-Encoding`）时直接借用原切片。
+pub fn decode_body_cow<'a>(m: &'a Message, max_body: usize) -> io::Result<Cow<'a, [u8]>> {
+    let encoding = m
         .header("Content-Encoding")
         .unwrap_or("identity")
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "identity" => Box::new(m.body.as_slice()),
+        .to_ascii_lowercase();
+    if encoding == "identity" {
+        if m.body.len() > max_body {
+            return Err(invalid("decompressed body exceeds limit"));
+        }
+        return Ok(Cow::Borrowed(&m.body));
+    }
+    let mut reader: Box<dyn Read + '_> = match encoding.as_str() {
         "gzip" => Box::new(flate2::read::GzDecoder::new(m.body.as_slice())),
         "deflate" => Box::new(flate2::read::ZlibDecoder::new(m.body.as_slice())),
         "br" => Box::new(brotli::Decompressor::new(m.body.as_slice(), 4096)),
@@ -1008,12 +1061,16 @@ pub fn decode_body(m: &Message) -> io::Result<Vec<u8>> {
     let mut out = vec![];
     reader
         .by_ref()
-        .take((MAX_BODY + 1) as u64)
+        .take((max_body + 1) as u64)
         .read_to_end(&mut out)?;
-    if out.len() > MAX_BODY {
+    if out.len() > max_body {
         return Err(invalid("decompressed body exceeds limit"));
     }
-    Ok(out)
+    Ok(Cow::Owned(out))
+}
+
+pub fn decode_body(m: &Message) -> io::Result<Vec<u8>> {
+    decode_body_cow(m, MAX_BODY).map(Cow::into_owned)
 }
 
 #[cfg(test)]
@@ -1104,7 +1161,7 @@ mod pattern_tests {
         assert!(Pattern::new(r"^https:\/\/(a", "").is_err());
         // 替换：前缀不符原样返回
         let p = Pattern::new(r"^http:\/\/a\.com\/(\d+)", "").unwrap();
-        assert_eq!(p.replace("http://a.com/42", "https://b.com/$1", false).unwrap(), "https://b.com/42");
-        assert_eq!(p.replace("http://c.com/42", "x", false).unwrap(), "http://c.com/42");
+        assert_eq!(p.replace_bounded("http://a.com/42", "https://b.com/$1", false, MAX_BODY).unwrap(), "https://b.com/42");
+        assert_eq!(p.replace_bounded("http://c.com/42", "x", false, MAX_BODY).unwrap(), "http://c.com/42");
     }
 }

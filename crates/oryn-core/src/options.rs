@@ -53,7 +53,18 @@ pub(crate) struct ResourceLimits {
     pub http_transactions: Option<usize>,
     pub http_upstream_establish: usize,
     pub udp_sessions: usize,
-    pub http_bodies: usize,
+    /// HTTP 并发正文缓冲总预算（字节，按 4 KiB 页计费）。
+    pub http_body_budget: usize,
+    /// 单个 HTTP 正文上限（字节）。
+    pub http_max_body: usize,
+    /// 单个 QuickJS 脚本运行时堆上限（字节）。
+    pub script_heap_limit: usize,
+    /// 允许启用的模块上限。
+    pub max_modules: usize,
+    /// 编译后允许启用的脚本规则上限。
+    pub max_scripts: usize,
+    /// 已启用模块资源去重后的总大小上限（字节）。
+    pub max_module_resources: usize,
     /// 全部 WG / Tailscale 出站隧道内 TCP 缓冲的合计上限（Oryn_dev/docs/oryncore/plans/plan-wg-worker-and-global-budget.md）。
     pub wg_buffer_budget: usize,
     /// WG 引擎工作线程数。
@@ -61,6 +72,15 @@ pub(crate) struct ResourceLimits {
     /// 单个 Mieru 节点同时活跃的会话上限（官方实现无上限；每会话净内存 ~0.1 MB，
     /// 档位只按引擎准入额度对齐，见 issue #5）。
     pub mieru_sessions: usize,
+}
+
+impl ResourceLimits {
+    pub(crate) fn inspect_limits(self) -> oryn_http_inspect::InspectLimits {
+        oryn_http_inspect::InspectLimits {
+            max_body: self.http_max_body,
+            ..oryn_http_inspect::InspectLimits::default()
+        }
+    }
 }
 
 impl ResourceProfile {
@@ -92,7 +112,36 @@ impl ResourceProfile {
                 _ => establishing,
             },
             udp_sessions,
-            http_bodies: 2,
+            http_body_budget: match self {
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                Self::DesktopHigh => 24 << 20,
+                _ => 6 << 20,
+            },
+            http_max_body: match self {
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                Self::DesktopHigh => oryn_http_inspect::DESKTOP_MAX_BODY,
+                _ => oryn_http_inspect::MAX_BODY,
+            },
+            script_heap_limit: match self {
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                Self::DesktopHigh => 32 << 20,
+                _ => oryn_script::HEAP_LIMIT,
+            },
+            max_modules: match self {
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                Self::DesktopHigh => 256,
+                _ => 128,
+            },
+            max_scripts: match self {
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                Self::DesktopHigh => 512,
+                _ => 256,
+            },
+            max_module_resources: match self {
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                Self::DesktopHigh => 64 << 20,
+                _ => 16 << 20,
+            },
             wg_buffer_budget: match self {
                 Self::Constrained => 4 << 20,
                 #[cfg(target_os = "ios")]

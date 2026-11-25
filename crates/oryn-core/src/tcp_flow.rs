@@ -290,6 +290,7 @@ async fn handle(ctx: Rc<EngineCtx>, mut stream: LwipTcpStream, phase: &crate::ad
             transactions: state.http_transactions.clone(),
             upstream_establish: ctx.http_upstream_establish.clone(),
             bodies: state.http_bodies.clone(),
+            max_body: state.http_plan.max_body,
         };
         let io = crate::http::FlowIo::new(first, stream, conn.clone(), ctx.stats.clone());
         let operation = async {
