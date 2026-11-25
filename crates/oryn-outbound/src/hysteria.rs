@@ -33,7 +33,7 @@ const FAKETCP_UNSUPPORTED: &str =
 use crate::{
     inbox::{self, Inbox},
     reassembly::Reassembly,
-    slots::{Counted, Slots},
+    slots::{Counted, HeldStream, Slots},
 };
 use crate::{resolve_target, BoxStream, Outbound, PacketConn, Resolver, SessionControl};
 
@@ -57,7 +57,7 @@ pub struct HysteriaOutbound {
     resolver: Arc<dyn Resolver>,
     quic: Arc<QuicClient>,
     rate: Arc<AtomicU64>,
-    auth: std::sync::Mutex<Option<Authed>>,
+    auth: std::sync::Mutex<Option<Arc<Authed>>>,
     /// 认证单飞锁：同一时刻只有一个 Flow 做握手往返。
     auth_flight: tokio::sync::Mutex<()>,
     streams: Slots,
@@ -66,7 +66,7 @@ pub struct HysteriaOutbound {
 struct Authed {
     id: usize,
     /// 控制流：保持打开。
-    _control: (quinn::SendStream, quinn::RecvStream),
+    _control: Mutex<(quinn::SendStream, quinn::RecvStream)>,
     hub: Arc<UdpHub>,
 }
 
@@ -186,24 +186,24 @@ impl HysteriaOutbound {
         Ok((addr.ip(), addr.port(), name))
     }
 
-    /// 已认证的连接与它的 UDP 分发器。
-    async fn ready(&self) -> io::Result<(quinn::Connection, Arc<UdpHub>)> {
+    /// 已认证的连接、它的 UDP 分发器与认证状态保活句柄。
+    async fn ready(&self) -> io::Result<(quinn::Connection, Arc<UdpHub>, Arc<Authed>)> {
         let (ip, port, name) = self.peer().await?;
         let conn = self.quic.connection(ip, &name, port).await?;
-        let cached = |auth: &std::sync::Mutex<Option<Authed>>| {
+        let cached = |auth: &std::sync::Mutex<Option<Arc<Authed>>>| {
             auth.lock()
                 .unwrap()
                 .as_ref()
                 .filter(|a| a.id == conn.stable_id() && conn.close_reason().is_none())
-                .map(|a| a.hub.clone())
+                .map(|a| (a.hub.clone(), a.clone()))
         };
         // 缓存命中不排队：网络往返只在单飞锁内做，已认证连接上的新 Flow 不受慢握手影响
-        if let Some(hub) = cached(&self.auth) {
-            return Ok((conn, hub));
+        if let Some((hub, keep)) = cached(&self.auth) {
+            return Ok((conn, hub, keep));
         }
         let _single = self.auth_flight.lock().await;
-        if let Some(hub) = cached(&self.auth) {
-            return Ok((conn, hub));
+        if let Some((hub, keep)) = cached(&self.auth) {
+            return Ok((conn, hub, keep));
         }
         if let Some(reason) = conn.close_reason() {
             return Err(io::Error::other(reason));
@@ -263,13 +263,14 @@ impl HysteriaOutbound {
             });
             *hub.task.lock().unwrap() = Some(task);
         }
-        *self.auth.lock().unwrap() = Some(Authed {
+        let keep = Arc::new(Authed {
             id: conn.stable_id(),
-            _control: (send, recv),
+            _control: Mutex::new((send, recv)),
             hub: hub.clone(),
         });
+        *self.auth.lock().unwrap() = Some(keep.clone());
         guard.0 = None;
-        Ok((conn, hub))
+        Ok((conn, hub, keep))
     }
 }
 
@@ -335,7 +336,7 @@ impl Outbound for HysteriaOutbound {
             .streams
             .acquire(MAX_BIDI)
             .ok_or_else(|| io::Error::other("hysteria stream limit reached"))?;
-        let (conn, _) = self.ready().await?;
+        let (conn, _, auth) = self.ready().await?;
         let (send, recv) = conn.open_bi().await.map_err(io::Error::other)?;
         let stream = TcpStream {
             send,
@@ -344,7 +345,10 @@ impl Outbound for HysteriaOutbound {
             first_written: false,
             response: Response::Pending,
         };
-        Ok(Counted::boxed(Box::new(stream), slot))
+        Ok(HeldStream::boxed(
+            Counted::boxed(Box::new(stream), slot),
+            (self.quic.clone(), auth),
+        ))
     }
 
     async fn bind_udp(&self, first: &TargetAddr) -> io::Result<Box<dyn PacketConn>> {
@@ -354,7 +358,7 @@ impl Outbound for HysteriaOutbound {
                 "hysteria udp is disabled",
             ));
         }
-        let (conn, hub) = self.ready().await?;
+        let (conn, hub, auth) = self.ready().await?;
         if conn.max_datagram_size().is_none() {
             return Err(io::Error::other(
                 "hysteria server does not support datagrams",
@@ -382,7 +386,9 @@ impl Outbound for HysteriaOutbound {
             }
             sessions.insert(id, inbox.clone());
         }
-        Ok(Box::new(HyPacket::new(id, conn, hub, inbox, send, recv)?))
+        Ok(Box::new(
+            HyPacket::new(id, conn, hub, inbox, send, recv)?.with_keep((self.quic.clone(), auth)),
+        ))
     }
 }
 
@@ -586,9 +592,15 @@ struct HyPacket {
     rx: SessionInbox,
     /// 每关联至多一个读取任务；Drop 撤销，不另起清理任务。
     keeper: tokio::task::JoinHandle<()>,
+    _keep: Option<(Arc<QuicClient>, Arc<Authed>)>,
 }
 
 impl HyPacket {
+    fn with_keep(mut self, keep: (Arc<QuicClient>, Arc<Authed>)) -> Self {
+        self._keep = Some(keep);
+        self
+    }
+
     fn new(
         id: u32,
         conn: quinn::Connection,
@@ -621,6 +633,7 @@ impl HyPacket {
             hub,
             rx,
             keeper,
+            _keep: None,
         })
     }
 }

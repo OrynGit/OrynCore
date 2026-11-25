@@ -248,10 +248,9 @@ async fn handle(ctx: Rc<EngineCtx>, mut stream: LwipTcpStream, phase: &crate::ad
         let host = tls_host.clone().unwrap_or_else(|| destination.ip().to_string());
         let config = state
             .mitm_ca
-            .borrow_mut()
-            .as_mut()
+            .as_ref()
             .ok_or_else(|| io::Error::other("MITM enabled without a valid CA"))
-            .and_then(|c| c.server_config(&host, state.config.mitm.http2));
+            .and_then(|c| c.borrow_mut().server_config(&host, state.config.mitm.http2));
         match config {
             Ok(c) => mitm_config = Some(c),
             Err(e) => {
@@ -270,7 +269,6 @@ async fn handle(ctx: Rc<EngineCtx>, mut stream: LwipTcpStream, phase: &crate::ad
         if mitm {
             conn.set_modified();
         }
-        let mut cancel = state.inspection_cancel.subscribe();
         let host = tls_host.unwrap_or_else(|| destination.ip().to_string());
         let authority = if host.contains(':') {
             format!("[{host}]")
@@ -326,7 +324,7 @@ async fn handle(ctx: Rc<EngineCtx>, mut stream: LwipTcpStream, phase: &crate::ad
                 inspector.serve(io, false).await
             }
         };
-        let result = tokio::select! { result=operation=>result, _=async{while !*cancel.borrow(){if cancel.changed().await.is_err(){break}}}=>Ok(()), _=conn.cancelled()=>Ok(()) };
+        let result = tokio::select! { result = operation => result, _ = conn.cancelled() => Ok(()) };
         if let Err(e) = result {
             conn.set_error(&e);
             warn!("TCP #{id} {label} HTTP inspection: {e}");

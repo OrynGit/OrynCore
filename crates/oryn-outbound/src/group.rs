@@ -3,7 +3,7 @@
 //! 策略组本身也是一个 Outbound。连接时先用 [`resolve`] 沿策略组一路选出最终的叶子出站，
 //! 得到完整链路（如 `Proxy → Auto → Tokyo`）后再由叶子出站建立连接。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -79,6 +79,12 @@ impl HealthStore {
                 checked_at: SystemTime::now(),
             },
         );
+    }
+
+    /// 增量重载后裁剪已移除节点的陈旧测速记录。
+    pub fn retain_names(&self, keep: &HashSet<&str>) {
+        self.map.lock().unwrap().retain(|k, _| keep.contains(k.as_str()));
+        self.udp.lock().unwrap().retain(|k, _| keep.contains(k.as_str()));
     }
 }
 
@@ -238,6 +244,20 @@ impl GroupOutbound {
 
     pub fn health_spec(&self) -> &HealthSpec {
         &self.health_spec
+    }
+
+    pub fn health_store(&self) -> &Arc<HealthStore> {
+        &self.store
+    }
+
+    pub fn current_member_name(&self) -> Option<String> {
+        if self.members.is_empty() {
+            return None;
+        }
+        match self.kind {
+            GroupKind::LoadBalance(_) | GroupKind::Smart => None,
+            _ => Some(self.members[self.current_index()].tag().to_string()),
+        }
     }
 
     /// 最近一次被使用距今的秒数；从未使用返回 `None`。

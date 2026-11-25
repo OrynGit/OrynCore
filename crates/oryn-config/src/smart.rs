@@ -19,6 +19,14 @@ pub struct NamePreference {
     pub regex: Option<regex::Regex>,
     pub factor: f64,
 }
+impl PartialEq for NamePreference {
+    fn eq(&self, other: &Self) -> bool {
+        self.contains == other.contains
+            && self.regex.as_ref().map(regex::Regex::as_str)
+                == other.regex.as_ref().map(regex::Regex::as_str)
+            && self.factor.to_bits() == other.factor.to_bits()
+    }
+}
 /// 调度参数；默认值即设计初值，范围在解析时校验。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SmartTuning {
@@ -66,7 +74,7 @@ impl Default for SmartTuning {
         }
     }
 }
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct SmartSpec {
     pub tuning: SmartTuning,
     pub server_strategy: ServerStrategy,

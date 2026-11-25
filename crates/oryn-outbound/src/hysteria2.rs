@@ -10,7 +10,7 @@ use std::time::Duration;
 use crate::{
     inbox::{self, Inbox},
     reassembly::Reassembly,
-    slots::{Counted, Slots},
+    slots::{Counted, HeldStream, Slots},
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -35,7 +35,7 @@ pub struct Hysteria2Outbound {
     resolver: Arc<dyn Resolver>,
     quic: Arc<QuicClient>,
     brutal: Option<Arc<AtomicU64>>,
-    auth: Mutex<Option<AuthCache>>,
+    auth: Mutex<Option<Arc<AuthCache>>>,
     /// 认证单飞锁，见 `authenticate`。
     auth_flight: tokio::sync::Mutex<()>,
     #[cfg(test)]
@@ -44,13 +44,20 @@ pub struct Hysteria2Outbound {
     udp: Mutex<Option<Arc<UdpHub>>>,
 }
 
+#[derive(Debug)]
 struct AuthCache {
     id: usize,
     udp: bool,
     task: JoinHandle<()>,
     /// h3 的 `SendRequest` 句柄。最后一个句柄释放时 h3 会以 H3_NO_ERROR 关闭整条 QUIC 连接，
     /// 而认证之后的 TCP / UDP 都复用这条连接，所以句柄必须与连接同寿命。
-    _send: Box<dyn std::any::Any + Send>,
+    _send: Mutex<Box<dyn std::any::Any + Send>>,
+}
+
+impl Drop for AuthCache {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 // 仅单飞拥有者持有：所有认证 await（包括 h3 初始化）失败/取消均回滚。
@@ -175,15 +182,15 @@ impl Hysteria2Outbound {
         Ok((addr.ip(), addr.port(), name))
     }
 
-    async fn ready(&self) -> io::Result<(quinn::Connection, bool)> {
+    async fn ready(&self) -> io::Result<(quinn::Connection, bool, Arc<AuthCache>)> {
         // 认证改变 BBR / Brutal 模式时重建一次；稳定响应不重复关闭。
         // 服务端连续改变模式时仍最多两次尝试，避免无限重连。
         for _ in 0..2 {
             let (ip, port, name) = self.peer().await?;
             let conn = self.quic.connection(ip, &name, port).await?;
-            let udp = self.authenticate(&conn).await?;
+            let (udp, auth) = self.authenticate(&conn).await?;
             if conn.close_reason().is_none() {
-                return Ok((conn, udp));
+                return Ok((conn, udp, auth));
             }
         }
         Err(io::Error::new(
@@ -192,25 +199,25 @@ impl Hysteria2Outbound {
         ))
     }
 
-    fn cached_auth(&self, id: usize) -> Option<bool> {
+    fn cached_auth(&self, id: usize) -> Option<(bool, Arc<AuthCache>)> {
         self.auth
             .lock()
             .unwrap()
             .as_ref()
             .filter(|cache| cache.id == id)
-            .map(|cache| cache.udp)
+            .map(|cache| (cache.udp, cache.clone()))
     }
 
-    async fn authenticate(&self, conn: &quinn::Connection) -> io::Result<bool> {
+    async fn authenticate(&self, conn: &quinn::Connection) -> io::Result<(bool, Arc<AuthCache>)> {
         let id = conn.stable_id();
-        if let Some(udp) = self.cached_auth(id) {
-            return Ok(udp);
+        if let Some(cached) = self.cached_auth(id) {
+            return Ok(cached);
         }
         // 单飞：同一条连接上只能有一个 h3 客户端（RFC 9114 每端只有一条控制流），
         // 并发首次使用的 Flow 在这里排队，等先到者认证完直接用缓存
         let _single = self.auth_flight.lock().await;
-        if let Some(udp) = self.cached_auth(id) {
-            return Ok(udp);
+        if let Some(cached) = self.cached_auth(id) {
+            return Ok(cached);
         }
         if conn.close_reason().is_some() {
             return Err(io::Error::new(
@@ -263,18 +270,16 @@ impl Hysteria2Outbound {
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or(""),
         );
-        let keep = AuthCache {
+        let keep = Arc::new(AuthCache {
             id,
             udp,
             task,
-            _send: Box::new(send),
-        };
-        if let Some(old) = self.auth.lock().unwrap().replace(keep) {
-            old.task.abort();
-        }
+            _send: Mutex::new(Box::new(send)),
+        });
+        *self.auth.lock().unwrap() = Some(keep.clone());
         attempt.published = true;
         self.udp.lock().unwrap().take();
-        Ok(udp)
+        Ok((udp, keep))
     }
 
     fn apply_server_rate(&self, value: &str) {
@@ -317,8 +322,11 @@ impl Outbound for Hysteria2Outbound {
             .streams
             .acquire(MAX_BIDI)
             .ok_or_else(|| io::Error::other("hysteria2 stream limit reached"))?;
-        let (conn, _) = self.ready().await?;
-        Ok(Counted::boxed(open_tcp(&conn, target).await?, slot))
+        let (conn, _, auth) = self.ready().await?;
+        Ok(HeldStream::boxed(
+            Counted::boxed(open_tcp(&conn, target).await?, slot),
+            (self.quic.clone(), auth),
+        ))
     }
     async fn bind_udp(&self, _first: &TargetAddr) -> io::Result<Box<dyn PacketConn>> {
         if !self.spec.udp {
@@ -327,12 +335,12 @@ impl Outbound for Hysteria2Outbound {
                 "hysteria2 udp is disabled",
             ));
         }
-        let (conn, udp) = self.ready().await?;
+        let (conn, udp, auth) = self.ready().await?;
         if !udp {
             return Err(io::Error::other("hysteria2 server disabled udp"));
         }
         let hub = self.hub(conn).await?;
-        hub.open_session()
+        hub.open_session((self.quic.clone(), auth))
     }
 }
 
@@ -529,7 +537,10 @@ impl UdpHub {
         }
     }
 
-    fn open_session(self: &Arc<Self>) -> io::Result<Box<dyn PacketConn>> {
+    fn open_session(
+        self: &Arc<Self>,
+        keep: (Arc<QuicClient>, Arc<AuthCache>),
+    ) -> io::Result<Box<dyn PacketConn>> {
         let mut sessions = self.sessions.lock().unwrap();
         if sessions.len() >= MAX_SESSIONS {
             return Err(io::Error::other("hysteria2 udp session limit reached"));
@@ -547,6 +558,7 @@ impl UdpHub {
             conn: self.conn.clone(),
             hub: self.clone(),
             rx: inbox,
+            _keep: keep,
         }))
     }
 }
@@ -568,6 +580,7 @@ struct HyPacket {
     conn: quinn::Connection,
     hub: Arc<UdpHub>,
     rx: SessionInbox,
+    _keep: (Arc<QuicClient>, Arc<AuthCache>),
 }
 
 #[async_trait]

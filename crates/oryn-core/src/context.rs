@@ -1,19 +1,22 @@
 //! 事件循环线程内共享的状态。
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::net::IpAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use log::warn;
-use oryn_config::{Mode, OutboundKind, RuntimeConfig};
+use oryn_config::{Mode, ModuleSpec, OutboundKind, ProxyProviderSource, RuntimeConfig};
 use oryn_dns::{DirectTargetResolver, DnsEngine, ProxyServerResolver, Routing};
 use oryn_http_inspect::Plan as HttpPlan;
 use oryn_netstack::LwipStack;
-use oryn_outbound::{build_outbounds_with_data_dir, BuildContext, HealthStore, SessionControl};
+use oryn_outbound::{
+    build_outbounds_reusing, BuildContext, HealthStore, PreviousOutbounds, SessionControl,
+};
 use oryn_router::{GeoIp, Router, RuleSetStore};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
@@ -29,7 +32,10 @@ pub const MAX_CONCURRENT_DNS: usize = 128;
 /// 一份运行时配置及其后台任务。重载时整体替换；已建立的 Flow 继续使用旧的。
 pub struct RuntimeState {
     pub base_config: RuntimeConfig,
-    pub inspection_cancel: tokio::sync::watch::Sender<bool>,
+    pub aux_cancel: tokio::sync::watch::Sender<bool>,
+    pub prepared_modules: Vec<ModuleSpec>,
+    pub compiled_modules_enabled: Vec<bool>,
+    pub module_compile_warnings: Vec<String>,
     pub config: RuntimeConfig,
     pub routing: Arc<Routing>,
     pub rule_sets: Arc<RuleSetStore>,
@@ -37,7 +43,7 @@ pub struct RuntimeState {
     pub sessions: Vec<Arc<dyn SessionControl>>,
     pub http_plan: Rc<HttpPlan>,
     pub scripts: Arc<crate::scripts::ScriptHost>,
-    pub mitm_ca: RefCell<Option<oryn_mitm::CertificateAuthority>>,
+    pub mitm_ca: Option<Rc<RefCell<oryn_mitm::CertificateAuthority>>>,
     pub http_transactions: Option<Arc<tokio::sync::Semaphore>>,
     pub http_bodies: Arc<tokio::sync::Semaphore>,
     pub geo_started: Cell<bool>,
@@ -74,6 +80,12 @@ impl Drop for RuntimeState {
     }
 }
 
+type CachedCa = (
+    PathBuf,
+    Option<(SystemTime, u64)>,
+    Rc<RefCell<oryn_mitm::CertificateAuthority>>,
+);
+
 pub struct EngineCtx {
     pub admission: crate::admission::Admission,
     pub iperf: Rc<crate::iperf::Manager>,
@@ -85,6 +97,12 @@ pub struct EngineCtx {
     pub reload_modules_dirty: Cell<bool>,
     pub selection_revision: Cell<u64>,
     pub mode_revision: Cell<u64>,
+    pub initialized: Cell<bool>,
+    pub health: Arc<HealthStore>,
+    pub config_generation: Cell<u64>,
+    pub resource_revision: Cell<u64>,
+    pub proxy_provider_overrides: RefCell<HashMap<String, String>>,
+    mitm_ca_cache: RefCell<Option<CachedCa>>,
     pub script_host: Arc<crate::scripts::ScriptHost>,
     pub http_transactions: Option<Arc<tokio::sync::Semaphore>>,
     pub http_bodies: Arc<tokio::sync::Semaphore>,
@@ -98,7 +116,7 @@ pub struct EngineCtx {
     pub geoip: Arc<GeoIp>,
     pub asn: Arc<GeoIp>,
     pub databases: [geo::DatabaseStatus; 2],
-    pub database_download: tokio::sync::Mutex<()>,
+    pub database_download: Arc<tokio::sync::Mutex<()>>,
     pub maxmind: RefCell<Option<crate::options::MaxMindOptions>>,
     pub state: RefCell<Rc<RuntimeState>>,
     pub conns: Rc<ConnRegistry>,
@@ -135,6 +153,12 @@ fn block_quic_mode(value: &str) -> Option<&'static str> {
 /// MITM 握手失败后直通的时长与条目上限。
 const MITM_BYPASS_TTL: std::time::Duration = std::time::Duration::from_secs(600);
 const MAX_MITM_BYPASS: usize = 256;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ApplyMode {
+    FullReload,
+    PartialUpdate,
+}
 
 impl EngineCtx {
     pub fn desktop_reload_compile(&self) -> bool {
@@ -209,6 +233,7 @@ impl EngineCtx {
         oryn_outbound::wireguard_resources::set_pressure(
             oryn_outbound::wireguard_resources::Pressure::Normal,
         );
+        let health = Arc::new(HealthStore::default());
         let ctx = EngineCtx {
             admission: crate::admission::Admission::new(options.resource_profile),
             iperf: Rc::new(crate::iperf::Manager::default()),
@@ -220,6 +245,12 @@ impl EngineCtx {
             reload_modules_dirty: Cell::new(false),
             selection_revision: Cell::new(0),
             mode_revision: Cell::new(0),
+            initialized: Cell::new(false),
+            health: health.clone(),
+            config_generation: Cell::new(0),
+            resource_revision: Cell::new(0),
+            proxy_provider_overrides: RefCell::new(HashMap::new()),
+            mitm_ca_cache: RefCell::new(None),
             script_host: Arc::new(crate::scripts::ScriptHost::new(options.data_dir.as_deref())),
             http_transactions: limits
                 .http_transactions
@@ -239,9 +270,9 @@ impl EngineCtx {
             geoip: Arc::new(GeoIp::default()),
             asn: Arc::new(GeoIp::default()),
             databases: Default::default(),
-            database_download: tokio::sync::Mutex::new(()),
+            database_download: Arc::new(tokio::sync::Mutex::new(())),
             maxmind: RefCell::new(options.maxmind.clone()),
-            state: RefCell::new(Rc::new(empty_state(&config))),
+            state: RefCell::new(Rc::new(empty_state(&config, &health))),
             conns: Rc::new(ConnRegistry::default()),
             close_on_policy_switch: Cell::new(options.close_connections_on_policy_switch),
             block_quic: Cell::new(block_quic_mode(&options.block_quic).unwrap_or("default")),
@@ -296,6 +327,9 @@ impl EngineCtx {
     }
 
     pub fn set_local_proxy(self: &Rc<Self>, options: LocalProxyOptions) {
+        if *self.local_proxy.borrow() == options {
+            return;
+        }
         *self.local_proxy.borrow_mut() = options;
         crate::local_proxy::restart(self);
     }
@@ -356,16 +390,73 @@ impl EngineCtx {
 
     /// 加载一份新配置：构建出站、路由、DNS，并启动后台任务。
     pub fn apply_config(self: &Rc<Self>, config: RuntimeConfig) {
-        self.apply_config_with_plans(config, Vec::new());
+        self.apply_config_inner(ApplyMode::FullReload, config, Vec::new());
     }
 
     pub(crate) fn apply_prepared(self: &Rc<Self>, prepared: crate::modules::PreparedConfig) {
         let (config, plans) = prepared.into_parts();
-        self.apply_config_with_plans(config, plans);
+        self.apply_config_inner(ApplyMode::FullReload, config, plans);
     }
 
-    fn apply_config_with_plans(
+    pub(crate) fn apply_partial(self: &Rc<Self>, config: RuntimeConfig) {
+        self.apply_config_inner(ApplyMode::PartialUpdate, config, Vec::new());
+    }
+
+    pub(crate) fn apply_prepared_partial(
         self: &Rc<Self>,
+        prepared: crate::modules::PreparedConfig,
+    ) {
+        let (config, plans) = prepared.into_parts();
+        self.apply_config_inner(ApplyMode::PartialUpdate, config, plans);
+    }
+
+    fn load_or_reuse_mitm_ca(
+        &self,
+        warnings: &mut Vec<String>,
+    ) -> Option<Rc<RefCell<oryn_mitm::CertificateAuthority>>> {
+        let dir = self.data_dir()?.parent()?.join("mitm");
+        let path = dir.join("identity.json");
+        let meta = std::fs::metadata(&path)
+            .ok()
+            .map(|m| (m.modified().unwrap_or(SystemTime::UNIX_EPOCH), m.len()));
+        if let (Some(cur_meta), Some((cached_path, Some(cached_meta), ca))) =
+            (meta, self.mitm_ca_cache.borrow().as_ref())
+        {
+            if *cached_path == path && *cached_meta == cur_meta {
+                return Some(ca.clone());
+            }
+        }
+        let load = || -> std::io::Result<oryn_mitm::CertificateAuthority> {
+            use base64::Engine as _;
+            let file = std::fs::read(&path)?;
+            let identity: serde_json::Value = serde_json::from_slice(&file)?;
+            let decode = |name: &str| {
+                base64::engine::general_purpose::STANDARD
+                    .decode(identity[name].as_str().unwrap_or(""))
+                    .map_err(std::io::Error::other)
+            };
+            oryn_mitm::CertificateAuthority::from_material(oryn_mitm::CaMaterial {
+                certificate_der: decode("certificate_der")?,
+                private_key_der: decode("private_key_der")?,
+            })
+        };
+        match load() {
+            Ok(c) => {
+                let ca = Rc::new(RefCell::new(c));
+                *self.mitm_ca_cache.borrow_mut() = Some((path, meta, ca.clone()));
+                Some(ca)
+            }
+            Err(e) => {
+                *self.mitm_ca_cache.borrow_mut() = None;
+                warnings.push(format!("MITM CA unavailable: {e}"));
+                None
+            }
+        }
+    }
+
+    fn apply_config_inner(
+        self: &Rc<Self>,
+        mode: ApplyMode,
         config: RuntimeConfig,
         plans: Vec<(usize, HttpPlan)>,
     ) {
@@ -373,9 +464,13 @@ impl EngineCtx {
             warn!("configuration retained: {error}");
             return;
         }
-        self.iperf.cancel("configuration reloaded");
-        self.network_test.cancel("configuration reloaded");
-        self.selftest.cancel("configuration reloaded");
+        let is_reload = self.initialized.get();
+        let old = self.state();
+        if mode == ApplyMode::FullReload && is_reload {
+            self.iperf.cancel("configuration reloaded");
+            self.network_test.cancel("configuration reloaded");
+            self.selftest.cancel("configuration reloaded");
+        }
         let base_config = config.clone();
         let mut config = config;
         if let Some(settings) = self.maxmind.borrow().as_ref() {
@@ -393,77 +488,114 @@ impl EngineCtx {
                 }
             }
         }
-        for spec in &mut config.modules {
-            let Some(ir) = spec.inline.as_ref().filter(|_| spec.enabled) else {
-                continue;
-            };
-            match crate::modules::allowed(ir, self.system_version()) {
-                Ok(warnings) => {
-                    let label = spec.url.as_deref().unwrap_or("inline");
-                    for w in warnings {
-                        config.warnings.push(format!("module {label}: {w}"));
-                    }
-                }
-                Err(reason) => {
-                    spec.enabled = false;
-                    config.warnings.push(format!(
-                        "module {} disabled: {reason}",
-                        spec.url.as_deref().unwrap_or("inline")
-                    ));
-                }
+
+        let prepared_modules = config.modules.clone();
+        let can_reuse_plan =
+            is_reload && plans.is_empty() && prepared_modules == old.prepared_modules;
+        let (http_plan, compiled_modules_enabled, module_compile_warnings) = if can_reuse_plan {
+            for (spec, &enabled) in config
+                .modules
+                .iter_mut()
+                .zip(&old.compiled_modules_enabled)
+            {
+                spec.enabled = enabled;
             }
-        }
-        let mut plans = plans.into_iter().peekable();
-        let mut plan = HttpPlan::default();
-        for (index, spec) in config
-            .modules
-            .iter_mut()
-            .enumerate()
-            .filter(|(_, m)| m.enabled)
-        {
-            if let Some(ir) = &spec.inline {
-                // allowed 已执行；只有 prepare 接受的同一份 spec 才能携带 Plan。
-                while plans.peek().is_some_and(|(i, _)| *i < index) {
-                    plans.next(); // allowed 禁用的模块不复用，也不保留其 Plan。
-                }
-                let cached = if plans.peek().is_some_and(|(i, _)| *i == index) {
-                    plans.next().map(|(_, plan)| plan)
-                } else {
-                    None
+            config
+                .warnings
+                .extend(old.module_compile_warnings.iter().cloned());
+            (
+                old.http_plan.clone(),
+                old.compiled_modules_enabled.clone(),
+                old.module_compile_warnings.clone(),
+            )
+        } else {
+            let mut module_compile_warnings = Vec::new();
+            for spec in &mut config.modules {
+                let Some(ir) = spec.inline.as_ref().filter(|_| spec.enabled) else {
+                    continue;
                 };
-                let compiled = match cached {
-                    Some(plan) => Ok(plan),
-                    None => oryn_http_inspect::compile_module_with_policies(
-                        ir,
-                        &spec.arguments.iter().cloned().collect(),
-                        &spec.resources,
-                        &spec.policy_map,
-                    ),
-                };
-                match compiled {
-                    Ok(p) => {
-                        plan.request.extend(p.request);
-                        plan.response.extend(p.response);
-                        plan.scripts.extend(p.scripts.into_iter().map(|mut s| {
-                            s.env = spec.env.clone();
-                            s
-                        }));
-                        config.warnings.extend(p.warnings);
+                match crate::modules::allowed(ir, self.system_version()) {
+                    Ok(warnings) => {
+                        let label = spec.url.as_deref().unwrap_or("inline");
+                        for w in warnings {
+                            let msg = format!("module {label}: {w}");
+                            module_compile_warnings.push(msg.clone());
+                            config.warnings.push(msg);
+                        }
                     }
-                    Err(e) => {
+                    Err(reason) => {
                         spec.enabled = false;
-                        config
-                            .warnings
-                            .push(format!("module disabled; compile failed: {e}"));
+                        let msg = format!(
+                            "module {} disabled: {reason}",
+                            spec.url.as_deref().unwrap_or("inline")
+                        );
+                        module_compile_warnings.push(msg.clone());
+                        config.warnings.push(msg);
                     }
                 }
             }
-        }
-        drop(plans);
-        if plan.scripts.len() > 64 {
-            plan.scripts.truncate(64);
-            config.warnings.push("script count exceeds 64".into());
-        }
+            let mut plans = plans.into_iter().peekable();
+            let mut plan = HttpPlan::default();
+            for (index, spec) in config
+                .modules
+                .iter_mut()
+                .enumerate()
+                .filter(|(_, m)| m.enabled)
+            {
+                if let Some(ir) = &spec.inline {
+                    // allowed 已执行；只有 prepare 接受的同一份 spec 才能携带 Plan。
+                    while plans.peek().is_some_and(|(i, _)| *i < index) {
+                        plans.next(); // allowed 禁用的模块不复用，也不保留其 Plan。
+                    }
+                    let cached = if plans.peek().is_some_and(|(i, _)| *i == index) {
+                        plans.next().map(|(_, plan)| plan)
+                    } else {
+                        None
+                    };
+                    let compiled = match cached {
+                        Some(plan) => Ok(plan),
+                        None => oryn_http_inspect::compile_module_with_policies(
+                            ir,
+                            &spec.arguments.iter().cloned().collect(),
+                            &spec.resources,
+                            &spec.policy_map,
+                        ),
+                    };
+                    match compiled {
+                        Ok(p) => {
+                            plan.request.extend(p.request);
+                            plan.response.extend(p.response);
+                            plan.scripts.extend(p.scripts.into_iter().map(|mut s| {
+                                s.env = spec.env.clone();
+                                s
+                            }));
+                            module_compile_warnings.extend(p.warnings.iter().cloned());
+                            config.warnings.extend(p.warnings);
+                        }
+                        Err(e) => {
+                            spec.enabled = false;
+                            let msg = format!("module disabled; compile failed: {e}");
+                            module_compile_warnings.push(msg.clone());
+                            config.warnings.push(msg);
+                        }
+                    }
+                }
+            }
+            drop(plans);
+            if plan.scripts.len() > 64 {
+                plan.scripts.truncate(64);
+                let msg = "script count exceeds 64".to_string();
+                module_compile_warnings.push(msg.clone());
+                config.warnings.push(msg);
+            }
+            plan.share_jq_programs();
+            let compiled_modules_enabled = config.modules.iter().map(|m| m.enabled).collect();
+            (
+                Rc::new(plan),
+                compiled_modules_enabled,
+                module_compile_warnings,
+            )
+        };
         if let Err(e) = oryn_config::merge_module_patches(&mut config) {
             config.warnings.push(e.to_string());
         }
@@ -494,44 +626,34 @@ impl EngineCtx {
             }
             config.warnings.extend(needs);
         }
-        plan.share_jq_programs();
-        let http_plan = Rc::new(plan);
         let mitm_ca = if config.mitm.enabled {
-            self.data_dir().and_then(|p| {
-                let dir = p.parent()?.join("mitm");
-                let load = || -> std::io::Result<oryn_mitm::CertificateAuthority> {
-                    use base64::Engine as _;
-                    let file = std::fs::read(dir.join("identity.json"))?;
-                    let identity: serde_json::Value = serde_json::from_slice(&file)?;
-                    let decode = |name: &str| {
-                        base64::engine::general_purpose::STANDARD
-                            .decode(identity[name].as_str().unwrap_or(""))
-                            .map_err(std::io::Error::other)
-                    };
-                    oryn_mitm::CertificateAuthority::from_material(oryn_mitm::CaMaterial {
-                        certificate_der: decode("certificate_der")?,
-                        private_key_der: decode("private_key_der")?,
-                    })
-                };
-                match load() {
-                    Ok(c) => Some(c),
-                    Err(e) => {
-                        config.warnings.push(format!("MITM CA unavailable: {e}"));
-                        None
-                    }
-                }
-            })
+            self.load_or_reuse_mitm_ca(&mut config.warnings)
         } else {
             None
         };
         for w in &config.warnings {
             warn!("config: {w}");
         }
-        let store = Arc::new(RuleSetStore::new(&config.providers));
-        let providers_use_geo = providers::load_local(&config, &store, self.data_dir());
-        self.dns
-            .apply(config.dns.clone(), config.hosts.clone(), store.clone());
-        let health = Arc::new(HealthStore::inherit_smart(&self.state().health));
+        let prev_rules = is_reload.then(|| (&old.config, old.rule_sets.as_ref()));
+        let store_build = providers::build_store(&config, prev_rules, self.data_dir());
+        let store = store_build.store;
+        let providers_use_geo = store_build.uses_geoip;
+        let dns_rulesets_changed = store_build.dns_rulesets_changed;
+        let url_changed_rule_indices = store_build.url_changed_indices;
+
+        if !is_reload {
+            self.dns
+                .apply(config.dns.clone(), config.hosts.clone(), store.clone());
+        } else {
+            self.dns.apply_incremental(
+                config.dns.clone(),
+                config.hosts.clone(),
+                store.clone(),
+                dns_rulesets_changed,
+            );
+        }
+
+        let health = self.health.clone();
         let build = BuildContext {
             proxy_resolver: Arc::new(ProxyServerResolver(self.dns.clone())),
             direct_resolver: Arc::new(DirectTargetResolver(self.dns.clone())),
@@ -539,11 +661,17 @@ impl EngineCtx {
             selections: self.selections.borrow().clone(),
             mieru_sessions: self.options.resource_profile.limits().mieru_sessions,
         };
-        // 配置切换前终止旧身份的数据面，不让旧 Flow 跨身份继续运行。
-        for session in &self.state().sessions {
-            session.on_config_replaced();
+        let prev_outbounds = is_reload.then(|| PreviousOutbounds {
+            specs: &old.config.outbounds,
+            outbounds: &old.routing.outbounds,
+        });
+        let outbounds =
+            build_outbounds_reusing(&config, &build, self.data_dir(), prev_outbounds).outbounds;
+        if is_reload {
+            let live_names: HashSet<&str> =
+                config.outbounds.iter().map(|o| o.name.as_str()).collect();
+            self.health.retain_names(&live_names);
         }
-        let outbounds = build_outbounds_with_data_dir(&config, &build, self.data_dir());
         let sessions = outbounds
             .iter()
             .filter_map(|outbound| outbound.session_control())
@@ -557,9 +685,39 @@ impl EngineCtx {
         let needs_geo = providers_use_geo || geo::rules_need_geoip(&config);
         let scripts = self.script_host.clone();
         scripts.set_network(routing.clone(), self.dns.clone());
+
+        let cancel_country = is_reload && old.config.geoip.url != config.geoip.url;
+        let cancel_asn = is_reload && old.config.geoip.asn_url != config.geoip.asn_url;
+        let mut changed_proxy_indices = Vec::new();
+        if is_reload {
+            let old_proxy_urls: HashMap<&str, &str> = old
+                .config
+                .proxy_providers
+                .iter()
+                .filter_map(|p| match &p.source {
+                    ProxyProviderSource::Http { url, .. } => Some((p.name.as_str(), url.as_str())),
+                    _ => None,
+                })
+                .collect();
+            for (idx, p) in config.proxy_providers.iter().enumerate() {
+                if let ProxyProviderSource::Http { url, .. } = &p.source {
+                    if old_proxy_urls
+                        .get(p.name.as_str())
+                        .is_some_and(|old_u| *old_u != url.as_str())
+                    {
+                        changed_proxy_indices.push(idx);
+                    }
+                }
+            }
+        }
+        let plan_changed = is_reload && !Rc::ptr_eq(&old.http_plan, &http_plan);
+
         let state = Rc::new(RuntimeState {
             base_config,
-            inspection_cancel: tokio::sync::watch::channel(false).0,
+            aux_cancel: tokio::sync::watch::channel(false).0,
+            prepared_modules,
+            compiled_modules_enabled,
+            module_compile_warnings,
             config,
             routing,
             rule_sets: store,
@@ -567,22 +725,37 @@ impl EngineCtx {
             sessions,
             http_plan,
             scripts,
-            mitm_ca: RefCell::new(mitm_ca),
+            mitm_ca,
             http_transactions: self.http_transactions.clone(),
             http_bodies: self.http_bodies.clone(),
             geo_started: Cell::new(false),
             needs_geo,
             tasks: RefCell::new(Vec::new()),
         });
-        self.script_host.cancel();
-        self.state().inspection_cancel.send_replace(true);
+        drop(old);
         let old = self.state.replace(state.clone());
+        self.initialized.set(true);
+        if mode == ApplyMode::FullReload {
+            self.config_generation
+                .set(self.config_generation.get().wrapping_add(1));
+        }
+        self.resource_revision
+            .set(self.resource_revision.get().wrapping_add(1));
+        if plan_changed {
+            let _ = old.aux_cancel.send_replace(true);
+        }
         // 只取消旧代维护任务，不关闭仍持旧路由的正常Flow，也不取消当前提交者pending_reload。
         old.cancel_tasks();
+        if cancel_country {
+            geo::cancel_in_flight(self, geo::Kind::Country);
+        }
+        if cancel_asn {
+            geo::cancel_in_flight(self, geo::Kind::Asn);
+        }
         crate::modules::schedule(self, &state);
         crate::scripts::schedule(&state);
-        providers::spawn_updates(self, &state);
-        crate::proxy_providers::spawn_updates(self, &state);
+        providers::spawn_updates_with_changed(self, &state, &url_changed_rule_indices);
+        crate::proxy_providers::spawn_updates_with_changed(self, &state, &changed_proxy_indices);
         health::spawn_checks(&state);
         health::spawn_provider_checks(&state);
         public_ip::spawn(self, &state);
@@ -599,7 +772,7 @@ impl EngineCtx {
 }
 
 /// 构造期间的占位状态（立即被 `apply_config` 替换）。
-fn empty_state(config: &RuntimeConfig) -> RuntimeState {
+fn empty_state(config: &RuntimeConfig, health: &Arc<HealthStore>) -> RuntimeState {
     // 占位状态只供首次 apply_config 校验接口计划及继承空 health/session 使用；
     // 不为尚未生效的用户规则构造 Router，也不复制整份节点/规则两次。
     let mut placeholder =
@@ -609,18 +782,21 @@ fn empty_state(config: &RuntimeConfig) -> RuntimeState {
     let router = Router::new(&placeholder, store.clone(), Arc::new(GeoIp::default()));
     RuntimeState {
         base_config: placeholder.clone(),
-        inspection_cancel: tokio::sync::watch::channel(false).0,
+        aux_cancel: tokio::sync::watch::channel(false).0,
+        prepared_modules: Vec::new(),
+        compiled_modules_enabled: Vec::new(),
+        module_compile_warnings: Vec::new(),
         config: placeholder,
         routing: Arc::new(Routing {
             router,
             outbounds: Vec::new(),
         }),
         rule_sets: store,
-        health: Arc::new(HealthStore::default()),
+        health: health.clone(),
         sessions: Vec::new(),
         http_plan: Rc::new(HttpPlan::default()),
         scripts: Arc::new(crate::scripts::ScriptHost::new(None)),
-        mitm_ca: RefCell::new(None),
+        mitm_ca: None,
         http_transactions: Some(Arc::new(tokio::sync::Semaphore::new(32))),
         http_bodies: Arc::new(tokio::sync::Semaphore::new(2)),
         geo_started: Cell::new(true),

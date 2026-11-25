@@ -179,7 +179,10 @@ impl Outbound for WireGuardOutbound {
         let endpoints = self.inner.endpoints().await?;
         let dest = self.inner.destination(&endpoints, target).await?;
         let stream = self.inner.tunnel.connect_tcp(&endpoints, dest).await?;
-        Ok(Box::new(stream))
+        Ok(crate::slots::HeldStream::boxed(
+            Box::new(stream),
+            self.inner.clone(),
+        ))
     }
     async fn bind_udp(&self, _: &TargetAddr) -> io::Result<Box<dyn PacketConn>> {
         if !self.inner.spec.udp {

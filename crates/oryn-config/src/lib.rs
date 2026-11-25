@@ -27,9 +27,10 @@ pub use domain::{
 };
 pub use model::*;
 pub use parse::{
-    parse_config, parse_config_with, parse_rule_body, parse_rule_item, proxy_provider_nodes,
-    split_rule_line,
+    parse_config, parse_config_with, parse_config_with_providers, parse_rule_body, parse_rule_item,
+    proxy_provider_nodes, split_rule_line,
 };
+pub use parse::patch::{merge_config_patch, PatchSummary};
 
 /// 配置错误，携带可展示给用户的说明。
 #[derive(Debug, Clone, PartialEq, Eq)]

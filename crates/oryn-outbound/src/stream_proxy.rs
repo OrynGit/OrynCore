@@ -190,9 +190,9 @@ impl StreamProxyOutbound {
             .await?;
         let (mut send, recv) = conn.open_bi().await.map_err(io::Error::other)?;
         send.write_all(initial).await.map_err(io::Error::other)?;
-        Ok(crate::slots::Counted::boxed(
-            Box::new(tokio::io::join(recv, send)),
-            slot,
+        Ok(crate::slots::HeldStream::boxed(
+            crate::slots::Counted::boxed(Box::new(tokio::io::join(recv, send)), slot),
+            quic.client.clone(),
         ))
     }
 

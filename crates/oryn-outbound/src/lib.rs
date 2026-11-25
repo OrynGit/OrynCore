@@ -58,7 +58,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use oryn_config::{OutboundKind, RuntimeConfig, TargetAddr, TlsSpec};
+use oryn_config::{OutboundKind, OutboundSpec, RuntimeConfig, TargetAddr, TlsSpec};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 pub use direct::{DirectDialer, DirectOutbound};
@@ -407,6 +407,19 @@ pub(crate) fn build_leaf(
     Some(o)
 }
 
+/// 增量重载时传入的上一代出站切片（索引互相对应）。
+pub struct PreviousOutbounds<'a> {
+    pub specs: &'a [OutboundSpec],
+    pub outbounds: &'a [Arc<dyn Outbound>],
+}
+
+/// 出站构造结果：出站数组与复用 / 重建计数。
+pub struct BuildResult {
+    pub outbounds: Vec<Arc<dyn Outbound>>,
+    pub reused: usize,
+    pub rebuilt: usize,
+}
+
 /// 按配置创建全部出站，下标与 `RuntimeConfig::outbounds` 一一对应。
 ///
 /// 策略组按依赖顺序创建（成员先于策略组）；配置解析阶段已排除循环引用。
@@ -419,93 +432,192 @@ pub fn build_outbounds_with_data_dir(
     ctx: &BuildContext,
     data_dir: Option<&std::path::Path>,
 ) -> Vec<Arc<dyn Outbound>> {
-    let proxy_dialer = Arc::new(DirectDialer::new(ctx.proxy_resolver.clone()));
-    let direct_dialer = Arc::new(DirectDialer::new(ctx.direct_resolver.clone()));
-    let n = config.outbounds.len();
-    let mut built: Vec<Option<Arc<dyn Outbound>>> = vec![None; n];
+    build_outbounds_reusing(config, ctx, data_dir, None).outbounds
+}
 
-    #[allow(clippy::too_many_arguments)]
-    fn build_one(
-        i: usize,
-        config: &RuntimeConfig,
-        ctx: &BuildContext,
-        proxy_dialer: &Arc<DirectDialer>,
-        direct_dialer: &Arc<DirectDialer>,
-        built: &mut Vec<Option<Arc<dyn Outbound>>>,
-        visiting: &mut Vec<bool>,
-        data_dir: Option<&std::path::Path>,
-    ) -> Arc<dyn Outbound> {
-        if let Some(o) = &built[i] {
+/// 增量创建或复用全部出站。
+///
+/// 同名、同规格且依赖链（`dialer` / 策略组成员 / `HealthStore`）未变的出站直接沿用旧实例，
+/// 其余出站按依赖顺序重建，并在替换前 / 后对未复用的旧出站调用 [`SessionControl::on_config_replaced`]。
+pub fn build_outbounds_reusing(
+    config: &RuntimeConfig,
+    ctx: &BuildContext,
+    data_dir: Option<&std::path::Path>,
+    previous: Option<PreviousOutbounds<'_>>,
+) -> BuildResult {
+    struct PrevState<'a> {
+        specs: &'a [OutboundSpec],
+        outbounds: &'a [Arc<dyn Outbound>],
+        by_name: HashMap<&'a str, usize>,
+        reused: Vec<bool>,
+        notified: Vec<bool>,
+    }
+
+    struct BuildState<'a> {
+        config: &'a RuntimeConfig,
+        ctx: &'a BuildContext,
+        proxy_dialer: Arc<DirectDialer>,
+        direct_dialer: Arc<DirectDialer>,
+        built: Vec<Option<Arc<dyn Outbound>>>,
+        visiting: Vec<bool>,
+        data_dir: Option<&'a std::path::Path>,
+        prev: Option<PrevState<'a>>,
+        reused: usize,
+        rebuilt: usize,
+    }
+
+    fn dialers_match(
+        prev: &PrevState<'_>,
+        prev_dialer: Option<usize>,
+        chain: &Option<Arc<dyn Outbound>>,
+    ) -> bool {
+        match (prev_dialer, chain) {
+            (None, None) => true,
+            (Some(pd), Some(cur)) => prev.outbounds.get(pd).is_some_and(|old| Arc::ptr_eq(old, cur)),
+            _ => false,
+        }
+    }
+
+    fn build_one(i: usize, state: &mut BuildState<'_>) -> Arc<dyn Outbound> {
+        if let Some(o) = &state.built[i] {
             return o.clone();
         }
-        let spec = &config.outbounds[i];
+        let spec = &state.config.outbounds[i];
         let name = spec.name.clone();
         // 纵深防御：配置层已排除循环引用，但绕过它直接构造的 RuntimeConfig 不能让这里无限递归。
         // 正在构建中的出站再次被引用即为环，该引用退化为 REJECT。
-        if visiting[i] {
+        if state.visiting[i] {
             log::warn!("outbound {name} references itself through a cycle; using REJECT");
             return Arc::new(reject::RejectOutbound::new(name));
         }
-        visiting[i] = true;
+        state.visiting[i] = true;
         // dialer-proxy：TCP 经另一个出站的 connect_tcp，UDP 经它的 bind_udp
-        let chain: Option<Arc<dyn Outbound>> = spec.dialer.map(|d| {
-            build_one(
-                d,
-                config,
-                ctx,
-                proxy_dialer,
-                direct_dialer,
-                built,
-                visiting,
-                data_dir,
-            )
-        });
+        let chain: Option<Arc<dyn Outbound>> = spec.dialer.map(|d| build_one(d, state));
+        let members: Option<Vec<Arc<dyn Outbound>>> = match &spec.kind {
+            OutboundKind::Group(g) => Some(g.members.iter().map(|&m| build_one(m, state)).collect()),
+            _ => None,
+        };
+
+        let prev_idx = state
+            .prev
+            .as_ref()
+            .and_then(|p| p.by_name.get(name.as_str()).copied())
+            .filter(|&pi| {
+                state
+                    .prev
+                    .as_ref()
+                    .is_some_and(|p| !p.reused[pi] && !p.notified[pi])
+            });
+
+        if let Some(pi) = prev_idx {
+            let can_reuse = {
+                let prev = state.prev.as_ref().expect("checked");
+                let prev_spec = &prev.specs[pi];
+                let prev_out = &prev.outbounds[pi];
+                let dialer_ok = dialers_match(prev, prev_spec.dialer, &chain);
+                match (&spec.kind, &prev_spec.kind, members.as_ref()) {
+                    (OutboundKind::Group(g), OutboundKind::Group(old_g), Some(cur_members)) => {
+                        prev_out.as_group().is_some_and(|old_group| {
+                            dialer_ok
+                                && old_g.kind == g.kind
+                                && old_g.health == g.health
+                                && old_g.disable_udp == g.disable_udp
+                                && old_g.smart == g.smart
+                                && Arc::ptr_eq(old_group.health_store(), &state.ctx.health)
+                                && cur_members.len() == old_group.members().len()
+                                && cur_members
+                                    .iter()
+                                    .zip(old_group.members())
+                                    .all(|(a, b)| Arc::ptr_eq(a, b))
+                        })
+                    }
+                    _ => {
+                        dialer_ok
+                            && members.is_none()
+                            && prev_spec.name == spec.name
+                            && prev_spec.kind == spec.kind
+                    }
+                }
+            };
+            if can_reuse {
+                let reused_out = {
+                    let prev = state.prev.as_mut().expect("checked");
+                    prev.reused[pi] = true;
+                    prev.outbounds[pi].clone()
+                };
+                if let Some(group) = reused_out.as_group() {
+                    if group.kind() == oryn_config::GroupKind::Select {
+                        if let Some(sel) = state.ctx.selections.get(&name) {
+                            group.select(sel);
+                        }
+                    }
+                }
+                state.reused += 1;
+                state.visiting[i] = false;
+                state.built[i] = Some(reused_out.clone());
+                return reused_out;
+            }
+        }
+
+        let prev_group_now = if let Some(pi) = prev_idx {
+            let prev = state.prev.as_mut().expect("checked");
+            let prev_out = &prev.outbounds[pi];
+            let now = prev_out.as_group().and_then(|g| g.current_member_name());
+            // 同名不可复用时先通知旧出站释放外部资源（例如 Tailscale 状态目录），再构造新实例。
+            if !prev.notified[pi] {
+                prev.notified[pi] = true;
+                if let Some(ctrl) = prev_out.session_control() {
+                    ctrl.on_config_replaced();
+                }
+            }
+            now
+        } else {
+            None
+        };
+
         let dialer: Arc<dyn Dialer> = match &chain {
             Some(outbound) => Arc::new(chain::ChainDialer(outbound.clone())),
-            None => proxy_dialer.clone(),
+            None => state.proxy_dialer.clone(),
         };
         let datagrams: Arc<dyn oryn_udp::DatagramFactory> = match &chain {
             Some(outbound) => Arc::new(chain::ChainDatagrams(outbound.clone())),
             None => Arc::new(oryn_udp::UdpFactory),
         };
         let deps = LeafDeps {
-            proxy_resolver: ctx.proxy_resolver.clone(),
-            direct_resolver: ctx.direct_resolver.clone(),
-            direct_dialer: direct_dialer.clone(),
-            data_dir,
-            mieru_sessions: ctx.mieru_sessions,
+            proxy_resolver: state.ctx.proxy_resolver.clone(),
+            direct_resolver: state.ctx.direct_resolver.clone(),
+            direct_dialer: state.direct_dialer.clone(),
+            data_dir: state.data_dir,
+            mieru_sessions: state.ctx.mieru_sessions,
         };
-        let o: Arc<dyn Outbound> = match &spec.kind {
-            OutboundKind::Group(g) => {
-                let members: Vec<Arc<dyn Outbound>> = g
-                    .members
-                    .iter()
-                    .map(|&m| {
-                        build_one(
-                            m,
-                            config,
-                            ctx,
-                            proxy_dialer,
-                            direct_dialer,
-                            built,
-                            visiting,
-                            data_dir,
-                        )
-                    })
-                    .collect();
+        let o: Arc<dyn Outbound> = match (&spec.kind, members) {
+            (OutboundKind::Group(g), Some(members)) => {
                 let smart = if g.kind == oryn_config::GroupKind::Smart {
-                    Some(smart::build(config, g, &members, ctx, &name, data_dir))
+                    Some(smart::build(
+                        state.config,
+                        g,
+                        &members,
+                        state.ctx,
+                        &name,
+                        state.data_dir,
+                    ))
                 } else {
                     None
                 };
+                let selected = state
+                    .ctx
+                    .selections
+                    .get(&name)
+                    .map(String::as_str)
+                    .or(prev_group_now.as_deref());
                 let mut group = GroupOutbound::new(
                     name.clone(),
                     g.kind,
                     members,
                     g.health.clone(),
                     g.disable_udp,
-                    ctx.health.clone(),
-                    ctx.selections.get(&name).map(String::as_str),
+                    state.ctx.health.clone(),
+                    selected,
                 );
                 group.smart = smart;
                 Arc::new(group)
@@ -513,26 +625,58 @@ pub fn build_outbounds_with_data_dir(
             _ => build_leaf(spec, &deps, dialer, datagrams)
                 .expect("non-group outbound kinds are always buildable"),
         };
-        visiting[i] = false;
-        built[i] = Some(o.clone());
+        state.rebuilt += 1;
+        state.visiting[i] = false;
+        state.built[i] = Some(o.clone());
         o
     }
 
-    let mut visiting = vec![false; n];
-    (0..n)
-        .map(|i| {
-            build_one(
-                i,
-                config,
-                ctx,
-                &proxy_dialer,
-                &direct_dialer,
-                &mut built,
-                &mut visiting,
-                data_dir,
-            )
+    let n = config.outbounds.len();
+    let prev = previous.and_then(|p| {
+        if p.specs.len() != p.outbounds.len() {
+            return None;
+        }
+        let by_name = p
+            .specs
+            .iter()
+            .enumerate()
+            .map(|(idx, s)| (s.name.as_str(), idx))
+            .collect();
+        Some(PrevState {
+            specs: p.specs,
+            outbounds: p.outbounds,
+            by_name,
+            reused: vec![false; p.outbounds.len()],
+            notified: vec![false; p.outbounds.len()],
         })
-        .collect()
+    });
+    let mut state = BuildState {
+        config,
+        ctx,
+        proxy_dialer: Arc::new(DirectDialer::new(ctx.proxy_resolver.clone())),
+        direct_dialer: Arc::new(DirectDialer::new(ctx.direct_resolver.clone())),
+        built: vec![None; n],
+        visiting: vec![false; n],
+        data_dir,
+        prev,
+        reused: 0,
+        rebuilt: 0,
+    };
+    let outbounds = (0..n).map(|i| build_one(i, &mut state)).collect();
+    if let Some(prev) = state.prev {
+        for (pi, old) in prev.outbounds.iter().enumerate() {
+            if !prev.reused[pi] && !prev.notified[pi] {
+                if let Some(ctrl) = old.session_control() {
+                    ctrl.on_config_replaced();
+                }
+            }
+        }
+    }
+    BuildResult {
+        outbounds,
+        reused: state.reused,
+        rebuilt: state.rebuilt,
+    }
 }
 
 /// 代理自身的 TLS（HTTPS 代理、SOCKS5 over TLS）。
@@ -811,5 +955,123 @@ mod shared_hub_tests {
         );
         assert_eq!(next.generation, 2);
         assert!(!Arc::ptr_eq(&first, &next));
+    }
+
+    #[test]
+    fn build_outbounds_reusing_keeps_unchanged_and_prunes_health() {
+        use std::collections::HashSet;
+        use super::*;
+
+        struct NoopDns;
+        #[async_trait]
+        impl Resolver for NoopDns {
+            async fn resolve(&self, _: &str) -> io::Result<Vec<IpAddr>> {
+                Ok(vec!["127.0.0.1".parse().unwrap()])
+            }
+        }
+
+        let yaml1 = r#"
+proxies:
+  - {name: P1, type: socks5, server: 127.0.0.1, port: 1081}
+  - {name: P2, type: socks5, server: 127.0.0.1, port: 1082}
+  - {name: Hop, type: socks5, server: 127.0.0.1, port: 1083, dialer-proxy: P1}
+  - {name: OldRemoved, type: socks5, server: 127.0.0.1, port: 1084}
+proxy-groups:
+  - {name: Auto, type: url-test, proxies: [P1, P2]}
+  - {name: Proxy, type: select, proxies: [Auto, P1, P2, Hop]}
+rules:
+  - MATCH,Proxy
+"#;
+        let yaml2 = r#"
+proxies:
+  - {name: P1, type: socks5, server: 127.0.0.1, port: 1081}
+  - {name: P2, type: socks5, server: 127.0.0.1, port: 2082}
+  - {name: Hop, type: socks5, server: 127.0.0.1, port: 1083, dialer-proxy: P1}
+proxy-groups:
+  - {name: Auto, type: url-test, proxies: [P1, P2]}
+  - {name: Proxy, type: select, proxies: [Auto, P1, P2, Hop]}
+rules:
+  - MATCH,Proxy
+"#;
+        let cfg1 = oryn_config::parse_config(yaml1).unwrap();
+        let cfg2 = oryn_config::parse_config(yaml2).unwrap();
+        let health = Arc::new(HealthStore::default());
+        health.record("P1", Some(10));
+        health.record("OldRemoved", Some(20));
+        let mut ctx = BuildContext {
+            proxy_resolver: Arc::new(NoopDns),
+            direct_resolver: Arc::new(NoopDns),
+            health: health.clone(),
+            selections: HashMap::new(),
+            mieru_sessions: 4,
+        };
+
+        let first = build_outbounds_reusing(&cfg1, &ctx, None, None);
+        assert_eq!(first.reused, 0);
+        let p1_first = first.outbounds[cfg1.outbound_index("P1").unwrap()].clone();
+        let p2_first = first.outbounds[cfg1.outbound_index("P2").unwrap()].clone();
+        let hop_first = first.outbounds[cfg1.outbound_index("Hop").unwrap()].clone();
+        let proxy_idx1 = cfg1.outbound_index("Proxy").unwrap();
+        assert!(first.outbounds[proxy_idx1].as_group().unwrap().select("P2"));
+
+        // P2 端口变化，P1 与依赖 P1 的 Hop 保持指针复用；Proxy 虽成员变化需重建但延续当前选中 P2
+        let second = build_outbounds_reusing(
+            &cfg2,
+            &ctx,
+            None,
+            Some(PreviousOutbounds {
+                specs: &cfg1.outbounds,
+                outbounds: &first.outbounds,
+            }),
+        );
+        let p1_second = second.outbounds[cfg2.outbound_index("P1").unwrap()].clone();
+        let p2_second = second.outbounds[cfg2.outbound_index("P2").unwrap()].clone();
+        let hop_second = second.outbounds[cfg2.outbound_index("Hop").unwrap()].clone();
+        let proxy_second = second.outbounds[cfg2.outbound_index("Proxy").unwrap()]
+            .as_group()
+            .unwrap();
+        assert!(Arc::ptr_eq(&p1_first, &p1_second));
+        assert!(Arc::ptr_eq(&hop_first, &hop_second));
+        assert!(!Arc::ptr_eq(&p2_first, &p2_second));
+        assert_eq!(proxy_second.current_member_name().as_deref(), Some("P2"));
+
+        let keep: HashSet<&str> = cfg2.outbounds.iter().map(|o| o.name.as_str()).collect();
+        health.retain_names(&keep);
+        assert!(health.get("P1").is_some());
+        assert!(health.get("OldRemoved").is_none());
+
+        // 同配置再次复用并传入新 select 选择，应当全量复用并在原组更新选区
+        ctx.selections.insert("Proxy".into(), "Hop".into());
+        let third = build_outbounds_reusing(
+            &cfg2,
+            &ctx,
+            None,
+            Some(PreviousOutbounds {
+                specs: &cfg2.outbounds,
+                outbounds: &second.outbounds,
+            }),
+        );
+        assert_eq!(third.rebuilt, 0);
+        let proxy_third = third.outbounds[cfg2.outbound_index("Proxy").unwrap()]
+            .as_group()
+            .unwrap();
+        assert_eq!(proxy_third.current_member_name().as_deref(), Some("Hop"));
+    }
+
+    #[test]
+    fn held_stream_retains_handle_until_dropped() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (duplex, _) = tokio::io::duplex(16);
+        let stream = crate::slots::HeldStream::boxed(Box::new(duplex), DropFlag(dropped.clone()));
+        assert!(!dropped.load(Ordering::SeqCst));
+        drop(stream);
+        assert!(dropped.load(Ordering::SeqCst));
     }
 }

@@ -252,7 +252,7 @@ impl MaxMindOptions {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct LocalProxyOptions {
     pub enabled: bool,

@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use crate::ConfigError;
 use base64::Engine;
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MieruTrafficPattern {
     pub seed: Option<i32>,
     pub unlock: bool,

@@ -8,6 +8,7 @@ mod mieru;
 pub(crate) mod modules;
 mod p3;
 mod p4;
+pub(crate) mod patch;
 mod providers;
 mod proxies;
 mod proxy_providers;
@@ -107,6 +108,15 @@ pub fn parse_config_with(
     text: &str,
     load: &dyn Fn(&str) -> Option<String>,
 ) -> Result<RuntimeConfig, ConfigError> {
+    parse_config_with_providers(text, load, &|_| None)
+}
+
+/// 解析配置文本，支持按代理集合名称提供内容覆盖（用于热更新，优先于内联或缓存文件）。
+pub fn parse_config_with_providers(
+    text: &str,
+    load: &dyn Fn(&str) -> Option<String>,
+    load_override: &dyn Fn(&str) -> Option<String>,
+) -> Result<RuntimeConfig, ConfigError> {
     let docs =
         YamlLoader::load_from_str(text).map_err(|e| ConfigError(format!("invalid YAML: {e}")))?;
     let root = docs.into_iter().next().unwrap_or(Yaml::Null);
@@ -147,7 +157,7 @@ pub fn parse_config_with(
 
     proxies::parse(&root, &mut b)?;
     let config_proxies = b.outbounds.len();
-    proxy_providers::parse(&root, &mut b, load)?;
+    proxy_providers::parse(&root, &mut b, load, load_override)?;
     groups::parse(&root, &mut b, config_proxies)?;
     proxy_providers::resolve_via(&mut b);
     for key in ["sub-rules"] {

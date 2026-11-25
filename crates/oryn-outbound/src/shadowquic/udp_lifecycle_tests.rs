@@ -131,6 +131,7 @@ async fn cancelled_uos_releases_all_children_and_quic_credit() {
         max_datagram: 1200,
         resolver: Arc::new(ResolverStub),
         _slot: crate::slots::Slots::default().acquire(1).unwrap(),
+        _keep: None,
     };
     drop(association);
     let (new, mut new_rx) = receiver(2);

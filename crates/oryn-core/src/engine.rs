@@ -749,7 +749,12 @@ fn dispatch_command(ctx: &Rc<EngineCtx>, req: Value, reply: std_mpsc::SyncSender
 }
 
 fn handle_command(ctx: &Rc<EngineCtx>, req: &Value) -> Value {
-    if ctx.reload_compiling.get() && req["cmd"] == "apply_settings" {
+    if ctx.reload_compiling.get()
+        && matches!(
+            req["cmd"].as_str(),
+            Some("apply_settings" | "patch_config" | "update_proxy_provider")
+        )
+    {
         return json!({"error": "engine is busy"});
     }
     if req["cmd"]
@@ -874,6 +879,8 @@ fn handle_command(ctx: &Rc<EngineCtx>, req: &Value) -> Value {
             "output_dropped": ctx.stack.output_dropped(),
             "mode": state.router().mode().as_str(),
             "warnings": state.config.warnings.len(),
+            "config_generation": ctx.config_generation.get(),
+            "resource_revision": ctx.resource_revision.get(),
             "loop_perf": crate::perf::snapshot(),
             "heap_live": crate::alloc::heap_usage().map(|(live, _)| live),
             "heap_peak": crate::alloc::heap_usage().map(|(_, peak)| peak),
@@ -1088,6 +1095,7 @@ fn handle_command(ctx: &Rc<EngineCtx>, req: &Value) -> Value {
                         "loaded": slot.get().is_some(),
                         "updated_at": unix(info.updated),
                         "error": info.error,
+                        "updating": slot.is_updating(),
                     })
                 })
                 .collect();
@@ -1112,23 +1120,48 @@ fn handle_command(ctx: &Rc<EngineCtx>, req: &Value) -> Value {
             let only = str_arg(req, "name").map(str::to_string);
             for (i, p) in state.config.providers.iter().enumerate() {
                 let wanted = only.as_deref().is_none_or(|n| n == p.name);
-                if wanted && matches!(p.source, ProviderSource::Http { .. }) {
-                    let (c, s) = (ctx.clone(), state.clone());
-                    state.spawn(async move {
-                        let _ = providers::download(&c, &s, i).await;
-                    });
+                if !wanted {
+                    continue;
+                }
+                match &p.source {
+                    ProviderSource::Http { .. } => {
+                        let (c, s) = (ctx.clone(), state.clone());
+                        state.spawn(async move {
+                            let _ = providers::download(&c, &s, i).await;
+                        });
+                    }
+                    ProviderSource::File { .. } => {
+                        if let Err(e) = providers::reload_file(ctx, &state, i) {
+                            log::warn!("rule provider `{}` reload failed: {e}", p.name);
+                        }
+                    }
+                    ProviderSource::Inline { .. } => {}
                 }
             }
+            let mut reload_file_proxy = false;
             for (i, p) in state.config.proxy_providers.iter().enumerate() {
                 let wanted = only.as_deref().is_none_or(|n| n == p.name);
-                if wanted && matches!(p.source, oryn_config::ProxyProviderSource::Http { .. }) {
-                    let (c, s) = (ctx.clone(), state.clone());
-                    state.spawn(async move {
-                        if let Ok(true) = crate::proxy_providers::download(&c, &s, i).await {
-                            crate::proxy_providers::schedule_reload(&c);
-                        }
-                    });
+                if !wanted {
+                    continue;
                 }
+                match &p.source {
+                    oryn_config::ProxyProviderSource::Http { .. } => {
+                        let (c, s) = (ctx.clone(), state.clone());
+                        state.spawn(async move {
+                            if let Ok(true) = crate::proxy_providers::download(&c, &s, i).await {
+                                crate::proxy_providers::schedule_reload(&c);
+                            }
+                        });
+                    }
+                    oryn_config::ProxyProviderSource::File { .. } => {
+                        ctx.proxy_provider_overrides.borrow_mut().remove(&p.name);
+                        reload_file_proxy = true;
+                    }
+                    oryn_config::ProxyProviderSource::Inline => {}
+                }
+            }
+            if reload_file_proxy {
+                crate::proxy_providers::schedule_reload(ctx);
             }
             if only.as_deref().is_none_or(|n| n == "geoip") {
                 geo::request(ctx, &state, geo::Kind::Country);
@@ -1137,6 +1170,205 @@ fn handle_command(ctx: &Rc<EngineCtx>, req: &Value) -> Value {
                 geo::request(ctx, &state, geo::Kind::Asn);
             }
             json!({ "ok": true })
+        }
+        "update_rule_provider" => {
+            let Some(name) = str_arg(req, "name").map(str::to_string) else {
+                return json!({ "error": "update_rule_provider requires name" });
+            };
+            let Some(i) = state.config.providers.iter().position(|p| p.name == name) else {
+                return json!({ "error": format!("unknown rule provider `{name}`") });
+            };
+            let content_val = req.get("content").filter(|v| !v.is_null());
+            let payload_val = req.get("payload").filter(|v| !v.is_null());
+            if content_val.is_some() && payload_val.is_some() {
+                return json!({ "error": "update_rule_provider accepts either content or payload, not both" });
+            }
+            let persist = req.get("persist").and_then(Value::as_bool).unwrap_or(false);
+            if let Some(val) = content_val {
+                let Some(text) = val.as_str() else {
+                    return json!({ "error": "content must be a string" });
+                };
+                return match providers::apply_content(ctx, &state, i, text, persist) {
+                    Ok(count) => json!({
+                        "ok": true,
+                        "name": name,
+                        "count": count,
+                        "resource_revision": ctx.resource_revision.get(),
+                    }),
+                    Err(e) => json!({ "error": e }),
+                };
+            }
+            if let Some(val) = payload_val {
+                let Ok(items) = serde_json::from_value::<Vec<String>>(val.clone()) else {
+                    return json!({ "error": "payload must be an array of strings" });
+                };
+                return match providers::apply_payload(ctx, &state, i, &items, persist) {
+                    Ok(count) => json!({
+                        "ok": true,
+                        "name": name,
+                        "count": count,
+                        "resource_revision": ctx.resource_revision.get(),
+                    }),
+                    Err(e) => json!({ "error": e }),
+                };
+            }
+            match &state.config.providers[i].source {
+                ProviderSource::File { .. } => match providers::reload_file(ctx, &state, i) {
+                    Ok(count) => json!({
+                        "ok": true,
+                        "name": name,
+                        "count": count,
+                        "resource_revision": ctx.resource_revision.get(),
+                    }),
+                    Err(e) => json!({ "error": e }),
+                },
+                ProviderSource::Http { .. } => {
+                    let updating = state.rule_sets.slot(i).is_some_and(|s| s.is_updating());
+                    if !updating {
+                        let (c, s) = (ctx.clone(), state.clone());
+                        state.spawn(async move {
+                            let _ = providers::download(&c, &s, i).await;
+                        });
+                    }
+                    json!({ "ok": true, "name": name, "scheduled": true })
+                }
+                ProviderSource::Inline { .. } => {
+                    json!({ "error": "inline rule provider requires content or payload" })
+                }
+            }
+        }
+        "update_proxy_provider" => {
+            let Some(name) = str_arg(req, "name").map(str::to_string) else {
+                return json!({ "error": "update_proxy_provider requires name" });
+            };
+            let Some(i) = state
+                .config
+                .proxy_providers
+                .iter()
+                .position(|p| p.name == name)
+            else {
+                return json!({ "error": format!("unknown proxy provider `{name}`") });
+            };
+            if let Some(val) = req.get("content").filter(|v| !v.is_null()) {
+                let Some(text) = val.as_str() else {
+                    return json!({ "error": "content must be a string" });
+                };
+                let persist = req.get("persist").and_then(Value::as_bool).unwrap_or(false);
+                drop(state);
+                return match crate::proxy_providers::apply_content(ctx, &name, text, persist) {
+                    Ok(count) => json!({
+                        "ok": true,
+                        "name": name,
+                        "count": count,
+                        "resource_revision": ctx.resource_revision.get(),
+                    }),
+                    Err(e) => json!({ "error": e }),
+                };
+            }
+            let source = state.config.proxy_providers[i].source.clone();
+            match source {
+                oryn_config::ProxyProviderSource::File { .. } => {
+                    drop(state);
+                    match crate::proxy_providers::reload_file(ctx, &name) {
+                        Ok(count) => json!({
+                            "ok": true,
+                            "name": name,
+                            "count": count,
+                            "resource_revision": ctx.resource_revision.get(),
+                        }),
+                        Err(e) => json!({ "error": e }),
+                    }
+                }
+                oryn_config::ProxyProviderSource::Http { .. } => {
+                    let updating = ctx
+                        .proxy_provider_status
+                        .borrow()
+                        .get(&name)
+                        .is_some_and(|s| s.updating);
+                    if !updating {
+                        let (c, s) = (ctx.clone(), state.clone());
+                        state.spawn(async move {
+                            if let Ok(true) = crate::proxy_providers::download(&c, &s, i).await {
+                                crate::proxy_providers::schedule_reload(&c);
+                            }
+                        });
+                    }
+                    json!({ "ok": true, "name": name, "scheduled": true })
+                }
+                oryn_config::ProxyProviderSource::Inline => {
+                    json!({ "error": "inline proxy provider requires content" })
+                }
+            }
+        }
+        "patch_config" => {
+            let patch_yaml = match req.get("patch") {
+                Some(Value::String(s)) => s.clone(),
+                Some(v @ Value::Object(_)) => match serde_json::to_string(v) {
+                    Ok(s) => s,
+                    Err(e) => return json!({ "error": format!("invalid patch object: {e}") }),
+                },
+                _ => return json!({ "error": "patch_config requires patch (YAML string or object)" }),
+            };
+            let replace = match req.get("mode").and_then(Value::as_str) {
+                None | Some("merge") => false,
+                Some("replace") => true,
+                Some(other) => {
+                    return json!({
+                        "error": format!("invalid patch mode `{other}`: expected merge or replace")
+                    })
+                }
+            };
+            let Some(source) = ctx.config_source.borrow().clone() else {
+                return json!({ "error": "configuration source is unavailable for patch_config" });
+            };
+            let (merged, summary) =
+                match oryn_config::merge_config_patch(&source.text, &patch_yaml, !replace) {
+                    Ok(res) => res,
+                    Err(e) => return json!({ "error": e.to_string() }),
+                };
+            let mut config = match crate::proxy_providers::compile_with_overrides(
+                &merged,
+                source.inspection.as_deref(),
+                ctx.data_dir(),
+                &ctx.proxy_provider_overrides.borrow(),
+            ) {
+                Ok(c) => c,
+                Err(e) => return json!({ "error": e.to_string() }),
+            };
+            if let Err(err) = ctx.validate_virtual_interface(&config) {
+                return json!({ "error": err, "requires_reconnect": true });
+            }
+            *ctx.config_source.borrow_mut() = Some(crate::proxy_providers::ConfigSource {
+                text: merged,
+                inspection: source.inspection,
+            });
+            logging::set_level(&config.log_level);
+            let warnings = config.warnings.clone();
+            let carry = crate::proxy_providers::carry_prepared_modules(
+                &state.base_config.modules,
+                &mut config.modules,
+            );
+            drop(state);
+            if carry {
+                ctx.apply_partial(config);
+                crate::scripts::event(&ctx.state(), "profile-reloaded");
+            } else {
+                if let Some(previous) = ctx.pending_reload.borrow_mut().take() {
+                    previous.abort();
+                }
+                let c = ctx.clone();
+                *ctx.pending_reload.borrow_mut() = Some(tokio::task::spawn_local(async move {
+                    let prepared = crate::modules::prepare_for_apply(&c, config).await;
+                    c.apply_prepared_partial(prepared);
+                    crate::scripts::event(&c.state(), "profile-reloaded");
+                }));
+            }
+            json!({
+                "ok": true,
+                "sections": summary.touched_sections,
+                "warnings": warnings,
+                "resource_revision": ctx.resource_revision.get(),
+            })
         }
         "warnings" => json!({ "warnings": state.config.warnings }),
         "clear_dns_cache" => {
@@ -1185,7 +1417,7 @@ fn handle_command(ctx: &Rc<EngineCtx>, req: &Value) -> Value {
                 }
                 if ctx.maxmind.borrow().as_ref() != Some(&options) {
                     *ctx.maxmind.borrow_mut() = Some(options);
-                    ctx.apply_config(state.base_config.clone());
+                    ctx.apply_partial(state.base_config.clone());
                 }
             }
             if let Some(value) = req
@@ -1284,6 +1516,7 @@ fn finish_reload(ctx: &Rc<EngineCtx>, req: &Value, result: Result<RuntimeConfig,
                         text: text.to_string(),
                         inspection: overlay.map(str::to_string),
                     });
+                    ctx.proxy_provider_overrides.borrow_mut().clear();
                     // 切换到另一个配置时，由调用方一并传入该配置保存的选择与模式
                     if let Some(sel) = req.get("selections").and_then(Value::as_object) {
                         *ctx.selections.borrow_mut() = sel

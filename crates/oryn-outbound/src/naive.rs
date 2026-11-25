@@ -147,6 +147,7 @@ impl NaiveOutbound {
             }
             req.body(()).map_err(io::Error::other)?
         };
+        let keep_send = send.clone();
         let mut stream = match send.send_request(request).await {
             Ok(stream) => stream,
             Err(err) => {
@@ -168,7 +169,10 @@ impl NaiveOutbound {
             ));
         }
         let (send, recv) = stream.split();
-        Ok(Box::new(H3Stream::new(send, recv)))
+        Ok(crate::slots::HeldStream::boxed(
+            Box::new(H3Stream::new(send, recv)),
+            (quic.clone(), keep_send),
+        ))
     }
 
     #[cfg(feature = "hysteria2")]

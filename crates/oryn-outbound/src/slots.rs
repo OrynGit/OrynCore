@@ -87,6 +87,57 @@ impl AsyncWrite for Counted {
     }
 }
 
+/// 持有底层传输保活句柄（如 QUIC 客户端或隧道实例）的流包装；
+/// 配置重载替换出站后，已建立的连接仍能继续运行直到流结束。
+#[allow(dead_code)]
+pub(crate) struct HeldStream<K: Send + 'static> {
+    inner: BoxStream,
+    _keep: K,
+}
+
+impl<K: Send + Unpin + 'static> HeldStream<K> {
+    #[allow(dead_code)]
+    pub(crate) fn boxed(inner: BoxStream, keep: K) -> BoxStream {
+        Box::new(Self { inner, _keep: keep })
+    }
+}
+
+impl<K: Send + Unpin + 'static> AsyncRead for HeldStream<K> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<K: Send + Unpin + 'static> AsyncWrite for HeldStream<K> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+    }
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

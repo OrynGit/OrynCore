@@ -17,6 +17,7 @@ pub(super) fn parse(
     root: &Yaml,
     b: &mut Builder,
     load: &dyn Fn(&str) -> Option<String>,
+    load_override: &dyn Fn(&str) -> Option<String>,
 ) -> Result<(), ConfigError> {
     let Some(map) = get(root, "proxy-providers") else {
         return Ok(());
@@ -99,21 +100,25 @@ pub(super) fn parse(
         b.proxy_provider_names.insert(name.clone(), index);
         b.pending_provider_via.push((index, str_of(p, "proxy")));
 
-        // 内容：内联节点，或数据目录里的文件 / 缓存
-        let nodes = match &b.proxy_providers[index].source {
-            ProxyProviderSource::Inline => Some(Ok(Content {
-                nodes: match get(p, "payload") {
-                    Some(Yaml::Array(a)) => a.clone(),
-                    _ => Vec::new(),
-                },
-                warnings: Vec::new(),
-            })),
-            _ => {
-                let path = b.proxy_providers[index]
-                    .file_path()
-                    .unwrap_or_default()
-                    .to_string();
-                load(&path).map(|text| content(&text))
+        // 内容：优先内存热更新覆盖，否则使用内联节点，或数据目录里的文件 / 缓存
+        let nodes = if let Some(text) = load_override(&name) {
+            Some(content(&text))
+        } else {
+            match &b.proxy_providers[index].source {
+                ProxyProviderSource::Inline => Some(Ok(Content {
+                    nodes: match get(p, "payload") {
+                        Some(Yaml::Array(a)) => a.clone(),
+                        _ => Vec::new(),
+                    },
+                    warnings: Vec::new(),
+                })),
+                _ => {
+                    let path = b.proxy_providers[index]
+                        .file_path()
+                        .unwrap_or_default()
+                        .to_string();
+                    load(&path).map(|text| content(&text))
+                }
             }
         };
         match nodes {

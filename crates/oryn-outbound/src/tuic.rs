@@ -21,7 +21,7 @@ use crate::{
     inbox::{self, Inbox},
     reassembly::Reassembly,
     resolve_target,
-    slots::{Counted, Slots},
+    slots::{Counted, HeldStream, Slots},
     BoxStream, Outbound, PacketConn, QuicControl, Resolver,
 };
 
@@ -238,7 +238,10 @@ impl Outbound for TuicOutbound {
             }
             _ => open_tcp(&conn, target).await?,
         };
-        Ok(Counted::boxed(stream, slot))
+        Ok(HeldStream::boxed(
+            Counted::boxed(stream, slot),
+            self.quic.clone(),
+        ))
     }
     async fn bind_udp(&self, first_target: &TargetAddr) -> io::Result<Box<dyn PacketConn>> {
         if !self.spec.udp {
@@ -258,7 +261,11 @@ impl Outbound for TuicOutbound {
         }
         let conn = self.connection().await?;
         let hub = self.hub(conn)?;
-        hub.open(self.spec.udp_relay, self.spec.max_udp_packet)
+        hub.open_with_keep(
+            self.spec.udp_relay,
+            self.spec.max_udp_packet,
+            Some(self.quic.clone()),
+        )
     }
 }
 
@@ -357,10 +364,20 @@ impl TuicOutbound {
 }
 
 impl UdpHub {
+    #[allow(dead_code)]
     fn open(
         self: &Arc<Self>,
         mode: UdpRelayMode,
         max_packet: usize,
+    ) -> io::Result<Box<dyn PacketConn>> {
+        self.open_with_keep(mode, max_packet, None)
+    }
+
+    fn open_with_keep(
+        self: &Arc<Self>,
+        mode: UdpRelayMode,
+        max_packet: usize,
+        keep: Option<Arc<QuicClient>>,
     ) -> io::Result<Box<dyn PacketConn>> {
         let mut sessions = self.sessions.lock().unwrap();
         if sessions.len() >= MAX_SESSIONS {
@@ -385,6 +402,7 @@ impl UdpHub {
             max_packet,
             rx: inbox,
             packet: AtomicU16::new(0),
+            _keep: keep,
         }))
     }
 
@@ -533,6 +551,7 @@ struct TuicPacket {
     max_packet: usize,
     rx: SessionInbox,
     packet: AtomicU16,
+    _keep: Option<Arc<QuicClient>>,
 }
 
 /// 从 `start` 起（回绕、跳过 0）找第一个没被占用的关联 ID。

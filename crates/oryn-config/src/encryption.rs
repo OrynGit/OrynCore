@@ -9,14 +9,14 @@ pub enum EncryptionMode {
     Random,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EncryptionPadding {
     pub probability: u8,
     pub min: u16,
     pub max: u16,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct VlessEncryptionSpec {
     pub mode: EncryptionMode,
     pub zero_rtt: bool,

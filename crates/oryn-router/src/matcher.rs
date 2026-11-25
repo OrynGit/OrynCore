@@ -159,6 +159,20 @@ impl Matcher {
         }
     }
 
+    /// 收集匹配器引用的规则集槽位下标。
+    pub(crate) fn collect_rule_sets(&self, out: &mut Vec<usize>) {
+        match self {
+            Matcher::RuleSet(i) => out.push(*i),
+            Matcher::Logic(_, subs) => {
+                for (m, _) in subs {
+                    m.collect_rule_sets(out);
+                }
+            }
+            Matcher::Src(m) => m.collect_rule_sets(out),
+            _ => {}
+        }
+    }
+
     /// 匹配结果是否取决于首包（TLS / HTTP 请求 / QUIC）。规则集看其中的规则。
     pub fn needs_payload(&self, rule_sets: Option<&RuleSetStore>) -> bool {
         match self {

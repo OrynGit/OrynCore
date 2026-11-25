@@ -4,6 +4,8 @@
 
 pub mod alloc;
 #[cfg(test)]
+mod hot_reload_tests;
+#[cfg(test)]
 mod reload_lifecycle_tests;
 mod cache_compare;
 #[cfg(test)]

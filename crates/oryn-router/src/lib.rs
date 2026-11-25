@@ -138,8 +138,10 @@ pub struct Router {
     mitm: oryn_config::MitmSpec,
     reject: usize,
     rules: Vec<CompiledRule>,
-    /// 是否有规则要看首包（`PROTOCOL,HTTP` 等）。
-    payload_rules: bool,
+    /// 规则本身（非规则集）是否要看首包（`PROTOCOL,HTTP` 等）。
+    static_payload_rules: bool,
+    /// 本路由引用的规则集下标（已排序去重），用于在热更新后动态判断首包需求。
+    referenced_rule_sets: Vec<usize>,
     mode: AtomicU8,
     ipv6_support: AtomicBool,
     direct: usize,
@@ -169,12 +171,17 @@ impl Router {
                 text: r.text.clone(),
             })
             .collect::<Vec<CompiledRule>>();
-        let payload_rules = rules
-            .iter()
-            .any(|r| r.matcher.needs_payload(Some(&rule_sets)));
+        let static_payload_rules = rules.iter().any(|r| r.matcher.needs_payload(None));
+        let mut referenced_rule_sets = Vec::new();
+        for rule in &rules {
+            rule.matcher.collect_rule_sets(&mut referenced_rule_sets);
+        }
+        referenced_rule_sets.sort_unstable();
+        referenced_rule_sets.dedup();
         Router {
             outbound_count: config.outbounds.len(),
-            payload_rules,
+            static_payload_rules,
+            referenced_rule_sets,
             mitm: config.mitm.clone(),
             reject: config
                 .outbound_index("REJECT")
@@ -389,7 +396,15 @@ impl Router {
     /// 路由前是否要先读首包（TCP 首批数据 / UDP 首个数据报）填入 `is_tls`、`http`、`is_quic`。
     /// 在第一条需要首包的规则之前已有规则决定策略时不读，避免服务器先说话的协议白等。
     pub fn needs_payload(&self, ctx: &FlowContext) -> bool {
-        if !self.payload_rules || self.mode() != Mode::Rule {
+        if self.mode() != Mode::Rule {
+            return false;
+        }
+        let dynamic_payload = self.referenced_rule_sets.iter().any(|&i| {
+            self.rule_sets
+                .slot(i)
+                .is_some_and(|slot| slot.needs_payload())
+        });
+        if !self.static_payload_rules && !dynamic_payload {
             return false;
         }
         for rule in &self.rules {
@@ -687,5 +702,43 @@ rules:
         let mut t = ctx("1.1.1.1:443", None, Network::Tcp);
         t.is_tls = true;
         assert_eq!(tag(&r, &cfg, &t), "DIRECT");
+    }
+
+    #[test]
+    fn dynamic_ruleset_updates_payload_requirement() {
+        let yaml = r#"
+proxies: [{name: P, type: socks5, server: 1.2.3.4, port: 1080}]
+rule-providers:
+  dyn:
+    type: inline
+    behavior: classical
+    payload: []
+rules:
+  - RULE-SET,dyn,DIRECT
+  - MATCH,P
+"#;
+        let cfg = parse_config(yaml).unwrap();
+        let store = Arc::new(RuleSetStore::new(&cfg.providers));
+        let r = Router::new(&cfg, Arc::clone(&store), Arc::new(GeoIp::default()));
+        let slot = store.slot(0).unwrap();
+
+        let flow = ctx("1.1.1.1:80", Some("example.com"), Network::Tcp);
+        assert!(!r.needs_payload(&flow));
+
+        assert!(slot.try_begin_update());
+        assert!(!slot.try_begin_update(), "并发更新应被单飞锁拦住");
+        assert!(slot.is_updating());
+        let (with_http, _) = build_inline(&["PROTOCOL,HTTP".to_string()], oryn_config::Behavior::Classical);
+        slot.set(with_http, SystemTime::now());
+        slot.finish_update();
+        assert!(!slot.is_updating());
+        assert!(r.needs_payload(&flow));
+
+        let (domain_only, _) = build_inline(
+            &["DOMAIN,other.example".to_string()],
+            oryn_config::Behavior::Classical,
+        );
+        slot.set(domain_only, SystemTime::now());
+        assert!(!r.needs_payload(&flow));
     }
 }

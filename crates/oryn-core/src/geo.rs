@@ -11,6 +11,8 @@ use oryn_config::{ProviderVia, RuntimeConfig};
 use oryn_http::Options;
 use oryn_router::{GeoIp, Mmdb};
 use serde_json::{json, Value};
+use tokio::sync::Notify;
+use tokio::task::JoinHandle;
 
 use crate::context::{EngineCtx, RuntimeState};
 use crate::download::{get_via, get_via_file};
@@ -57,12 +59,56 @@ impl Kind {
     }
 }
 
-#[derive(Default)]
 pub struct DatabaseStatus {
     updated: Cell<Option<SystemTime>>,
     source: RefCell<Option<String>>,
     error: RefCell<Option<String>>,
     updating: Cell<bool>,
+    token: Cell<u64>,
+    cancel: RefCell<tokio::sync::watch::Sender<bool>>,
+    task: RefCell<Option<JoinHandle<()>>>,
+    done: Notify,
+}
+
+impl Default for DatabaseStatus {
+    fn default() -> Self {
+        Self {
+            updated: Cell::new(None),
+            source: RefCell::new(None),
+            error: RefCell::new(None),
+            updating: Cell::new(false),
+            token: Cell::new(0),
+            cancel: RefCell::new(tokio::sync::watch::channel(false).0),
+            task: RefCell::new(None),
+            done: Notify::new(),
+        }
+    }
+}
+
+impl Drop for DatabaseStatus {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.borrow_mut().take() {
+            task.abort();
+        }
+    }
+}
+
+impl DatabaseStatus {
+    /// 取消当前进行中的该类型数据库下载（仅在配置中的 URL 变化时触发）。
+    pub fn cancel_in_flight(&self, temp_path: Option<PathBuf>) {
+        self.token.set(self.token.get().wrapping_add(1));
+        let (next, _) = tokio::sync::watch::channel(false);
+        let prev = std::mem::replace(&mut *self.cancel.borrow_mut(), next);
+        let _ = prev.send_replace(true);
+        if let Some(task) = self.task.borrow_mut().take() {
+            task.abort();
+        }
+        if let Some(path) = temp_path {
+            let _ = std::fs::remove_file(path);
+        }
+        self.updating.set(false);
+        self.done.notify_waiters();
+    }
 }
 
 pub fn status_json(ctx: &EngineCtx, state: &RuntimeState, kind: Kind) -> Value {
@@ -170,9 +216,23 @@ async fn update_loop(
                 }
             }
         }
+        let expected_url = kind.url(&st).map(str::to_string);
         drop(st);
-        let result = download(&ctx, state.clone(), kind).await;
-        wait = match (result.is_ok(), interval) {
+        let ok = if kind.status(&ctx).updating.get() {
+            // 已有同 URL 的在途下载（如跨越无关热重载保留下来），等待其完成后检查结果。
+            kind.status(&ctx).done.notified().await;
+            kind.db(&ctx).is_loaded()
+                && kind.status(&ctx).source.borrow().as_deref() == expected_url.as_deref()
+        } else {
+            match start_download(&ctx, kind) {
+                Some(rx) => rx.await.unwrap_or(false),
+                None => {
+                    kind.status(&ctx).done.notified().await;
+                    kind.db(&ctx).is_loaded()
+                }
+            }
+        };
+        wait = match (ok, interval) {
             (false, _) => RETRY,
             (true, Some(iv)) => iv,
             (true, None) => return,
@@ -185,77 +245,95 @@ pub fn request(ctx: &Rc<EngineCtx>, state: &Rc<RuntimeState>, kind: Kind) {
     if kind.status(ctx).updating.get() || kind.url(state).is_none() {
         return;
     }
-    let Some(guard) = DownloadGuard::begin(ctx, kind) else {
-        return;
-    };
-    let (ctx, st) = (ctx.clone(), Rc::downgrade(state));
-    state.spawn(async move {
-        let _ = download_guarded(&ctx, st, kind, guard).await;
+    let _ = start_download(ctx, kind);
+}
+
+pub fn cancel_in_flight(ctx: &EngineCtx, kind: Kind) {
+    kind.status(ctx)
+        .cancel_in_flight(kind.path(ctx).map(|p| p.with_extension("tmp")));
+}
+
+fn start_download(
+    ctx: &Rc<EngineCtx>,
+    kind: Kind,
+) -> Option<tokio::sync::oneshot::Receiver<bool>> {
+    let guard = DownloadGuard::begin(ctx, kind)?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let weak = Rc::downgrade(ctx);
+    let handle = tokio::task::spawn_local(async move {
+        let ok = download_guarded(weak, kind, guard).await.is_ok();
+        let _ = tx.send(ok);
     });
+    *kind.status(ctx).task.borrow_mut() = Some(handle);
+    Some(rx)
 }
 
 struct DownloadGuard {
-    ctx: Rc<EngineCtx>,
+    ctx: Weak<EngineCtx>,
     kind: Kind,
+    token: u64,
     temp: Option<PathBuf>,
 }
 impl DownloadGuard {
     fn begin(ctx: &Rc<EngineCtx>, kind: Kind) -> Option<Self> {
-        if kind.status(ctx).updating.replace(true) {
+        let status = kind.status(ctx);
+        if status.updating.replace(true) {
             return None;
         }
-        *kind.status(ctx).error.borrow_mut() = None;
+        let token = status.token.get().wrapping_add(1);
+        status.token.set(token);
+        *status.error.borrow_mut() = None;
         Some(Self {
-            ctx: ctx.clone(),
+            ctx: Rc::downgrade(ctx),
             kind,
+            token,
             temp: kind.path(ctx).map(|p| p.with_extension("tmp")),
         })
     }
 }
 impl Drop for DownloadGuard {
     fn drop(&mut self) {
-        if let Some(path) = &self.temp {
-            let _ = std::fs::remove_file(path);
+        let Some(ctx) = self.ctx.upgrade() else {
+            return;
+        };
+        let status = self.kind.status(&ctx);
+        if status.token.get() == self.token {
+            if let Some(path) = &self.temp {
+                let _ = std::fs::remove_file(path);
+            }
+            status.updating.set(false);
+            status.done.notify_waiters();
         }
-        self.kind.status(&self.ctx).updating.set(false);
     }
-}
-
-async fn download(
-    ctx: &Rc<EngineCtx>,
-    state: Weak<RuntimeState>,
-    kind: Kind,
-) -> Result<(), String> {
-    let guard = DownloadGuard::begin(ctx, kind).ok_or("database update already in progress")?;
-    download_guarded(ctx, state, kind, guard).await
 }
 
 async fn download_guarded(
-    ctx: &Rc<EngineCtx>,
-    state: Weak<RuntimeState>,
+    ctx_weak: Weak<EngineCtx>,
     kind: Kind,
     guard: DownloadGuard,
 ) -> Result<(), String> {
-    // 已建立的 Flow 可能继续持有旧 RuntimeState，不能只依赖其 Drop 来取消下载。
-    let mut cancelled = state
-        .upgrade()
-        .ok_or("database configuration changed")?
-        .inspection_cancel
-        .subscribe();
+    let mut cancelled = {
+        let ctx = ctx_weak.upgrade().ok_or("engine stopped")?;
+        let rx = kind.status(&ctx).cancel.borrow().subscribe();
+        rx
+    };
     if *cancelled.borrow() {
         return Err("database configuration changed".into());
     }
+    let mutex = ctx_weak
+        .upgrade()
+        .ok_or("engine stopped")?
+        .database_download
+        .clone();
     let _permit = tokio::select! {
         biased;
         _ = cancelled.changed() => return Err("database configuration changed".into()),
-        permit = ctx.database_download.lock() => permit,
+        permit = mutex.lock_owned() => permit,
     };
     let result = async {
         let (url, routing, direct) = {
-            let current = state.upgrade().ok_or("database configuration changed")?;
-            if !Rc::ptr_eq(&current, &ctx.state()) {
-                return Err("database configuration changed".into());
-            }
+            let ctx = ctx_weak.upgrade().ok_or("engine stopped")?;
+            let current = ctx.state();
             (
                 kind.url(&current)
                     .ok_or("database URL is not configured")?
@@ -293,13 +371,11 @@ async fn download_guarded(
         if resp.status != 200 {
             return Err(format!("HTTP {}", resp.status));
         }
-        if !state
-            .upgrade()
-            .is_some_and(|st| Rc::ptr_eq(&st, &ctx.state()))
-        {
+        let ctx = ctx_weak.upgrade().ok_or("engine stopped")?;
+        if kind.url(&ctx.state()) != Some(url.as_str()) {
             return Err("database configuration changed".into());
         }
-        match kind.path(ctx) {
+        match kind.path(&ctx) {
             Some(path) => {
                 let tmp = guard.temp.as_ref().unwrap();
                 debug_assert!(resp.body.is_empty());
@@ -312,32 +388,37 @@ async fn download_guarded(
                 if std::fs::write(&source, &url).is_err() {
                     let _ = std::fs::remove_file(source);
                 }
-                kind.db(ctx).set(Some(Arc::new(db)));
+                kind.db(&ctx).set(Some(Arc::new(db)));
             }
             None => {
                 let db = Mmdb::from_bytes(resp.body)?;
                 db.validate_kind(kind == Kind::Asn)?;
-                kind.db(ctx).set(Some(Arc::new(db)));
+                kind.db(&ctx).set(Some(Arc::new(db)));
             }
         }
-        let status = kind.status(ctx);
+        let status = kind.status(&ctx);
         status.updated.set(Some(SystemTime::now()));
         *status.source.borrow_mut() = Some(url.to_string());
         *status.error.borrow_mut() = None;
         Ok(())
     }
     .await;
-    if let Err(e) = &result {
-        warn!("{} database update failed: {e}", kind.name());
-        *kind.status(ctx).error.borrow_mut() = Some(e.clone());
-        crate::events::push(
-            "resource",
-            "Database update failed",
-            format!("{}: {e}", kind.name()),
-        );
-    } else {
-        info!("{} database updated", kind.name());
-        crate::events::push("resource", "Database updated", kind.name());
+    if let Some(ctx) = ctx_weak.upgrade() {
+        let status = kind.status(&ctx);
+        if status.token.get() == guard.token {
+            if let Err(e) = &result {
+                warn!("{} database update failed: {e}", kind.name());
+                *status.error.borrow_mut() = Some(e.clone());
+                crate::events::push(
+                    "resource",
+                    "Database update failed",
+                    format!("{}: {e}", kind.name()),
+                );
+            } else {
+                info!("{} database updated", kind.name());
+                crate::events::push("resource", "Database updated", kind.name());
+            }
+        }
     }
     result
 }

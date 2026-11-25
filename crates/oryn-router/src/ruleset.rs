@@ -1,6 +1,7 @@
 //! 规则集：`domain` / `ipcidr` / `classical` 三种行为，`text` / `yaml` 两种格式。
 
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::SystemTime;
 
@@ -366,6 +367,10 @@ pub struct RuleSetSlot {
     pub behavior: Behavior,
     data: RwLock<Option<Arc<RuleSet>>>,
     info: Mutex<SlotInfo>,
+    /// 当前已加载规则集是否包含需要首包的规则（动态随后台更新变化）。
+    needs_payload: AtomicBool,
+    /// 是否正在后台下载或解析更新。
+    updating: AtomicBool,
 }
 
 impl RuleSetSlot {
@@ -375,7 +380,9 @@ impl RuleSetSlot {
 
     pub fn set(&self, set: RuleSet, updated: SystemTime) {
         let count = set.len();
+        let needs_payload = set.needs_payload();
         *self.data.write().unwrap() = Some(Arc::new(set));
+        self.needs_payload.store(needs_payload, Ordering::Release);
         let mut info = self.info.lock().unwrap();
         info.count = count;
         info.updated = Some(updated);
@@ -389,6 +396,23 @@ impl RuleSetSlot {
     pub fn info(&self) -> SlotInfo {
         self.info.lock().unwrap().clone()
     }
+
+    pub fn needs_payload(&self) -> bool {
+        self.needs_payload.load(Ordering::Acquire)
+    }
+
+    /// 尝试标记开始更新；已有并发更新进行中时返回 `false`。
+    pub fn try_begin_update(&self) -> bool {
+        !self.updating.swap(true, Ordering::AcqRel)
+    }
+
+    pub fn finish_update(&self) {
+        self.updating.store(false, Ordering::Release);
+    }
+
+    pub fn is_updating(&self) -> bool {
+        self.updating.load(Ordering::Acquire)
+    }
 }
 
 /// 全部规则集，下标与 `RuntimeConfig::providers` 一致。
@@ -400,18 +424,23 @@ pub struct RuleSetStore {
 impl RuleSetStore {
     pub fn new(providers: &[ProviderSpec]) -> RuleSetStore {
         RuleSetStore {
-            slots: providers
-                .iter()
-                .map(|p| {
-                    Arc::new(RuleSetSlot {
-                        name: p.name.clone(),
-                        behavior: p.behavior,
-                        data: RwLock::new(None),
-                        info: Mutex::new(SlotInfo::default()),
-                    })
-                })
-                .collect(),
+            slots: providers.iter().map(Self::new_slot).collect(),
         }
+    }
+
+    pub fn new_slot(p: &ProviderSpec) -> Arc<RuleSetSlot> {
+        Arc::new(RuleSetSlot {
+            name: p.name.clone(),
+            behavior: p.behavior,
+            data: RwLock::new(None),
+            info: Mutex::new(SlotInfo::default()),
+            needs_payload: AtomicBool::new(false),
+            updating: AtomicBool::new(false),
+        })
+    }
+
+    pub fn from_slots(slots: Vec<Arc<RuleSetSlot>>) -> RuleSetStore {
+        RuleSetStore { slots }
     }
 
     pub fn slot(&self, i: usize) -> Option<&Arc<RuleSetSlot>> {

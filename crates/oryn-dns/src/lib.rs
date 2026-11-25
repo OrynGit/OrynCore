@@ -307,6 +307,31 @@ impl DnsEngine {
         self.reset();
     }
 
+    /// 增量更新 DNS 配置：
+    /// - `spec` 与 `hosts` 未变且 `dns_rulesets_changed` 为假时保留缓存、持久连接、Fake-IP 与统计；
+    /// - `spec` 与 `hosts` 未变且仅引用的规则集内容变化时清空查询缓存，不销毁上游客户端与统计；
+    /// - 其余情况回退到完整 [`DnsEngine::apply`]。
+    pub fn apply_incremental(
+        &self,
+        spec: DnsSpec,
+        hosts: Vec<HostEntry>,
+        rule_sets: Arc<RuleSetStore>,
+        dns_rulesets_changed: bool,
+    ) {
+        let unchanged = {
+            let current = self.runtime.read().unwrap();
+            current.spec == spec && current.hosts == hosts
+        };
+        if !unchanged {
+            self.apply(spec, hosts, rule_sets);
+            return;
+        }
+        *self.runtime.write().unwrap() = Arc::new(compile(spec, hosts, rule_sets));
+        if dns_rulesets_changed {
+            self.clear_cache();
+        }
+    }
+
     pub fn set_target_ipv6(&self, support: bool, prefer: bool) {
         let policy = u8::from(support) | (u8::from(prefer) << 1);
         if self.target_ip_policy.swap(policy, Ordering::Relaxed) != policy {

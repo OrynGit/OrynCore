@@ -4,7 +4,7 @@
 // Modified for Oryn: Flow 接口、有界上下文与队列，QUIC / TLS 使用原生 Rust。
 mod udp;
 use crate::{
-    slots::{Counted, Slots},
+    slots::{Counted, HeldStream, Slots},
     BoxStream, Outbound, PacketConn, Resolver, SessionControl,
 };
 use async_trait::async_trait;
@@ -257,7 +257,10 @@ impl Outbound for ShadowQuicOutbound {
                     recv = pair.1;
                     send.write_all(&request).await.map_err(io::Error::other)?;
                 }
-                Ok(Counted::boxed(Box::new(tokio::io::join(recv, send)), slot))
+                Ok(HeldStream::boxed(
+                    Counted::boxed(Box::new(tokio::io::join(recv, send)), slot),
+                    self.quic.clone(),
+                ))
             },
             "ShadowQUIC connect",
         )
@@ -280,6 +283,7 @@ impl Outbound for ShadowQuicOutbound {
                     self.spec.max_datagram,
                     self.target_resolver.clone(),
                     slot,
+                    self.quic.clone(),
                 )
                 .await
             },

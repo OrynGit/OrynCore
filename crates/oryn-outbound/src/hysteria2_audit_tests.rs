@@ -224,7 +224,7 @@ async fn real_h3_auth_cancel_and_errors_roll_back() {
             let (server_b, release) = peer.control.as_mut().unwrap().recv().await.unwrap();
             assert_ne!(server_a.stable_id(), server_b.stable_id());
             release.send(233).unwrap();
-            let (client_b, udp) = b.await.unwrap().unwrap();
+            let (client_b, udp, _) = b.await.unwrap().unwrap();
             assert!(udp);
             assert!(client_b.close_reason().is_none());
             assert_eq!(peer.accepted.load(Ordering::Relaxed), 2);
@@ -244,7 +244,7 @@ async fn check_mode(
     bbr: bool,
     count: u64,
 ) -> quinn::Connection {
-    let (conn, udp) = tokio::time::timeout(Duration::from_secs(5), out.ready())
+    let (conn, udp, _) = tokio::time::timeout(Duration::from_secs(5), out.ready())
         .await
         .unwrap()
         .unwrap();
@@ -257,7 +257,7 @@ async fn check_mode(
         "actual congestion controller, response={:?}",
         peer.value.lock().unwrap()
     );
-    let (reused, _) = out.ready().await.unwrap();
+    let (reused, _, _) = out.ready().await.unwrap();
     assert_eq!(conn.stable_id(), reused.stable_id());
     assert_eq!(
         peer.accepted.load(Ordering::Relaxed),
@@ -438,4 +438,25 @@ fn reconnect_recomputes_brutal_rate_from_config() {
         out.apply_server_rate(header);
         assert_eq!(rate.load(Ordering::Relaxed), configured, "header={header}");
     }
+}
+
+#[tokio::test]
+async fn dropping_outbound_keeps_auth_cache_alive_until_streams_drop() {
+    let peer = AuthPeer::new();
+    let out = peer.outbound(false);
+    let (conn, _, auth) = out.ready().await.unwrap();
+    let driver = out.auth_driver.lock().unwrap().clone().unwrap();
+    let held = (out.quic.clone(), auth);
+    drop(out);
+    tokio::task::yield_now().await;
+    assert!(!driver.is_finished(), "活动流仍在保活，不得提前中止 h3 驱动");
+    assert!(conn.close_reason().is_none(), "不得关闭活跃 QUIC 连接");
+    drop(held);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !driver.is_finished() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("最后一个保活引用释放后必须停止 h3 驱动任务");
 }

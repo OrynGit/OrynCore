@@ -240,6 +240,7 @@ struct Packet {
     max_datagram: usize,
     resolver: Arc<dyn Resolver>,
     _slot: Slot,
+    _keep: Option<Arc<oryn_quic::QuicClient>>,
 }
 impl Drop for Packet {
     fn drop(&mut self) {
@@ -268,6 +269,7 @@ pub(super) async fn open(
     max_datagram: usize,
     resolver: Arc<dyn Resolver>,
     slot: Slot,
+    keep: Arc<oryn_quic::QuicClient>,
 ) -> io::Result<Box<dyn PacketConn>> {
     let (mut control, mut incoming) = hub.conn.open_bi().await.map_err(io::Error::other)?;
     control
@@ -311,6 +313,7 @@ pub(super) async fn open(
         max_datagram,
         resolver,
         _slot: slot,
+        _keep: Some(keep),
     }))
 }
 struct CancelGuard {

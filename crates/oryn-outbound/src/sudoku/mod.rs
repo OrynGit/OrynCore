@@ -287,12 +287,6 @@ impl SessionControl for SessionControls {
         self.http.clear();
     }
 }
-impl Drop for SudokuOutbound {
-    fn drop(&mut self) {
-        self.control.reset();
-        self.http.clear();
-    }
-}
 #[async_trait]
 impl Outbound for SudokuOutbound {
     fn tag(&self) -> &str {

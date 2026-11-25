@@ -1088,3 +1088,38 @@ async fn cached_client_uses_latest_proxy_resolution() {
     assert_eq!(ip_of(&Message::parse(&resp).unwrap()), Some("10.9.9.9".parse().unwrap()));
     assert_eq!(e.clients.lock().unwrap().len(), 1, "仍复用同一个缓存客户端");
 }
+
+#[tokio::test]
+async fn apply_incremental_preserves_or_clears_selectively() {
+    let upstream = tcp_server(Ipv4Addr::new(10, 8, 8, 8)).await;
+    let yaml = format!("dns:\n  nameserver: ['tcp://{upstream}']\n  fake-ip-filter: []\n");
+    let cfg = parse_config(&yaml).unwrap();
+    let store = Arc::new(RuleSetStore::new(&cfg.providers));
+    let e = DnsEngine::new(cfg.dns.clone(), cfg.hosts.clone(), Arc::clone(&store));
+    e.set_real_ip_domains(&["*".into()]).unwrap();
+
+    let (_, outcome) = query(&e, "keep.example", TYPE_A).await;
+    assert_eq!(outcome.upstream.as_deref(), Some(format!("tcp://{upstream}").as_str()));
+    assert_eq!(e.cache_len(), 1);
+    assert_eq!(e.clients.lock().unwrap().len(), 1);
+    assert!(!e.upstream_stats.lock().unwrap().is_empty());
+
+    // spec/hosts 未变且未改 DNS 引用的规则集：保留缓存、客户端与统计
+    e.apply_incremental(cfg.dns.clone(), cfg.hosts.clone(), Arc::clone(&store), false);
+    assert_eq!(e.cache_len(), 1);
+    assert_eq!(e.clients.lock().unwrap().len(), 1);
+    assert!(!e.upstream_stats.lock().unwrap().is_empty());
+
+    // 仅 DNS 规则集变化：只清缓存，保留持久客户端与统计
+    e.apply_incremental(cfg.dns.clone(), cfg.hosts.clone(), Arc::clone(&store), true);
+    assert_eq!(e.cache_len(), 0);
+    assert_eq!(e.clients.lock().unwrap().len(), 1);
+    assert!(!e.upstream_stats.lock().unwrap().is_empty());
+
+    // hosts 变化：走完整 apply，连同客户端与统计一起重建
+    let yaml2 = format!("hosts:\n  hosts.example: 192.0.2.9\n{yaml}");
+    let cfg2 = parse_config(&yaml2).unwrap();
+    e.apply_incremental(cfg2.dns, cfg2.hosts, store, false);
+    assert_eq!(e.clients.lock().unwrap().len(), 0);
+    assert!(e.upstream_stats.lock().unwrap().is_empty());
+}

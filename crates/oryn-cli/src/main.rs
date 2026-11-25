@@ -123,8 +123,7 @@ fn data_dir(args: &Args) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
-/// 由宿主设置组装 Engine 运行参数（JSON，字段见 `oryn_core::EngineOptions`）。
-fn engine_options(desktop: &DesktopSettings, data_dir: &Path) -> Vec<u8> {
+fn local_proxy_json(desktop: &DesktopSettings) -> serde_json::Value {
     let mut local = json!({ "enabled": true });
     if let Some(p) = desktop.http_port {
         local["http_port"] = json!(p);
@@ -135,9 +134,14 @@ fn engine_options(desktop: &DesktopSettings, data_dir: &Path) -> Vec<u8> {
     if let Some(lan) = desktop.allow_lan {
         local["allow_external"] = json!(lan);
     }
+    local
+}
+
+/// 由宿主设置组装 Engine 运行参数（JSON，字段见 `oryn_core::EngineOptions`）。
+fn engine_options(desktop: &DesktopSettings, data_dir: &Path) -> Vec<u8> {
     let mut options = json!({
         "data_dir": data_dir,
-        "local_proxy": local,
+        "local_proxy": local_proxy_json(desktop),
         "system_version": std::env::consts::OS,
     });
     // 桌面额度只在 macOS / Linux 上存在（见 oryn_core::ResourceProfile）
@@ -286,7 +290,17 @@ fn run(args: &Args, signals: mpsc::Receiver<Signal>) -> Result<(), String> {
     result
 }
 
-/// `SIGHUP`：重新读取配置文件，用控制命令 `reload` 热重载。宿主设置的变化需要重启。
+fn desktop_diff(current: &DesktopSettings, next: &DesktopSettings) -> (bool, bool) {
+    let tun_changed = next.tun != current.tun
+        || next.routing_mark != current.routing_mark
+        || next.interface_name != current.interface_name;
+    let local_proxy_changed = next.http_port != current.http_port
+        || next.socks_port != current.socks_port
+        || next.allow_lan != current.allow_lan;
+    (tun_changed, local_proxy_changed)
+}
+
+/// `SIGHUP`：重新读取配置文件，用控制命令 `reload` 热重载；本地代理端口变化同步热应用，TUN 与路由变更需重启。
 fn reload(engine: &Engine, args: &Args, current: &mut DesktopSettings) {
     let text = match read_config(&args.config) {
         Ok(t) => t,
@@ -295,28 +309,43 @@ fn reload(engine: &Engine, args: &Args, current: &mut DesktopSettings) {
             return;
         }
     };
-    match parse_desktop(&text) {
-        Ok(next) => {
-            let changed = next.tun != current.tun
-                || next.routing_mark != current.routing_mark
-                || next.interface_name != current.interface_name
-                || next.http_port != current.http_port
-                || next.socks_port != current.socks_port
-                || next.allow_lan != current.allow_lan;
-            if changed {
-                log::warn!("tun, routing-mark, interface-name and local proxy port changes take effect after a restart");
-            }
-        }
+    let next = match parse_desktop(&text) {
+        Ok(n) => n,
         Err(e) => {
             log::error!("reload failed: invalid config: {e}");
             return;
         }
+    };
+    let (tun_changed, local_proxy_changed) = desktop_diff(current, &next);
+    if tun_changed {
+        log::warn!("tun, routing-mark and interface-name changes take effect after a restart");
     }
     let request = json!({ "cmd": "reload", "config": text }).to_string();
     let reply = engine.command(request.as_bytes());
-    match reply.get("error").and_then(|e| e.as_str()) {
-        Some(e) => log::error!("reload failed: {e}"),
-        None => log::info!("config reloaded from {}", args.config.display()),
+    if let Some(e) = reply.get("error").and_then(|e| e.as_str()) {
+        if reply.get("requires_reconnect").and_then(|v| v.as_bool()) == Some(true) {
+            log::error!("reload failed (requires restart/reconnect): {e}");
+        } else {
+            log::error!("reload failed: {e}");
+        }
+        return;
+    }
+    log::info!("config reloaded from {}", args.config.display());
+    if local_proxy_changed {
+        let settings = json!({
+            "cmd": "apply_settings",
+            "local_proxy": local_proxy_json(&next),
+        })
+        .to_string();
+        let reply = engine.command(settings.as_bytes());
+        if let Some(e) = reply.get("error").and_then(|e| e.as_str()) {
+            log::warn!("local proxy settings update failed: {e}");
+        } else {
+            current.http_port = next.http_port;
+            current.socks_port = next.socks_port;
+            current.allow_lan = next.allow_lan;
+            log::info!("local proxy settings applied");
+        }
     }
 }
 
@@ -350,5 +379,19 @@ mod tests {
         // 序列化后的写法能被 Core 重新解析
         let engine = Engine::new(b"rules: ['MATCH,DIRECT']", &engine_options(&desktop, Path::new("/tmp/d")));
         assert!(engine.is_ok());
+    }
+
+    #[test]
+    fn desktop_diff_separates_tun_from_hot_local_proxy() {
+        let base = parse_desktop("port: 7890\nsocks-port: 7891\nallow-lan: false\n").unwrap();
+        let port_changed = parse_desktop("port: 8890\nsocks-port: 7891\nallow-lan: true\n").unwrap();
+        assert_eq!(desktop_diff(&base, &port_changed), (false, true));
+        let local = local_proxy_json(&port_changed);
+        assert_eq!(
+            local,
+            json!({"enabled": true, "http_port": 8890, "socks_port": 7891, "allow_external": true})
+        );
+        let tun_changed = parse_desktop("port: 7890\nsocks-port: 7891\ntun:\n  enable: true\n").unwrap();
+        assert!(desktop_diff(&base, &tun_changed).0);
     }
 }

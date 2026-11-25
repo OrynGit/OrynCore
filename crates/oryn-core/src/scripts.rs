@@ -403,7 +403,7 @@ pub async fn auxiliary(state: std::rc::Rc<crate::context::RuntimeState>, spec: S
         body: vec![],
     };
     if let Err(e) = state.scripts.execute(&spec, &request, None, out.leaf).await {
-        if !*state.inspection_cancel.borrow() {
+        if !*state.aux_cancel.borrow() {
             state
                 .scripts
                 .record_result(&spec.name, json!({"error":e.to_string()}));

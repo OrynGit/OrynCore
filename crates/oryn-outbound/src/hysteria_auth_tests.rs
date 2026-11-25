@@ -101,9 +101,9 @@ async fn cancelled_auth_closes_connection_and_retry_uses_first_stream() {
             (peer, send, recv)
         };
         let (ready, (peer, _send, _recv)) = tokio::join!(retry, accept);
-        let (conn, hub) = ready.unwrap();
+        let (conn, hub, _) = ready.unwrap();
         assert!(conn.close_reason().is_none());
-        let (cached, cached_hub) = outbound.ready().await.unwrap();
+        let (cached, cached_hub, _) = outbound.ready().await.unwrap();
         assert_eq!(cached.stable_id(), conn.stable_id());
         assert!(Arc::ptr_eq(&hub, &cached_hub));
         assert!(peer.close_reason().is_none());

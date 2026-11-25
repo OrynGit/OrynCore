@@ -66,7 +66,7 @@ pub struct RuntimeConfig {
     pub warnings: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModuleSpec {
     pub url: Option<String>,
     pub format: Option<ModuleFormat>,
@@ -93,6 +93,18 @@ impl RuntimeConfig {
 
     pub fn global_index(&self) -> usize {
         self.outbound_index(TAG_GLOBAL).expect("GLOBAL 总是存在")
+    }
+
+    pub fn dns_uses_provider(&self, provider_index: usize) -> bool {
+        self.dns
+            .forward
+            .iter()
+            .any(|rule| matches!(rule.matcher, ForwardMatch::RuleSet(i) if i == provider_index))
+            || self
+                .dns
+                .fake_ip_filter
+                .iter()
+                .any(|item| matches!(item, FakeIpFilter::RuleSet(i) if *i == provider_index))
     }
 }
 
@@ -364,14 +376,14 @@ pub enum MuxProtocol {
     Yamux,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PacketEncoding {
     Default,
     PacketAddr,
     Xudp,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamProxySpec {
     pub server: TargetAddr,
     pub udp: bool,
@@ -403,7 +415,7 @@ impl StreamProxySpec {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnyTlsSpec {
     pub server: TargetAddr,
     pub password: String,
@@ -415,7 +427,7 @@ pub struct AnyTlsSpec {
     pub udp: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VmessSpec {
     pub uuid: [u8; 16],
     pub alter_id: u16,
@@ -454,7 +466,7 @@ impl PortSet {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hysteria2Spec {
     pub server: TargetAddr,
     /// 非空时忽略 `server` 的端口，改走跳跃。
@@ -475,7 +487,7 @@ pub struct Hysteria2Spec {
 }
 
 /// Hysteria Realm（sing-box 1.14 的会合服务）客户端参数。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RealmSpec {
     /// 会合服务器：`https` 走 TLS + HTTP/2，`http` 走明文 HTTP/2（prior knowledge）。
     pub tls: bool,
@@ -494,7 +506,7 @@ pub struct RealmSpec {
 }
 
 /// Sudoku 节点；HTTP mask 与会话复用均在出站内部实现。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SudokuSpec {
     pub server: TargetAddr,
     pub key: String,
@@ -513,7 +525,7 @@ pub struct SudokuSpec {
     pub tls: Option<TlsSpec>,
 }
 /// ShadowQUIC / JLS v3。QUIC 参数在配置阶段限制到 Extension 的资源预算。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShadowQuicSpec {
     pub server: TargetAddr,
     pub username: String,
@@ -535,7 +547,7 @@ pub struct ShadowQuicSpec {
 }
 
 /// Mieru v3：底层传输与是否转发 UDP Flow 相互独立。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MieruSpec {
     pub server: TargetAddr,
     pub port_end: u16,
@@ -560,7 +572,7 @@ pub enum SnellMode {
     UnsafeRaw,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnellSpec {
     pub server: TargetAddr,
     pub psk: String,
@@ -575,7 +587,7 @@ pub struct SnellSpec {
 }
 
 /// NaïveProxy：TLS + HTTP/2/HTTP/3 CONNECT，前 8 个数据块带填充。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NaiveSpec {
     pub server: TargetAddr,
     pub username: String,
@@ -603,7 +615,7 @@ pub struct SshUdpSpec {
 }
 
 /// SSH 出站：每个 Flow 一个 `direct-tcpip` 通道，同一出站共享一条 SSH 连接。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SshSpec {
     pub server: TargetAddr,
     pub username: String,
@@ -628,7 +640,7 @@ pub enum UdpRelayMode {
     Quic,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TuicSpec {
     pub server: TargetAddr,
     pub uuid: [u8; 16],
@@ -647,7 +659,7 @@ pub struct TuicSpec {
     pub reduce_rtt: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WireGuardPeerSpec {
     pub endpoint: TargetAddr,
     pub public_key: [u8; 32],
@@ -670,7 +682,7 @@ pub struct AmneziaSpec {
     pub h: [u32; 4],
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WireGuardSpec {
     /// 至少一个；多个时按目的地址匹配 `allowed_ips`（最长前缀）选择对端。
     pub peers: Vec<WireGuardPeerSpec>,
@@ -729,7 +741,7 @@ impl Default for WireGuardTcpBuffers {
 }
 
 /// mihomo Tailscale 节点；enabled 是默认关闭的 Oryn 扩展。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TailscaleSpec {
     pub enabled: bool,
     pub hostname: Option<String>,
@@ -743,7 +755,7 @@ pub struct TailscaleSpec {
     pub exit_node_allow_lan_access: Option<bool>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum OutboundKind {
     Direct,
     Reject,
@@ -854,7 +866,7 @@ impl OutboundKind {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct GroupSpec {
     pub smart: crate::SmartSpec,
     pub kind: GroupKind,
@@ -1045,7 +1057,7 @@ pub enum DomainStyle {
     Surge,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderSource {
     Http {
         url: String,
@@ -1068,7 +1080,7 @@ pub enum ProviderSource {
 }
 
 /// 代理集合。节点在解析配置时从内联内容或缓存展开为普通出站。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProxyProviderSpec {
     pub name: String,
     pub source: ProxyProviderSource,
@@ -1091,7 +1103,7 @@ pub enum ProviderVia {
     Outbound(usize),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProxyProviderSource {
     Http {
         url: String,
@@ -1121,7 +1133,7 @@ impl ProxyProviderSpec {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderSpec {
     pub name: String,
     pub source: ProviderSource,
@@ -1193,13 +1205,13 @@ impl ServerSpec {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpstreamGroup {
     pub name: String,
     pub servers: Vec<ServerSpec>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ForwardTarget {
     /// `DnsSpec::upstreams` 的下标。
     Upstream(usize),
@@ -1208,7 +1220,7 @@ pub enum ForwardTarget {
     Reject,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ForwardMatch {
     Domain(String),
     DomainSuffix(String),
@@ -1223,7 +1235,7 @@ pub enum ForwardMatch {
     Final,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForwardRule {
     pub matcher: ForwardMatch,
     pub target: ForwardTarget,
@@ -1271,7 +1283,7 @@ pub const DEFAULT_FAKE_IP_FILTER: &[&str] = &[
     "localhost.ptlogin2.qq.com",
 ];
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DnsSpec {
     pub bootstrap: Vec<ServerSpec>,
     pub nameserver: Vec<ServerSpec>,
@@ -1298,13 +1310,13 @@ pub enum HostValue {
     Alias(String),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostEntry {
     pub pattern: DomainPattern,
     pub value: HostValue,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SniffProto {
     pub enabled: bool,
     pub ports: Vec<PortRange>,
@@ -1317,7 +1329,7 @@ impl SniffProto {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnifferSpec {
     pub enable: bool,
     pub force_dns_mapping: bool,
@@ -1331,7 +1343,7 @@ pub struct SnifferSpec {
     pub skip_dst: Vec<IpCidr>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GeoIpSpec {
     pub url: String,
     pub asn_url: Option<String>,
@@ -1385,7 +1397,7 @@ pub const SSR_OBFS: &[&str] = &[
     "tls1.2_ticket_fastauth",
 ];
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SsrSpec {
     pub server: TargetAddr,
     /// 流式加密方式（`SS_STREAM_CIPHERS`）或 `none`。
@@ -1398,7 +1410,7 @@ pub struct SsrSpec {
     pub udp: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HysteriaSpec {
     pub server: TargetAddr,
     /// QUIC 外层承载：udp、wechat-video 或 faketcp（后者未实现，运行时在所有平台拒绝）。
@@ -1418,7 +1430,7 @@ pub struct HysteriaSpec {
 }
 
 /// MITM 只对显式主机列表生效；CA 路径由平台传入，不允许远程模块替换。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MitmSpec {
     pub enabled: bool,
     pub hostnames: Vec<String>,

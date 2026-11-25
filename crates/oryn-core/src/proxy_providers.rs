@@ -9,12 +9,29 @@ use std::rc::{Rc, Weak};
 use std::time::{Duration, SystemTime};
 
 use log::{info, warn};
-use oryn_config::{parse_config_with, ConfigError, ProxyProviderSource, RuntimeConfig};
+use oryn_config::{
+    parse_config_with_providers, ConfigError, ModuleSpec, ProxyProviderSource, RuntimeConfig,
+};
 use oryn_http::{Options, Request};
 use tokio::sync::Semaphore;
 
 use crate::context::{EngineCtx, RuntimeState};
 use crate::download::fetch_via;
+
+struct UpdateGuard {
+    ctx: Weak<EngineCtx>,
+    name: String,
+}
+
+impl Drop for UpdateGuard {
+    fn drop(&mut self) {
+        if let Some(ctx) = self.ctx.upgrade() {
+            if let Some(status) = ctx.proxy_provider_status.borrow_mut().get_mut(&self.name) {
+                status.updating = false;
+            }
+        }
+    }
+}
 
 const MAX_BODY: usize = 32 * 1024 * 1024;
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30);
@@ -82,20 +99,23 @@ pub struct Status {
     pub error: Option<String>,
     pub updated: Option<SystemTime>,
     pub traffic: Option<Traffic>,
+    pub updating: bool,
 }
 
-/// 读缓存 → 解析 → 叠加检查 overlay。
-pub fn compile(
+/// 读缓存与内存覆盖 → 解析 → 叠加检查 overlay。
+pub fn compile_with_overrides(
     text: &str,
     inspection: Option<&str>,
     data_dir: Option<&Path>,
+    overrides: &HashMap<String, String>,
 ) -> Result<RuntimeConfig, ConfigError> {
     let load = |path: &str| -> Option<String> {
         let bytes = std::fs::read(data_dir?.join(path)).ok()?;
         Some(String::from_utf8_lossy(&bytes).into_owned())
     };
+    let over = |name: &str| -> Option<String> { overrides.get(name).cloned() };
     let config = (|| {
-        let mut config = parse_config_with(text, &load)?;
+        let mut config = parse_config_with_providers(text, &load, &over)?;
         if let Some(overlay) = inspection {
             crate::engine::apply_inspection_overlay(&mut config, overlay)?;
         }
@@ -105,6 +125,15 @@ pub fn compile(
     // 调用方可能是平台层的线程，不会再被事件循环整理
     crate::alloc::trim();
     config
+}
+
+/// 读缓存 → 解析 → 叠加检查 overlay。
+pub fn compile(
+    text: &str,
+    inspection: Option<&str>,
+    data_dir: Option<&Path>,
+) -> Result<RuntimeConfig, ConfigError> {
+    compile_with_overrides(text, inspection, data_dir, &HashMap::new())
 }
 
 fn cache_age(data_dir: Option<&Path>, path: &str) -> Option<Duration> {
@@ -172,8 +201,12 @@ pub async fn fetch_missing(ctx: &Rc<EngineCtx>) -> bool {
     }
 }
 
-/// 为每个 `http` 集合启动定期更新。
-pub fn spawn_updates(ctx: &Rc<EngineCtx>, state: &Rc<RuntimeState>) {
+/// 为每个 `http` 集合启动定期更新；`force_indices` 中的集合立即下载一次。
+pub fn spawn_updates_with_changed(
+    ctx: &Rc<EngineCtx>,
+    state: &Rc<RuntimeState>,
+    force_indices: &[usize],
+) {
     for (i, spec) in state.config.proxy_providers.iter().enumerate() {
         let ProxyProviderSource::Http {
             interval_secs,
@@ -184,7 +217,7 @@ pub fn spawn_updates(ctx: &Rc<EngineCtx>, state: &Rc<RuntimeState>) {
             continue;
         };
         let interval = interval_secs.map(Duration::from_secs);
-        let first = if !spec.loaded {
+        let first = if !spec.loaded || force_indices.contains(&i) {
             Some(Duration::ZERO)
         } else {
             let age = cache_age(ctx.data_dir(), cache_path).unwrap_or(Duration::MAX);
@@ -199,6 +232,11 @@ pub fn spawn_updates(ctx: &Rc<EngineCtx>, state: &Rc<RuntimeState>) {
             interval,
         ));
     }
+}
+
+#[allow(dead_code)]
+pub fn spawn_updates(ctx: &Rc<EngineCtx>, state: &Rc<RuntimeState>) {
+    spawn_updates_with_changed(ctx, state, &[]);
 }
 
 async fn update_loop(
@@ -257,6 +295,18 @@ pub async fn download(
         return Err("no data directory to cache the proxy provider".into());
     };
     let path = dir.join(cache_path);
+    {
+        let mut statuses = ctx.proxy_provider_status.borrow_mut();
+        let status = statuses.entry(spec.name.clone()).or_default();
+        if status.updating {
+            return Err("proxy provider update already in progress".into());
+        }
+        status.updating = true;
+    }
+    let _updating = UpdateGuard {
+        ctx: Rc::downgrade(ctx),
+        name: spec.name.clone(),
+    };
     let opts = Options {
         timeout: DOWNLOAD_TIMEOUT,
         max_body: if *size_limit > 0 {
@@ -337,6 +387,11 @@ pub async fn download(
         ))
     }
     .await;
+    let traffic_and_ok = result.is_ok();
+    if traffic_and_ok {
+        ctx.proxy_provider_overrides.borrow_mut().remove(&spec.name);
+    }
+    drop(_updating);
     let mut statuses = ctx.proxy_provider_status.borrow_mut();
     let status = statuses.entry(spec.name.clone()).or_default();
     match result {
@@ -358,6 +413,7 @@ pub async fn download(
                 error: None,
                 updated: Some(SystemTime::now()),
                 traffic,
+                updating: false,
             };
             Ok(changed)
         }
@@ -369,12 +425,58 @@ pub async fn download(
                 format!("{}: {e}", spec.name),
             );
             status.error = Some(e.clone());
+            status.updating = false;
             Err(e)
         }
     }
 }
 
-/// 用保存的配置原文重新编译并应用（集合内容变化后）。
+/// 当模块列表与参数完全一致时，直接沿用上一代已准备好的模块内容与资源，
+/// 避免仅更新代理集合或规则时重复联网/读盘准备模块，并保证后续 HttpPlan 复用生效。
+pub(crate) fn carry_prepared_modules(
+    old_prepared: &[ModuleSpec],
+    new_modules: &mut [ModuleSpec],
+) -> bool {
+    if old_prepared.len() != new_modules.len() {
+        return false;
+    }
+    for (old_m, new_m) in old_prepared.iter().zip(new_modules.iter()) {
+        if old_m.url != new_m.url
+            || old_m.format != new_m.format
+            || old_m.update_interval != new_m.update_interval
+            || old_m.arguments != new_m.arguments
+            || old_m.policy_map != new_m.policy_map
+            || old_m.env != new_m.env
+        {
+            return false;
+        }
+        if !new_m.enabled {
+            if old_m.enabled || old_m.inline != new_m.inline {
+                return false;
+            }
+            continue;
+        }
+        if !old_m.enabled {
+            return false;
+        }
+        if new_m.url.is_none() {
+            if old_m.inline != new_m.inline {
+                return false;
+            }
+        } else if old_m.inline.is_none() {
+            return false;
+        }
+    }
+    for (old_m, new_m) in old_prepared.iter().zip(new_modules.iter_mut()) {
+        if new_m.enabled {
+            new_m.inline.clone_from(&old_m.inline);
+            new_m.resources = old_m.resources.clone();
+        }
+    }
+    true
+}
+
+/// 用保存的配置原文重新编译并部分增量应用（集合内容变化后）。
 pub fn schedule_reload(ctx: &Rc<EngineCtx>) {
     if ctx.reload_compiling.get() {
         ctx.reload_provider_dirty.set(true);
@@ -383,7 +485,12 @@ pub fn schedule_reload(ctx: &Rc<EngineCtx>) {
     let Some(source) = ctx.config_source.borrow().clone() else {
         return;
     };
-    let config = match compile(&source.text, source.inspection.as_deref(), ctx.data_dir()) {
+    let mut config = match compile_with_overrides(
+        &source.text,
+        source.inspection.as_deref(),
+        ctx.data_dir(),
+        &ctx.proxy_provider_overrides.borrow(),
+    ) {
         Ok(c) => c,
         Err(e) => {
             warn!("proxy providers: recompiling the configuration failed: {e}");
@@ -394,11 +501,204 @@ pub fn schedule_reload(ctx: &Rc<EngineCtx>) {
     if let Some(previous) = ctx.pending_reload.borrow_mut().take() {
         previous.abort();
     }
+    let carry = carry_prepared_modules(&ctx.state().base_config.modules, &mut config.modules);
     *ctx.pending_reload.borrow_mut() = Some(tokio::task::spawn_local(async move {
-        let prepared = crate::modules::prepare_for_apply(&c, config).await;
-        c.apply_prepared(prepared);
+        if carry {
+            c.apply_partial(config);
+        } else {
+            let prepared = crate::modules::prepare_for_apply(&c, config).await;
+            c.apply_prepared_partial(prepared);
+        }
         info!("configuration recompiled after a proxy provider update");
     }));
+}
+
+fn apply_recompiled_provider(
+    ctx: &Rc<EngineCtx>,
+    mut config: RuntimeConfig,
+) {
+    if carry_prepared_modules(&ctx.state().base_config.modules, &mut config.modules) {
+        ctx.apply_partial(config);
+    } else {
+        if let Some(previous) = ctx.pending_reload.borrow_mut().take() {
+            previous.abort();
+        }
+        let c = ctx.clone();
+        *ctx.pending_reload.borrow_mut() = Some(tokio::task::spawn_local(async move {
+            let prepared = crate::modules::prepare_for_apply(&c, config).await;
+            c.apply_prepared_partial(prepared);
+        }));
+    }
+}
+
+/// 立即重新读取本地 `file` 代理集合并增量应用。
+pub fn reload_file(ctx: &Rc<EngineCtx>, name: &str) -> Result<usize, String> {
+    let state = ctx.state();
+    let spec = state
+        .config
+        .proxy_providers
+        .iter()
+        .find(|p| p.name == name)
+        .ok_or_else(|| format!("no such proxy provider `{name}`"))?;
+    let ProxyProviderSource::File { path } = &spec.source else {
+        return Err("not a file proxy provider".into());
+    };
+    let dir = ctx
+        .data_dir()
+        .ok_or("no data directory for file proxy provider")?;
+    let full = dir.join(path);
+    if !full.exists() {
+        return Err(format!("cannot read {}", full.display()));
+    }
+    if ctx
+        .proxy_provider_status
+        .borrow()
+        .get(name)
+        .is_some_and(|s| s.updating)
+    {
+        return Err("proxy provider update already in progress".into());
+    }
+    let source = ctx
+        .config_source
+        .borrow()
+        .clone()
+        .ok_or("configuration source is unavailable for proxy provider reload")?;
+    drop(state);
+
+    let mut overrides = ctx.proxy_provider_overrides.borrow().clone();
+    overrides.remove(name);
+    let config = compile_with_overrides(
+        &source.text,
+        source.inspection.as_deref(),
+        ctx.data_dir(),
+        &overrides,
+    )
+    .map_err(|e| e.to_string())?;
+    ctx.validate_virtual_interface(&config)?;
+
+    let p = config
+        .proxy_providers
+        .iter()
+        .find(|p| p.name == name)
+        .ok_or_else(|| format!("proxy provider `{name}` missing after recompile"))?;
+    if let Some(err) = &p.error {
+        let mut statuses = ctx.proxy_provider_status.borrow_mut();
+        statuses.entry(name.to_string()).or_default().error = Some(err.clone());
+        return Err(err.clone());
+    }
+    let count = p.members.len();
+    let updated = std::fs::metadata(&full)
+        .and_then(|m| m.modified())
+        .unwrap_or_else(|_| SystemTime::now());
+    ctx.proxy_provider_overrides.borrow_mut().remove(name);
+    {
+        let mut statuses = ctx.proxy_provider_status.borrow_mut();
+        let entry = statuses.entry(name.to_string()).or_default();
+        entry.error = None;
+        entry.updated = Some(updated);
+        entry.updating = false;
+    }
+    apply_recompiled_provider(ctx, config);
+    info!("proxy provider `{name}` reloaded from file: {count} proxies");
+    crate::events::push(
+        "resource",
+        "Proxy provider updated",
+        format!("{name}: {count} proxies"),
+    );
+    Ok(count)
+}
+
+/// 直接推送代理集合内容并增量生效（不重启、不重建隧道）。
+pub fn apply_content(
+    ctx: &Rc<EngineCtx>,
+    name: &str,
+    content: &str,
+    persist: bool,
+) -> Result<usize, String> {
+    let state = ctx.state();
+    let spec = state
+        .config
+        .proxy_providers
+        .iter()
+        .find(|p| p.name == name)
+        .cloned()
+        .ok_or_else(|| format!("no such proxy provider `{name}`"))?;
+    if ctx
+        .proxy_provider_status
+        .borrow()
+        .get(name)
+        .is_some_and(|s| s.updating)
+    {
+        return Err("proxy provider update already in progress".into());
+    }
+    let source = ctx
+        .config_source
+        .borrow()
+        .clone()
+        .ok_or("configuration source is unavailable for proxy provider update")?;
+    drop(state);
+
+    let nodes = oryn_config::proxy_provider_nodes(content).map_err(|e| e.to_string())?;
+    if nodes.is_empty() {
+        return Err("the pushed content has no proxies".into());
+    }
+
+    let mut overrides = ctx.proxy_provider_overrides.borrow().clone();
+    overrides.insert(name.to_string(), content.to_string());
+    let config = compile_with_overrides(
+        &source.text,
+        source.inspection.as_deref(),
+        ctx.data_dir(),
+        &overrides,
+    )
+    .map_err(|e| e.to_string())?;
+    ctx.validate_virtual_interface(&config)?;
+
+    let p = config
+        .proxy_providers
+        .iter()
+        .find(|p| p.name == name)
+        .ok_or_else(|| format!("proxy provider `{name}` missing after recompile"))?;
+    if let Some(err) = &p.error {
+        return Err(err.clone());
+    }
+    let count = p.members.len();
+
+    let mut disk_synced = false;
+    if persist {
+        let rel = spec
+            .file_path()
+            .ok_or("inline proxy provider has no backing file to persist")?;
+        let dir = ctx
+            .data_dir()
+            .ok_or("no data directory to persist proxy provider")?;
+        crate::providers::write_atomic(&dir.join(rel), content.as_bytes())
+            .map_err(|e| format!("cannot write cache: {e}"))?;
+        disk_synced = matches!(spec.source, ProxyProviderSource::File { .. });
+    }
+
+    if disk_synced {
+        ctx.proxy_provider_overrides.borrow_mut().remove(name);
+    } else {
+        ctx.proxy_provider_overrides
+            .borrow_mut()
+            .insert(name.to_string(), content.to_string());
+    }
+    {
+        let mut statuses = ctx.proxy_provider_status.borrow_mut();
+        let entry = statuses.entry(name.to_string()).or_default();
+        entry.error = None;
+        entry.updated = Some(SystemTime::now());
+        entry.updating = false;
+    }
+    apply_recompiled_provider(ctx, config);
+    info!("proxy provider `{name}` pushed: {count} proxies");
+    crate::events::push(
+        "resource",
+        "Proxy provider updated",
+        format!("{name}: {count} proxies"),
+    );
+    Ok(count)
 }
 
 /// `providers` 命令里的代理集合列表。
@@ -440,6 +740,7 @@ pub fn status_json(ctx: &EngineCtx, state: &RuntimeState) -> Vec<serde_json::Val
                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                     .map(|d| d.as_secs_f64()),
                 "error": status.error.or_else(|| p.error.clone()),
+                "updating": status.updating,
             })
         })
         .collect()

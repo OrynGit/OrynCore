@@ -250,11 +250,6 @@ impl MieruOutbound {
         .await
     }
 }
-impl Drop for MieruOutbound {
-    fn drop(&mut self) {
-        self.state.reset();
-    }
-}
 #[async_trait]
 impl Outbound for MieruOutbound {
     fn tag(&self) -> &str {
