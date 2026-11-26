@@ -76,7 +76,9 @@ pub struct ModuleSpec {
     pub policy_map: Vec<(String, String)>,
     /// 模块环境变量，脚本通过 `ctx.env` 读取。
     pub env: std::collections::BTreeMap<String, String>,
-    pub inline: Option<ModuleIR>,
+    /// 解析后的模块 IR。`Arc` 共享：`RuntimeState` 的 `config` 与 `base_config`、
+    /// 增量重载复用的旧配置都指向同一份，避免多份 `ModuleIR` 深拷贝。
+    pub inline: Option<std::sync::Arc<ModuleIR>>,
     /// 模块引用的脚本 / 数据文件。`Arc` 共享：`RuntimeState` 的 `config` 与 `base_config`、
     /// 重新加载时的上一份配置都指向同一份，不随配置 `clone()` 复制（资源最多 8 MiB）。
     pub resources: std::sync::Arc<oryn_module::Resources>,

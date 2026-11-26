@@ -174,7 +174,7 @@ fn audit(
         arguments,
         policy_map: vec![],
         env: BTreeMap::new(),
-        inline: Some(ir),
+        inline: Some(std::sync::Arc::new(ir)),
         resources: std::sync::Arc::new(loaded),
     };
     out["resource_bytes"] = json!(spec.resources.values().map(|v| v.len()).sum::<usize>());

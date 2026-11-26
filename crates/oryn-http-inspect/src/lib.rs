@@ -47,11 +47,68 @@ pub fn unsupported(e: impl std::fmt::Display) -> io::Error {
 /// 按需编译：加载时只校验语法，第一次可能命中时才编译并缓存。`^` 锚定的正则（模块里几乎
 /// 都是 `^https:\/\/主机\/…`）先比对开头的字面量前缀，对不上就一定不命中，不必编译；
 /// 用户不访问的 App 的规则因此不占内存（一个常见的 37 模块组合约 970 条正则，全部编译约 14 MiB）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Prefix {
+    Exact { text: String, ci: bool },
+    /// 匹配 `http://<rest>` 或 `https://<rest>`（对应常见的 `^https?://...`）。
+    HttpOrHttps { rest: String, ci: bool },
+}
+
+impl Prefix {
+    fn matches(&self, s: &str) -> bool {
+        match self {
+            Self::Exact { text, ci } => {
+                let Some(head) = s.as_bytes().get(..text.len()) else {
+                    return false;
+                };
+                if *ci {
+                    head.eq_ignore_ascii_case(text.as_bytes())
+                } else {
+                    head == text.as_bytes()
+                }
+            }
+            Self::HttpOrHttps { rest, ci } => {
+                let bytes = s.as_bytes();
+                let tail = if *ci {
+                    if bytes.len() >= 8 && bytes[..8].eq_ignore_ascii_case(b"https://") {
+                        &bytes[8..]
+                    } else if bytes.len() >= 7 && bytes[..7].eq_ignore_ascii_case(b"http://") {
+                        &bytes[7..]
+                    } else {
+                        return false;
+                    }
+                } else if let Some(t) = bytes.strip_prefix(b"https://") {
+                    t
+                } else if let Some(t) = bytes.strip_prefix(b"http://") {
+                    t
+                } else {
+                    return false;
+                };
+                let Some(head) = tail.get(..rest.len()) else {
+                    return false;
+                };
+                if *ci {
+                    head.eq_ignore_ascii_case(rest.as_bytes())
+                } else {
+                    head == rest.as_bytes()
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Prefilter {
+    prefix: Option<Prefix>,
+    needle: Option<(Box<str>, bool)>,
+    exact_host: Option<Box<str>>,
+}
+
 #[derive(Clone, Debug)]
 pub struct Pattern {
     source: std::sync::Arc<str>,
-    /// 字面量前缀与是否忽略 ASCII 大小写；None 表示无法提取（未锚定、多行模式、顶层 `|` 等）。
-    prefix: Option<(String, bool)>,
+    /// 打包到堆上的预过滤信息（前缀、必现子串、精确主机名），保持 `Pattern` 自身紧凑。
+    prefilter: Option<Box<Prefilter>>,
     engine: std::sync::OnceLock<Engine>,
     /// 包括整体匹配组0；加载时记录，不为索引校验再次编译。
     capture_count: usize,
@@ -74,10 +131,7 @@ impl Engine {
         ))
     }
 }
-/// 锚定正则开头必然出现的字面量（只处理 ASCII 字面量与转义的标点）。
-fn literal_prefix(pattern: &str) -> Option<String> {
-    let rest = pattern.strip_prefix('^')?;
-    // 顶层 `|` 让 `^` 只约束第一个分支。
+fn has_top_level_alternation(rest: &str) -> bool {
     let (mut depth, mut class, mut escape) = (0i32, false, false);
     for c in rest.chars() {
         match c {
@@ -87,33 +141,343 @@ fn literal_prefix(pattern: &str) -> Option<String> {
             ']' if class => class = false,
             '(' if !class => depth += 1,
             ')' if !class => depth -= 1,
-            '|' if !class && depth == 0 => return None,
+            '|' if !class && depth == 0 => return true,
             _ => {}
         }
     }
+    false
+}
+/// 从正则切片开头提取连续的 ASCII 字面量与转义标点，并返回未消费的剩余切片。
+fn literal_run(rest: &str) -> (String, &str) {
     let mut out = String::new();
-    let mut chars = rest.chars().peekable();
-    while let Some(c) = chars.next() {
-        let lit = match c {
-            '\\' => match chars.next() {
-                Some(n) if n.is_ascii_punctuation() => n,
-                _ => break,
-            },
-            '.' | '[' | '(' | ')' | '*' | '+' | '?' | '{' | '|' | '$' | '^' => break,
-            c if c.is_ascii() => c,
+    let mut i = 0usize;
+    let bytes = rest.as_bytes();
+    while i < bytes.len() {
+        let (lit, next_i) = match bytes[i] {
+            b'\\' => {
+                if i + 1 < bytes.len() && bytes[i + 1].is_ascii_punctuation() {
+                    (bytes[i + 1] as char, i + 2)
+                } else {
+                    break;
+                }
+            }
+            b'.' | b'[' | b'(' | b')' | b'*' | b'+' | b'?' | b'{' | b'|' | b'$' | b'^' => break,
+            b if b.is_ascii() => (b as char, i + 1),
             _ => break,
         };
-        match chars.peek() {
-            // 量词让这个字符变成可选：不计入前缀。
-            Some('?' | '*' | '{') => break,
-            Some('+') => {
+        match bytes.get(next_i) {
+            // 量词让这个字符变成可选：不计入前缀，剩余切片停在该字符之前。
+            Some(b'?' | b'*' | b'{') => break,
+            Some(b'+') => {
                 out.push(lit);
+                i = next_i;
                 break;
             }
-            _ => out.push(lit),
+            _ => {
+                out.push(lit);
+                i = next_i;
+            }
         }
     }
+    (out, &rest[i..])
+}
+/// 锚定正则开头必然出现的字面量（只处理 ASCII 字面量与转义的标点）。
+#[cfg(test)]
+fn literal_prefix(pattern: &str) -> Option<String> {
+    let rest = pattern.strip_prefix('^')?;
+    if has_top_level_alternation(rest) {
+        return None;
+    }
+    let (out, _) = literal_run(rest);
     (!out.is_empty()).then_some(out)
+}
+fn strip_optional_https_scheme(rest: &str, ci: bool) -> Option<&str> {
+    for pat in ["https?://", r"https?:\/\/"] {
+        if rest.len() >= pat.len() {
+            let head = &rest.as_bytes()[..pat.len()];
+            let matched = if ci {
+                head.eq_ignore_ascii_case(pat.as_bytes())
+            } else {
+                head == pat.as_bytes()
+            };
+            if matched {
+                return Some(&rest[pat.len()..]);
+            }
+        }
+    }
+    None
+}
+fn extract_exact_host(after_scheme: &str, tail: &str) -> Option<String> {
+    let host = if let Some(pos) = after_scheme.find(['/', ':', '?', '#']) {
+        &after_scheme[..pos]
+    } else if tail == "$" {
+        after_scheme
+    } else {
+        return None;
+    };
+    if host.is_empty()
+        || host
+            .bytes()
+            .any(|b| b.is_ascii_whitespace() || matches!(b, b'@' | b'[' | b']'))
+    {
+        return None;
+    }
+    Some(host.to_ascii_lowercase())
+}
+fn extract_prefix(pattern: &str, ci: bool) -> (Option<Prefix>, Option<String>) {
+    let Some(rest) = pattern.strip_prefix('^') else {
+        return (None, None);
+    };
+    if has_top_level_alternation(rest) {
+        return (None, None);
+    }
+    if let Some(after_scheme) = strip_optional_https_scheme(rest, ci) {
+        let (lit, tail) = literal_run(after_scheme);
+        if !lit.is_empty() {
+            let host = extract_exact_host(&lit, tail);
+            return (Some(Prefix::HttpOrHttps { rest: lit, ci }), host);
+        }
+    }
+    let (lit, tail) = literal_run(rest);
+    if lit.is_empty() {
+        return (None, None);
+    }
+    let host = if lit.len() >= 8 && lit.as_bytes()[..8].eq_ignore_ascii_case(b"https://") {
+        extract_exact_host(&lit[8..], tail)
+    } else if lit.len() >= 7 && lit.as_bytes()[..7].eq_ignore_ascii_case(b"http://") {
+        extract_exact_host(&lit[7..], tail)
+    } else {
+        None
+    };
+    (Some(Prefix::Exact { text: lit, ci }), host)
+}
+/// 从 HTTP(S) URL 提取小写主机名（不分配，除非含大写字母）。
+fn url_host_lower(url: &str) -> Option<Cow<'_, str>> {
+    let bytes = url.as_bytes();
+    let after = if bytes.len() >= 8 && bytes[..8].eq_ignore_ascii_case(b"https://") {
+        &url[8..]
+    } else if bytes.len() >= 7 && bytes[..7].eq_ignore_ascii_case(b"http://") {
+        &url[7..]
+    } else {
+        return None;
+    };
+    let authority_end = after.find(['/', '?', '#']).unwrap_or(after.len());
+    let authority = &after[..authority_end];
+    let host_port = match authority.rsplit_once('@') {
+        Some((_, hp)) => hp,
+        None => authority,
+    };
+    if host_port.is_empty() || host_port.starts_with('[') {
+        return None;
+    }
+    let host = match host_port.split_once(':') {
+        Some((h, _)) => h,
+        None => host_port,
+    };
+    if host.is_empty() {
+        return None;
+    }
+    if host.bytes().any(|b| b.is_ascii_uppercase()) {
+        Some(Cow::Owned(host.to_ascii_lowercase()))
+    } else {
+        Some(Cow::Borrowed(host))
+    }
+}
+/// 从无顶层 `|` 的正则中提取括号深度 0、字符类外、非可选的最长 ASCII 字面量子串。
+/// 仅在不含内联标志（如 `(?i)`）时启用，确保不漏匹配。
+fn required_literal_needle(pattern: &str) -> Option<String> {
+    if has_top_level_alternation(pattern) {
+        return None;
+    }
+    let bytes = pattern.as_bytes();
+    let mut best = String::new();
+    let mut cur = String::new();
+    let mut depth = 0i32;
+    let mut in_class = false;
+    let mut i = 0usize;
+
+    let flush = |cur: &mut String, best: &mut String| {
+        if cur.len() > best.len() {
+            best.clear();
+            best.push_str(cur);
+        }
+        cur.clear();
+    };
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_class {
+            if b == b'\\' {
+                i += 2;
+            } else {
+                if b == b']' {
+                    in_class = false;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if depth > 0 {
+            match b {
+                b'\\' => i += 2,
+                b'[' => {
+                    in_class = true;
+                    i += 1;
+                }
+                b'(' => {
+                    if bytes.get(i + 1) == Some(&b'?') {
+                        match bytes.get(i + 2) {
+                            Some(b':' | b'=' | b'!' | b'<') => {}
+                            _ => return None,
+                        }
+                    }
+                    depth += 1;
+                    i += 1;
+                }
+                b')' => {
+                    depth -= 1;
+                    i += 1;
+                }
+                _ => i += 1,
+            }
+            continue;
+        }
+        match b {
+            b'[' => {
+                flush(&mut cur, &mut best);
+                in_class = true;
+                i += 1;
+            }
+            b'(' => {
+                flush(&mut cur, &mut best);
+                if bytes.get(i + 1) == Some(&b'?') {
+                    match bytes.get(i + 2) {
+                        Some(b':' | b'=' | b'!' | b'<') => {}
+                        _ => return None,
+                    }
+                }
+                depth += 1;
+                i += 1;
+            }
+            b')' => return None,
+            b'{' => {
+                flush(&mut cur, &mut best);
+                let rel_end = bytes[i + 1..].iter().position(|&c| c == b'}')?;
+                i += rel_end + 2;
+            }
+            b'.' | b'*' | b'+' | b'?' | b'^' | b'$' | b'|' => {
+                flush(&mut cur, &mut best);
+                i += 1;
+            }
+            b'\\' => {
+                let Some(&next) = bytes.get(i + 1) else {
+                    break;
+                };
+                if next.is_ascii_punctuation() {
+                    let after = i + 2;
+                    match bytes.get(after) {
+                        Some(b'?' | b'*') => {
+                            flush(&mut cur, &mut best);
+                            i = after + 1;
+                        }
+                        Some(b'{') => {
+                            flush(&mut cur, &mut best);
+                            let rel_end = bytes[after + 1..].iter().position(|&c| c == b'}')?;
+                            i = after + rel_end + 2;
+                        }
+                        Some(b'+') => {
+                            cur.push(next as char);
+                            flush(&mut cur, &mut best);
+                            i = after + 1;
+                        }
+                        _ => {
+                            cur.push(next as char);
+                            i = after;
+                        }
+                    }
+                } else if matches!(
+                    next,
+                    b'd' | b'D'
+                        | b'w'
+                        | b'W'
+                        | b's'
+                        | b'S'
+                        | b'b'
+                        | b'B'
+                        | b'A'
+                        | b'z'
+                        | b'Z'
+                        | b'n'
+                        | b'r'
+                        | b't'
+                        | b'f'
+                        | b'v'
+                ) {
+                    flush(&mut cur, &mut best);
+                    i += 2;
+                } else {
+                    // 遇到 \x / \u / \p / 反向引用等复杂转义，停止继续扫描，仅保留此前已确认的最长字面量。
+                    flush(&mut cur, &mut best);
+                    break;
+                }
+            }
+            c if c.is_ascii() => {
+                let after = i + 1;
+                match bytes.get(after) {
+                    Some(b'?' | b'*') => {
+                        flush(&mut cur, &mut best);
+                        i = after + 1;
+                    }
+                    Some(b'{') => {
+                        flush(&mut cur, &mut best);
+                        let rel_end = bytes[after + 1..].iter().position(|&c| c == b'}')?;
+                        i = after + rel_end + 2;
+                    }
+                    Some(b'+') => {
+                        cur.push(c as char);
+                        flush(&mut cur, &mut best);
+                        i = after + 1;
+                    }
+                    _ => {
+                        cur.push(c as char);
+                        i = after;
+                    }
+                }
+            }
+            _ => {
+                flush(&mut cur, &mut best);
+                i += 1;
+            }
+        }
+    }
+    flush(&mut cur, &mut best);
+    if best.len() < 4
+        || best.eq_ignore_ascii_case("http")
+        || best.eq_ignore_ascii_case("https")
+        || best.eq_ignore_ascii_case("http://")
+        || best.eq_ignore_ascii_case("https://")
+    {
+        return None;
+    }
+    Some(best)
+}
+fn contains_ascii_ci(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if haystack.len() < needle.len() {
+        return false;
+    }
+    let first = needle[0].to_ascii_lowercase();
+    let end = haystack.len() - needle.len();
+    for i in 0..=end {
+        if haystack[i].to_ascii_lowercase() == first
+            && haystack[i..i + needle.len()].eq_ignore_ascii_case(needle)
+        {
+            return true;
+        }
+    }
+    false
 }
 impl Pattern {
     pub fn new(s: &str, flags: &str) -> io::Result<Self> {
@@ -122,45 +486,79 @@ impl Pattern {
         }
         // 模块正则是 JavaScript 语义：`\d` / `\w` 只匹配 ASCII，也避免 Unicode 类编出巨大的自动机。
         let ascii = oryn_module::regex_ascii_classes(s);
-        let prefix = if flags.contains('m') {
-            None
+        let ci = flags.contains('i');
+        let (prefix, exact_host) = if flags.contains('m') {
+            (None, None)
         } else {
-            literal_prefix(&ascii).map(|p| (p, flags.contains('i')))
+            extract_prefix(&ascii, ci)
+        };
+        // 对未抽出精确主机的规则（如子域通配、未锚定正则），再提取必现字面量子串作为预过滤，
+        // 避免首条不相关请求即编译所有通配 DFA。
+        let needle = if exact_host.is_none() {
+            required_literal_needle(&ascii)
+                .filter(|n| match &prefix {
+                    Some(Prefix::Exact { text, .. }) => !text.contains(n.as_str()),
+                    Some(Prefix::HttpOrHttps { rest, .. }) => !rest.contains(n.as_str()),
+                    None => true,
+                })
+                .map(|n| (n.into_boxed_str(), ci))
+        } else {
+            None
+        };
+        let prefilter = if prefix.is_some() || needle.is_some() || exact_host.is_some() {
+            Some(Box::new(Prefilter {
+                prefix,
+                needle,
+                exact_host: exact_host.map(String::into_boxed_str),
+            }))
+        } else {
+            None
         };
         let source: std::sync::Arc<str> = if flags.is_empty() {
             ascii.into()
         } else {
             format!("(?{flags}){ascii}").into()
         };
-        // 校验语法；有前缀时先丢掉编译结果，等真正可能命中时再编译。
+        // 校验语法；有前缀或必现子串时先丢掉编译结果，等真正可能命中时再编译。
         let engine = Engine::build(&source)?;
         let capture_count = match &engine {
             Engine::Meta(re) => re.captures_len(),
             Engine::Fancy(re) => re.captures_len(),
         };
         let cell = std::sync::OnceLock::new();
-        if prefix.is_none() {
+        if prefilter.is_none() {
             let _ = cell.set(engine);
         }
         Ok(Self {
             source,
-            prefix,
+            prefilter,
             engine: cell,
             capture_count,
         })
     }
-    pub(crate) fn capture_count(&self) -> usize { self.capture_count }
-    /// 前缀对不上时为 None（一定不命中），否则返回（必要时现编译的）引擎。
+    pub(crate) fn capture_count(&self) -> usize {
+        self.capture_count
+    }
+    pub(crate) fn exact_host(&self) -> Option<&str> {
+        self.prefilter.as_deref()?.exact_host.as_deref()
+    }
+    /// 前缀或必现子串对不上时为 None（一定不命中），否则返回（必要时现编译的）引擎。
     fn engine_for(&self, s: &str) -> Option<&Engine> {
-        if let Some((p, ci)) = &self.prefix {
-            let head = s.as_bytes().get(..p.len())?;
-            let ok = if *ci {
-                head.eq_ignore_ascii_case(p.as_bytes())
-            } else {
-                head == p.as_bytes()
-            };
-            if !ok {
-                return None;
+        if let Some(pf) = self.prefilter.as_deref() {
+            if let Some(p) = &pf.prefix {
+                if !p.matches(s) {
+                    return None;
+                }
+            }
+            if let Some((needle, ci)) = &pf.needle {
+                let ok = if *ci {
+                    contains_ascii_ci(s.as_bytes(), needle.as_bytes())
+                } else {
+                    s.contains(needle.as_ref())
+                };
+                if !ok {
+                    return None;
+                }
             }
         }
         Some(self.engine.get_or_init(|| {
@@ -363,7 +761,77 @@ pub struct CompiledRule {
     pub dialect: ModuleFormat,
     pub source: String,
 }
-#[derive(Clone, Debug)]
+#[derive(Debug, Default)]
+struct RuleIndex {
+    by_host: std::collections::HashMap<String, Vec<usize>>,
+    fallback: Vec<usize>,
+}
+
+impl RuleIndex {
+    fn build<'a>(conditions: impl Iterator<Item = &'a Condition>) -> Self {
+        let mut by_host: std::collections::HashMap<String, Vec<usize>> =
+            std::collections::HashMap::new();
+        let mut fallback = Vec::new();
+        for (idx, cond) in conditions.enumerate() {
+            if let Some(host) = condition_exact_host(cond) {
+                by_host.entry(host.to_owned()).or_default().push(idx);
+            } else {
+                fallback.push(idx);
+            }
+        }
+        Self { by_host, fallback }
+    }
+
+    fn host_indices(&self, url: &str) -> &[usize] {
+        if self.by_host.is_empty() {
+            return &[];
+        }
+        match url_host_lower(url) {
+            Some(host) => self.by_host.get(host.as_ref()).map_or(&[], Vec::as_slice),
+            None => &[],
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PlanIndex {
+    lens: (usize, usize, usize),
+    request: RuleIndex,
+    response: RuleIndex,
+    scripts: RuleIndex,
+}
+
+fn condition_exact_host(c: &Condition) -> Option<&str> {
+    match c {
+        Condition::Match(Expr::Variable(v), p, _) if v == "url" => p.exact_host(),
+        Condition::And(a, b) => condition_exact_host(a).or_else(|| condition_exact_host(b)),
+        _ => None,
+    }
+}
+
+fn expr_reads_response_header(e: &Expr) -> bool {
+    match e {
+        Expr::Variable(n) => n.starts_with("response.header["),
+        Expr::Template(s) => s.contains("response.header["),
+        Expr::BoundTemplate(parts) => parts.iter().any(|p| {
+            matches!(p, TemplatePart::Variable(n) if n.starts_with("response.header["))
+        }),
+        Expr::Array(xs) => xs.iter().any(expr_reads_response_header),
+        _ => false,
+    }
+}
+
+fn condition_reads_response_header(c: &Condition) -> bool {
+    match c {
+        Condition::Always => false,
+        Condition::Eq(a, b) => expr_reads_response_header(a) || expr_reads_response_header(b),
+        Condition::Match(e, _, _) => expr_reads_response_header(e),
+        Condition::And(a, b) | Condition::Or(a, b) => {
+            condition_reads_response_header(a) || condition_reads_response_header(b)
+        }
+    }
+}
+
 pub struct Plan {
     pub request: Vec<CompiledRule>,
     pub response: Vec<CompiledRule>,
@@ -372,6 +840,33 @@ pub struct Plan {
     pub max_body: usize,
     /// 被跳过的行，由加载方并入配置警告。
     pub warnings: Vec<String>,
+    /// 延迟按精确主机名建立的候选下标索引，避免每条请求线性扫描全部规则。
+    index: std::cell::RefCell<Option<Box<PlanIndex>>>,
+}
+
+impl Clone for Plan {
+    fn clone(&self) -> Self {
+        Self {
+            request: self.request.clone(),
+            response: self.response.clone(),
+            scripts: self.scripts.clone(),
+            max_body: self.max_body,
+            warnings: self.warnings.clone(),
+            index: std::cell::RefCell::new(None),
+        }
+    }
+}
+
+impl std::fmt::Debug for Plan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Plan")
+            .field("request", &self.request)
+            .field("response", &self.response)
+            .field("scripts", &self.scripts)
+            .field("max_body", &self.max_body)
+            .field("warnings", &self.warnings)
+            .finish()
+    }
 }
 
 impl Default for Plan {
@@ -382,6 +877,7 @@ impl Default for Plan {
             scripts: Vec::new(),
             max_body: MAX_BODY,
             warnings: Vec::new(),
+            index: std::cell::RefCell::new(None),
         }
     }
 }
@@ -465,6 +961,35 @@ mod jq_sharing_bounds_tests {
 }
 
 impl Plan {
+    /// 按指定单正文上限构造空计划（供外部 crate 使用）。
+    pub fn with_max_body(max_body: usize) -> Self {
+        Self {
+            max_body,
+            ..Self::default()
+        }
+    }
+
+    fn ensure_index(&self) -> std::cell::Ref<'_, PlanIndex> {
+        let lens = (self.request.len(), self.response.len(), self.scripts.len());
+        let needs_build = self
+            .index
+            .borrow()
+            .as_ref()
+            .is_none_or(|idx| idx.lens != lens);
+        if needs_build {
+            let built = Box::new(PlanIndex {
+                lens,
+                request: RuleIndex::build(self.request.iter().map(|r| &r.condition)),
+                response: RuleIndex::build(self.response.iter().map(|r| &r.condition)),
+                scripts: RuleIndex::build(self.scripts.iter().map(|s| &s.condition)),
+            });
+            *self.index.borrow_mut() = Some(built);
+        }
+        std::cell::Ref::map(self.index.borrow(), |opt| {
+            opt.as_deref().expect("PlanIndex initialized")
+        })
+    }
+
     /// 仅在加载完成后共享同源码 jq；每条声明仍由编译器独立验证。
     /// 临时索引借读已有源码，无源码副本；超限的新候选照常独立执行。
     pub fn share_jq_programs(&mut self) {
@@ -543,121 +1068,323 @@ impl Plan {
         } else {
             "http-request"
         };
+        let index = self.ensure_index();
+        let host_slice = index.scripts.host_indices(&m.url);
+        let fallback = index.scripts.fallback.as_slice();
+        let (mut hi, mut fi) = (0usize, 0usize);
         let mut loon_selected = false;
-        self.scripts
-            .iter()
-            .filter(|s| {
-                if !s.enabled || s.kind != kind || (s.dialect == ModuleFormat::Loon && loon_selected) {
-                    return false;
+        let mut out = Vec::new();
+        let mut caps = BTreeMap::new();
+        loop {
+            let idx = match (host_slice.get(hi).copied(), fallback.get(fi).copied()) {
+                (Some(h), Some(f)) if h < f => {
+                    hi += 1;
+                    h
                 }
-                if !evaluate(&s.condition, m, request, &mut BTreeMap::new()) { return false; }
-                if s.dialect == ModuleFormat::Loon { loon_selected = true; }
-                true
-            })
-            .collect()
+                (Some(_), Some(f)) => {
+                    fi += 1;
+                    f
+                }
+                (Some(h), None) => {
+                    hi += 1;
+                    h
+                }
+                (None, Some(f)) => {
+                    fi += 1;
+                    f
+                }
+                (None, None) => break,
+            };
+            let s = &self.scripts[idx];
+            if !s.enabled || s.kind != kind || (s.dialect == ModuleFormat::Loon && loon_selected) {
+                continue;
+            }
+            caps.clear();
+            if !evaluate(&s.condition, m, request, &mut caps) {
+                continue;
+            }
+            if s.dialect == ModuleFormat::Loon {
+                loon_selected = true;
+            }
+            out.push(s);
+        }
+        out
     }
     pub fn apply_request(&self, m: &mut Message) -> io::Result<Option<Message>> {
-        self.execute(&self.request, m, None, true)
+        self.execute(false, m, None, true)
     }
     pub fn apply_response(&self, m: &mut Message, request: &Message) -> io::Result<()> {
-        self.execute(&self.response, m, Some(request), true)?;
+        self.execute(true, m, Some(request), true)?;
         Ok(())
     }
     pub fn apply_request_headers(&self, m: &mut Message) -> io::Result<Option<Message>> {
-        self.execute(&self.request, m, None, false)
+        self.execute(false, m, None, false)
     }
     pub fn apply_response_headers(&self, m: &mut Message, request: &Message) -> io::Result<()> {
-        self.execute(&self.response, m, Some(request), false)?;
+        self.execute(true, m, Some(request), false)?;
         Ok(())
     }
     /// 预演本消息命中的非正文动作以决定是否缓冲；实际消息的动作仅执行一次。
     /// 响应脚本仍按原始响应选取。
     pub fn needs_body_after_rewrite(&self, m: &Message, request: Option<&Message>) -> bool {
-        // 预演只操作独立header快照，无IO/脚本，不重放到实际Message。
+        // 预演只在首条命中的非正文改写发生时延迟克隆 header 快照；未命中时零分配。
         // 未命中的其他主机规则不能令普通大上传返回413。
-        let rules = if m.status.is_some() { &self.response } else { &self.request };
-        let mut preview = Message { url: m.url.clone(), method: m.method.clone(),
-            status: m.status, headers: m.headers.clone(), body: Vec::new() };
+        let is_response = m.status.is_some();
+        let rules = if is_response {
+            &self.response
+        } else {
+            &self.request
+        };
+        let mut preview: Option<Message> = None;
         let mut url_rewritten = false;
-        for rule in rules {
+        {
+            let index = self.ensure_index();
+            let rule_index = if is_response {
+                &index.response
+            } else {
+                &index.request
+            };
+            let mut host_slice = rule_index.host_indices(&m.url);
+            let fallback = rule_index.fallback.as_slice();
+            let (mut hi, mut fi) = (0usize, 0usize);
             let mut captures = BTreeMap::new();
-            if !evaluate(&rule.condition, &preview, request, &mut captures) { continue; }
-            for action in &rule.actions {
-                if action.needs_body() { return true; }
-                if rule.dialect == ModuleFormat::Surge && url_rewritten && matches!(action, Action::Url(..)) { continue; }
-                match perform(action, &mut preview, request, &captures, self.max_body) {
-                    Ok(Some(_)) => return false,
-                    Ok(None) => { if matches!(action, Action::Url(..)) { url_rewritten = true; } },
-                    Err(_) => {},
+            loop {
+                let rule_idx = match (host_slice.get(hi).copied(), fallback.get(fi).copied()) {
+                    (Some(h), Some(f)) if h < f => {
+                        hi += 1;
+                        h
+                    }
+                    (Some(_), Some(f)) => {
+                        fi += 1;
+                        f
+                    }
+                    (Some(h), None) => {
+                        hi += 1;
+                        h
+                    }
+                    (None, Some(f)) => {
+                        fi += 1;
+                        f
+                    }
+                    (None, None) => break,
+                };
+                let rule = &rules[rule_idx];
+                captures.clear();
+                let current = preview.as_ref().unwrap_or(m);
+                if !evaluate(&rule.condition, current, request, &mut captures) {
+                    continue;
+                }
+                for action in &rule.actions {
+                    if action.needs_body() {
+                        return true;
+                    }
+                    if rule.dialect == ModuleFormat::Surge
+                        && url_rewritten
+                        && matches!(action, Action::Url(..))
+                    {
+                        continue;
+                    }
+                    let msg = preview.get_or_insert_with(|| Message {
+                        url: m.url.clone(),
+                        method: m.method.clone(),
+                        status: m.status,
+                        headers: m.headers.clone(),
+                        body: Vec::new(),
+                    });
+                    match perform(action, msg, request, &captures, self.max_body) {
+                        Ok(Some(_)) => return false,
+                        Ok(None) => {
+                            if matches!(action, Action::Url(..)) {
+                                url_rewritten = true;
+                                host_slice = rule_index.host_indices(&msg.url);
+                                hi = host_slice.partition_point(|&i| i <= rule_idx);
+                            }
+                        }
+                        Err(_) => {}
+                    }
                 }
             }
         }
-        let script_message = if m.status.is_some() { m } else { &preview };
-        self.scripts(script_message, request).iter().any(|s| s.requires_body)
+        let script_message = if is_response {
+            m
+        } else {
+            preview.as_ref().unwrap_or(m)
+        };
+        self.scripts(script_message, request)
+            .iter()
+            .any(|s| s.requires_body)
     }
     /// 返回是否命中过正文规则（包括执行失败/资源不足），用于Loon互斥，不表示正文已改变。
     pub fn apply_request_with_effects(&self, m: &mut Message) -> io::Result<(Option<Message>, bool)> {
         let mut body_matched = false;
-        let response = self.execute_inner(&self.request, m, None, true, &mut body_matched)?;
+        let response = self.execute_inner(false, m, None, true, &mut body_matched)?;
         Ok((response, body_matched))
     }
-    pub fn apply_response_with_effects(&self, m: &mut Message, request: &Message, body_available: bool) -> io::Result<bool> {
+    pub fn apply_response_with_effects(
+        &self,
+        m: &mut Message,
+        request: &Message,
+        body_available: bool,
+    ) -> io::Result<bool> {
         let mut body_matched = false;
-        self.execute_inner(&self.response, m, Some(request), body_available, &mut body_matched)?;
+        self.execute_inner(true, m, Some(request), body_available, &mut body_matched)?;
         Ok(body_matched)
     }
     pub fn body_rewrite_matches(&self, m: &Message, request: Option<&Message>) -> bool {
-        let rules = if m.status.is_some() {
+        let is_response = m.status.is_some();
+        let rules = if is_response {
             &self.response
         } else {
             &self.request
         };
-        rules.iter().any(|r| {
-            r.actions.iter().any(Action::needs_body)
-                && evaluate(&r.condition, m, request, &mut BTreeMap::new())
-        })
+        let index = self.ensure_index();
+        let rule_index = if is_response {
+            &index.response
+        } else {
+            &index.request
+        };
+        let host_slice = rule_index.host_indices(&m.url);
+        let fallback = rule_index.fallback.as_slice();
+        let (mut hi, mut fi) = (0usize, 0usize);
+        let mut caps = BTreeMap::new();
+        loop {
+            let idx = match (host_slice.get(hi).copied(), fallback.get(fi).copied()) {
+                (Some(h), Some(f)) if h < f => {
+                    hi += 1;
+                    h
+                }
+                (Some(_), Some(f)) => {
+                    fi += 1;
+                    f
+                }
+                (Some(h), None) => {
+                    hi += 1;
+                    h
+                }
+                (None, Some(f)) => {
+                    fi += 1;
+                    f
+                }
+                (None, None) => return false,
+            };
+            let r = &rules[idx];
+            if r.actions.iter().any(Action::needs_body) {
+                caps.clear();
+                if evaluate(&r.condition, m, request, &mut caps) {
+                    return true;
+                }
+            }
+        }
     }
     pub fn needs_body(&self, m: &Message, request: Option<&Message>) -> bool {
-        let rules = if m.status.is_some() {
-            &self.response
-        } else {
-            &self.request
-        };
-        rules.iter().any(|r| {
-            r.actions.iter().any(Action::needs_body)
-                && evaluate(&r.condition, m, request, &mut BTreeMap::new())
-        }) || self.scripts(m, request).iter().any(|s| s.requires_body)
+        self.body_rewrite_matches(m, request)
+            || self.scripts(m, request).iter().any(|s| s.requires_body)
     }
     fn execute(
         &self,
-        rules: &[CompiledRule],
+        is_response: bool,
         m: &mut Message,
         request: Option<&Message>,
         body_available: bool,
     ) -> io::Result<Option<Message>> {
-        self.execute_inner(rules, m, request, body_available, &mut false)
+        self.execute_inner(is_response, m, request, body_available, &mut false)
     }
     fn execute_inner(
-        &self, rules: &[CompiledRule], m: &mut Message, request: Option<&Message>,
-        body_available: bool, body_matched: &mut bool,
+        &self,
+        is_response: bool,
+        m: &mut Message,
+        request: Option<&Message>,
+        body_available: bool,
+        body_matched: &mut bool,
     ) -> io::Result<Option<Message>> {
+        let rules = if is_response {
+            &self.response
+        } else {
+            &self.request
+        };
+        let index = self.ensure_index();
+        let rule_index = if is_response {
+            &index.response
+        } else {
+            &index.request
+        };
+        let mut host_slice = rule_index.host_indices(&m.url);
+        let fallback = rule_index.fallback.as_slice();
+        let (mut hi, mut fi) = (0usize, 0usize);
         let mut url_rewritten = false;
         let started = std::time::Instant::now();
-        for rule in rules {
-            if started.elapsed() > std::time::Duration::from_millis(250) {
-                let skipped = rules.len() - rules.iter().position(|r| std::ptr::eq(r, rule)).unwrap_or(0);
+        let mut captures = BTreeMap::new();
+        // 连续的 JsonAdd/JsonReplace/JsonDelete 复用同一份解析后的 JSON DOM，
+        // 避免单条规则链或相邻规则对大 JSON 反复解析与序列化。
+        let mut pending_json: Option<(Value, bool)> = None;
+        let mut pending_source = "";
+
+        fn flush_json(
+            m: &mut Message,
+            pending: &mut Option<(Value, bool)>,
+            max_body: usize,
+            source: &str,
+        ) {
+            let Some((json, dirty)) = pending.take() else {
+                return;
+            };
+            if !dirty {
+                return;
+            }
+            match serde_json::to_vec(&json).map_err(invalid) {
+                Ok(output) if output.len() <= max_body => {
+                    m.body = output;
+                    m.delete_header("Content-Encoding");
+                    m.delete_header("ETag");
+                    m.delete_header("Content-MD5");
+                    m.length();
+                }
+                Ok(_) => log::warn!("{source}: rewrite skipped: rewritten body exceeds limit"),
+                Err(e) => log::warn!("{source}: rewrite skipped: {e}"),
+            }
+        }
+
+        loop {
+            let rule_idx = match (host_slice.get(hi).copied(), fallback.get(fi).copied()) {
+                (Some(h), Some(f)) if h < f => {
+                    hi += 1;
+                    h
+                }
+                (Some(_), Some(f)) => {
+                    fi += 1;
+                    f
+                }
+                (Some(h), None) => {
+                    hi += 1;
+                    h
+                }
+                (None, Some(f)) => {
+                    fi += 1;
+                    f
+                }
+                (None, None) => break,
+            };
+            let rule = &rules[rule_idx];
+            if started.elapsed() > std::time::Duration::from_millis(500) {
+                let skipped = rules.len() - rule_idx;
                 log::warn!(
-                    "HTTP rewrite execution budget (250 ms) exceeded on {}; {skipped} remaining rules skipped, starting at {}",
+                    "HTTP rewrite execution budget (500 ms) exceeded on {}; {skipped} remaining rules skipped, starting at {}",
                     m.url,
                     rule.source
                 );
                 break;
             }
-            let mut captures = BTreeMap::new();
+            if pending_json.is_some() && condition_reads_response_header(&rule.condition) {
+                flush_json(m, &mut pending_json, self.max_body, pending_source);
+            }
+            captures.clear();
             if !evaluate(&rule.condition, m, request, &mut captures) {
                 continue;
             }
-            *body_matched |= rule.actions.iter().any(|a| a.needs_body() || matches!(a, Action::Mock { status: None, .. }));
+            *body_matched |= rule
+                .actions
+                .iter()
+                .any(|a| a.needs_body() || matches!(a, Action::Mock { status: None, .. }));
             if let Some(mock) = rule.actions.iter().find(|a| {
                 matches!(
                     a,
@@ -667,10 +1394,13 @@ impl Plan {
                     }
                 )
             }) {
+                flush_json(m, &mut pending_json, self.max_body, pending_source);
                 if let Some(mut response) = perform(mock, m, request, &captures, self.max_body)? {
                     for a in &rule.actions {
                         if !matches!(a, Action::Mock { .. }) {
-                            if let Err(e) = perform(a, &mut response, Some(m), &captures, self.max_body) {
+                            if let Err(e) =
+                                perform(a, &mut response, Some(m), &captures, self.max_body)
+                            {
                                 log::warn!("{}: rewrite action skipped: {e}", rule.source);
                             }
                         }
@@ -688,18 +1418,87 @@ impl Plan {
                 {
                     continue;
                 }
-                match perform(action, m, request, &captures, self.max_body) {
-                    Ok(Some(response)) => return Ok(Some(response)),
-                    Ok(None) => {
-                        if matches!(action, Action::Url(..)) {
-                            url_rewritten = true
+                match action {
+                    Action::JsonAdd(path, expr)
+                    | Action::JsonReplace(path, expr) => {
+                        if pending_json.is_some() && expr_reads_response_header(expr) {
+                            flush_json(m, &mut pending_json, self.max_body, pending_source);
+                        }
+                        if let Err(e) = require_captures(expr, &captures) {
+                            log::warn!("{}: rewrite skipped: {e}", rule.source);
+                            continue;
+                        }
+                        if pending_json.is_none() {
+                            if m.body.len() > self.max_body {
+                                log::warn!("{}: rewrite skipped: body exceeds rewrite limit", rule.source);
+                                continue;
+                            }
+                            let parsed = decode_body_cow(m, self.max_body)
+                                .and_then(|raw| serde_json::from_slice::<Value>(&raw).map_err(invalid));
+                            match parsed {
+                                Ok(v) => pending_json = Some((v, false)),
+                                Err(e) => {
+                                    log::warn!("{}: rewrite skipped: {e}", rule.source);
+                                    continue;
+                                }
+                            }
+                        }
+                        let val = value(expr, m, request, &captures);
+                        let (json, dirty) = pending_json.as_mut().unwrap();
+                        match json_path::set(json, path, val, matches!(action, Action::JsonAdd(..))) {
+                            Ok(()) => {
+                                *dirty = true;
+                                pending_source = &rule.source;
+                            }
+                            Err(e) => log::warn!("{}: rewrite skipped: {e}", rule.source),
                         }
                     }
-                    Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => return Err(e),
-                    Err(e) => log::warn!("{}: rewrite skipped: {e}", rule.source),
+                    Action::JsonDelete(path) => {
+                        if pending_json.is_none() {
+                            if m.body.len() > self.max_body {
+                                log::warn!("{}: rewrite skipped: body exceeds rewrite limit", rule.source);
+                                continue;
+                            }
+                            let parsed = decode_body_cow(m, self.max_body)
+                                .and_then(|raw| serde_json::from_slice::<Value>(&raw).map_err(invalid));
+                            match parsed {
+                                Ok(v) => pending_json = Some((v, false)),
+                                Err(e) => {
+                                    log::warn!("{}: rewrite skipped: {e}", rule.source);
+                                    continue;
+                                }
+                            }
+                        }
+                        let (json, dirty) = pending_json.as_mut().unwrap();
+                        match json_path::delete(json, path) {
+                            Ok(()) => {
+                                *dirty = true;
+                                pending_source = &rule.source;
+                            }
+                            Err(e) => log::warn!("{}: rewrite skipped: {e}", rule.source),
+                        }
+                    }
+                    _ => {
+                        flush_json(m, &mut pending_json, self.max_body, pending_source);
+                        match perform(action, m, request, &captures, self.max_body) {
+                            Ok(Some(response)) => return Ok(Some(response)),
+                            Ok(None) => {
+                                if matches!(action, Action::Url(..)) {
+                                    url_rewritten = true;
+                                    host_slice = rule_index.host_indices(&m.url);
+                                    hi = host_slice.partition_point(|&i| i <= rule_idx);
+                                }
+                            }
+                            Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => {
+                                return Err(e);
+                            }
+                            Err(e) => log::warn!("{}: rewrite skipped: {e}", rule.source),
+                        }
+                    }
                 }
             }
         }
+        flush_json(m, &mut pending_json, self.max_body, pending_source);
         Ok(None)
     }
 }
@@ -818,6 +1617,45 @@ fn require_captures(e: &Expr, caps: &BTreeMap<String, String>) -> io::Result<()>
     }
 }
 
+/// 常见字符串表达式（`url`、`request.method`、请求/响应头、字面量）零拷贝求值，
+/// 避免每条规则匹配都克隆整条 `m.url`。
+fn eval_str<'a>(
+    e: &'a Expr,
+    m: &'a Message,
+    req: Option<&'a Message>,
+    caps: &'a BTreeMap<String, String>,
+) -> Option<Cow<'a, str>> {
+    match e {
+        Expr::Literal(Value::String(s)) => Some(Cow::Borrowed(s.as_str())),
+        Expr::Literal(_) | Expr::Array(_) | Expr::Regex(_) => None,
+        Expr::Variable(name) => {
+            if let Some(v) = capture_value(name, caps) {
+                return Some(Cow::Borrowed(v.as_str()));
+            }
+            let r = req.unwrap_or(m);
+            match name.as_str() {
+                "url" => Some(Cow::Borrowed(m.url.as_str())),
+                "request.method" => Some(Cow::Borrowed(r.method.as_str())),
+                "response.status" => None,
+                _ => {
+                    let (msg, rest) = if let Some(n) = name.strip_prefix("request.header[") {
+                        (r, n)
+                    } else {
+                        let n = name.strip_prefix("response.header[")?;
+                        (m, n)
+                    };
+                    let key = rest.trim_end_matches(']').trim_matches(['\'', '"']);
+                    msg.header(key).map(Cow::Borrowed)
+                }
+            }
+        }
+        Expr::BoundTemplate(_) | Expr::Template(_) => match value(e, m, req, caps) {
+            Value::String(s) => Some(Cow::Owned(s)),
+            _ => None,
+        },
+    }
+}
+
 fn evaluate(
     c: &Condition,
     m: &Message,
@@ -826,8 +1664,15 @@ fn evaluate(
 ) -> bool {
     match c {
         Condition::Always => true,
-        Condition::Eq(a, b) => require_captures(a, caps).is_ok() && require_captures(b, caps).is_ok()
-            && value(a, m, req, caps) == value(b, m, req, caps),
+        Condition::Eq(a, b) => {
+            if require_captures(a, caps).is_err() || require_captures(b, caps).is_err() {
+                return false;
+            }
+            if let (Some(sa), Some(sb)) = (eval_str(a, m, req, caps), eval_str(b, m, req, caps)) {
+                return sa.as_ref() == sb.as_ref();
+            }
+            value(a, m, req, caps) == value(b, m, req, caps)
+        }
         Condition::And(a, b) => evaluate(a, m, req, caps) && evaluate(b, m, req, caps),
         Condition::Or(a, b) => {
             let saved = caps.clone();
@@ -839,20 +1684,27 @@ fn evaluate(
             }
         }
         Condition::Match(e, p, name) => {
-            if require_captures(e, caps).is_err() { return false; }
-            let v = value(e, m, req, caps);
-            let Some(s) = v.as_str() else { return false };
-            // 不需要命名捕获时只判断是否命中，比取捕获组便宜得多（每个请求都要过全部条件）。
-            let Some(name) = name else {
-                return p.matches(s);
-            };
-            let Some(groups) = p.captures(s) else {
+            if require_captures(e, caps).is_err() {
+                return false;
+            }
+            let Some(s) = eval_str(e, m, req, caps) else {
                 return false;
             };
-            for (i, g) in groups.into_iter().enumerate() {
-                if let Some(g) = g {
-                    caps.insert(format!("{name}.{i}"), g.into());
-                }
+            // 不需要命名捕获时只判断是否命中，比取捕获组便宜得多（每个请求都要过全部条件）。
+            let Some(name) = name else {
+                return p.matches(s.as_ref());
+            };
+            let Some(groups) = p.captures(s.as_ref()) else {
+                return false;
+            };
+            let owned: Vec<(usize, String)> = groups
+                .into_iter()
+                .enumerate()
+                .filter_map(|(i, g)| g.map(|g| (i, g.to_owned())))
+                .collect();
+            drop(s);
+            for (i, g) in owned {
+                caps.insert(format!("{name}.{i}"), g);
             }
             true
         }
@@ -1001,10 +1853,7 @@ fn perform(
                         max_body,
                     )?
                     .into_bytes(),
-                Action::Jq(program) => {
-                    let input = serde_json::from_slice(&original).map_err(invalid)?;
-                    serde_json::to_vec(&program.run(&input).map_err(invalid)?).map_err(invalid)?
-                }
+                Action::Jq(program) => program.run_bytes(&original, max_body).map_err(invalid)?,
                 Action::JsonAdd(path, v) | Action::JsonReplace(path, v) => {
                     let mut json = serde_json::from_slice(&original).map_err(invalid)?;
                     json_path::set(&mut json, path, eval(v), matches!(a, Action::JsonAdd(..)))?;
@@ -1163,5 +2012,181 @@ mod pattern_tests {
         let p = Pattern::new(r"^http:\/\/a\.com\/(\d+)", "").unwrap();
         assert_eq!(p.replace_bounded("http://a.com/42", "https://b.com/$1", false, MAX_BODY).unwrap(), "https://b.com/42");
         assert_eq!(p.replace_bounded("http://c.com/42", "x", false, MAX_BODY).unwrap(), "http://c.com/42");
+    }
+
+    #[test]
+    fn https_optional_prefix_stays_lazy_and_matches_both_schemes() {
+        let p = Pattern::new(r"^https?://api\.example\.com/v1/ad$", "").unwrap();
+        assert_eq!(p.exact_host(), Some("api.example.com"));
+        // 其它主机不编译正则
+        assert!(!p.matches("https://other.example.com/v1/ad"));
+        assert!(!p.matches("http://other.example.com/v1/ad"));
+        assert!(p.engine.get().is_none(), "unmatched host must not compile DFA");
+        // 同主机 http / https 均正常命中
+        assert!(p.matches("http://api.example.com/v1/ad"));
+        assert!(p.matches("https://api.example.com/v1/ad"));
+        assert!(!p.matches("https://api.example.com/v1/other"));
+
+        // 未终结的主机前缀不能进入精确主机索引（避免漏匹配 api.example.com.cn）。
+        let open = Pattern::new(r"^https?://api\.example\.com", "").unwrap();
+        assert_eq!(open.exact_host(), None);
+        assert!(open.matches("https://api.example.com.cn/x"));
+
+        // 子域通配规则通过必现字面量子串预过滤，不相关请求不编译 DFA。
+        let wild = Pattern::new(r"^https://[^/]+\.wild0\.example/ad$", "").unwrap();
+        assert_eq!(wild.exact_host(), None);
+        assert!(!wild.matches("https://unmatched.example/home"));
+        assert!(
+            wild.engine.get().is_none(),
+            "wildcard rule must stay lazy on unmatched URL"
+        );
+        assert!(wild.matches("https://sub.wild0.example/ad"));
+        assert!(wild.engine.get().is_some());
+
+        // 含内联 (?i) 或量化器 {1,3} 不得误抽出不可靠子串导致漏匹配。
+        let inline_ci = Pattern::new(r"(?i)^https://[^/]+\.MiXeD\.example/ad$", "").unwrap();
+        assert!(inline_ci.matches("https://a.mixed.example/ad"));
+        let braced = Pattern::new(r"^https://a\.example/x{1,3}y$", "").unwrap();
+        assert!(braced.matches("https://a.example/xy"));
+    }
+
+    #[test]
+    fn host_index_preserves_declaration_order_wildcards_and_url_rewrites() {
+        let text = "\
+[Rewrite]
+^https://a\\.example/go$ url-302-skip
+^https://a\\.example/start$ header-add X-Step 1
+^https://[^/]+\\.example/start$ header-add X-Step 2
+^https://a\\.example/start$ header-add X-Step 3
+^https://a\\.example/jump$ https://b.example/land 307
+";
+        // 直接用 Plan 构造含精确主机、通配和 URL 重写换主机的顺序测试。
+        let _ = text;
+        let mut plan = Plan::default();
+        plan.request.push(CompiledRule {
+            condition: Condition::Match(
+                Expr::Variable("url".into()),
+                Pattern::new(r"^https://a\.example/step$", "").unwrap(),
+                None,
+            ),
+            actions: vec![Action::HeaderAdd("X-Trace".into(), Expr::Literal("1".into()))],
+            dialect: ModuleFormat::Loon,
+            source: "r1".into(),
+        });
+        plan.request.push(CompiledRule {
+            condition: Condition::Match(
+                Expr::Variable("url".into()),
+                Pattern::new(r"^https://[^/]+\.example/step$", "").unwrap(),
+                None,
+            ),
+            actions: vec![Action::HeaderAdd("X-Trace".into(), Expr::Literal("2".into()))],
+            dialect: ModuleFormat::Loon,
+            source: "r2".into(),
+        });
+        plan.request.push(CompiledRule {
+            condition: Condition::Match(
+                Expr::Variable("url".into()),
+                Pattern::new(r"^https://a\.example/step$", "").unwrap(),
+                None,
+            ),
+            actions: vec![Action::Url(
+                Pattern::new(r"^https://a\.example/step$", "").unwrap(),
+                Expr::Literal("https://b.example/after".into()),
+            )],
+            dialect: ModuleFormat::Loon,
+            source: "r3".into(),
+        });
+        plan.request.push(CompiledRule {
+            condition: Condition::Match(
+                Expr::Variable("url".into()),
+                Pattern::new(r"^https://b\.example/after$", "").unwrap(),
+                None,
+            ),
+            actions: vec![Action::HeaderAdd("X-Trace".into(), Expr::Literal("4".into()))],
+            dialect: ModuleFormat::Loon,
+            source: "r4".into(),
+        });
+
+        let mut req = Message {
+            url: "https://a.example/step".into(),
+            method: "GET".into(),
+            status: None,
+            headers: vec![("Host".into(), "a.example".into())],
+            body: Vec::new(),
+        };
+        plan.apply_request(&mut req).unwrap();
+        let trace: Vec<&str> = req
+            .headers
+            .iter()
+            .filter(|(k, _)| k == "X-Trace")
+            .map(|(_, v)| v.as_str())
+            .collect();
+        assert_eq!(trace, vec!["1", "2", "4"]);
+        assert_eq!(req.url, "https://b.example/after");
+    }
+
+    #[test]
+    fn chained_json_actions_and_two_mib_jq_succeed() {
+        let ir = oryn_module::parse(
+            "[Rewrite]\n\
+             ^https://chain\\.example/api$ response-body-json-del a0 a1 a2\n\
+             ^https://chain\\.example/api$ response-body-json-add clean true\n\
+             ^https://jq\\.example/feed$ response-body-json-jq 'del(.ad) | .items |= map(select(.is_ad != true))'\n",
+            Some(ModuleFormat::Loon),
+        )
+        .unwrap();
+        let plan = compile_module(&ir, &BTreeMap::new(), &Resources::new()).unwrap();
+
+        let req = Message {
+            url: "https://chain.example/api".into(),
+            method: "GET".into(),
+            status: None,
+            headers: vec![],
+            body: vec![],
+        };
+        let mut resp = Message {
+            url: req.url.clone(),
+            method: "GET".into(),
+            status: Some(200),
+            headers: vec![("ETag".into(), "\"v1\"".into())],
+            body: br#"{"a0":1,"a1":2,"a2":3,"keep":4}"#.to_vec(),
+        };
+        plan.apply_response(&mut resp, &req).unwrap();
+        let v: Value = serde_json::from_slice(&resp.body).unwrap();
+        assert_eq!(v, serde_json::json!({"keep": 4, "clean": true}));
+        assert!(resp.header("ETag").is_none());
+
+        // 2 MiB JSON 正文经 jq 改写应成功（不再被旧的 1 MiB 硬编码截断）。
+        let pad = "x".repeat(220);
+        let mut big = String::from(r#"{"ad":true,"items":["#);
+        for i in 0..8_000usize {
+            if i > 0 {
+                big.push(',');
+            }
+            big.push_str(&format!(
+                r#"{{"id":{i},"is_ad":{},"s":"{pad}"}}"#,
+                i % 4 == 0
+            ));
+        }
+        big.push_str("]}");
+        assert!(big.len() > 2_000_000);
+        let jq_req = Message {
+            url: "https://jq.example/feed".into(),
+            method: "GET".into(),
+            status: None,
+            headers: vec![],
+            body: vec![],
+        };
+        let mut jq_resp = Message {
+            url: jq_req.url.clone(),
+            method: "GET".into(),
+            status: Some(200),
+            headers: vec![],
+            body: big.into_bytes(),
+        };
+        plan.apply_response(&mut jq_resp, &jq_req).unwrap();
+        let out: Value = serde_json::from_slice(&jq_resp.body).unwrap();
+        assert!(out.get("ad").is_none());
+        assert_eq!(out["items"].as_array().unwrap().len(), 6_000);
     }
 }

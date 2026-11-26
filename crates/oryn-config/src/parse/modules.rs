@@ -73,7 +73,7 @@ pub fn parse(root: &Yaml, b: &mut Builder) -> Vec<ModuleSpec> {
                 }
             };
             match parse_module(&text, Some(actual)) {
-                Ok(ir) => Some(ir),
+                Ok(ir) => Some(std::sync::Arc::new(ir)),
                 Err(e) => {
                     b.warn(format!("modules[{index}] inline parse failed: {e}"));
                     None

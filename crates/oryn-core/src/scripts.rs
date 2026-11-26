@@ -23,11 +23,15 @@ pub struct ScriptHost {
     network: std::sync::RwLock<Option<(Arc<oryn_dns::Routing>, Arc<oryn_dns::DnsEngine>)>>,
     pub results: Mutex<BTreeMap<String, Value>>,
     pub notifications: Mutex<std::collections::VecDeque<Value>>,
-    slots: Arc<Semaphore>,
-    pending: Arc<Semaphore>,
+    /// 前台 HTTP 脚本与后台 cron/event 脚本分池，避免后台慢 `$httpClient` 阻塞 HTTP 请求。
+    http_slots: Arc<Semaphore>,
+    bg_slots: Arc<Semaphore>,
+    http_pending: Arc<Semaphore>,
+    bg_pending: Arc<Semaphore>,
     store: Mutex<Arc<BTreeMap<String, String>>>,
     path: Option<std::path::PathBuf>,
     max_heap: usize,
+    bg_max_heap: usize,
     max_body: usize,
     max_scripts: usize,
 }
@@ -43,6 +47,25 @@ impl ScriptHost {
     pub fn new_with_limits(
         dir: Option<&std::path::Path>,
         max_heap: usize,
+        max_body: usize,
+        max_scripts: usize,
+    ) -> Self {
+        Self::new_with_pools(
+            dir,
+            1,
+            1,
+            max_heap,
+            max_heap.min(8 << 20),
+            max_body,
+            max_scripts,
+        )
+    }
+    pub fn new_with_pools(
+        dir: Option<&std::path::Path>,
+        http_workers: usize,
+        bg_workers: usize,
+        max_heap: usize,
+        bg_max_heap: usize,
         max_body: usize,
         max_scripts: usize,
     ) -> Self {
@@ -67,11 +90,14 @@ impl ScriptHost {
             network: Default::default(),
             results: Mutex::new(BTreeMap::new()),
             notifications: Mutex::new(Default::default()),
-            slots: Arc::new(Semaphore::new(1)),
-            pending: Arc::new(Semaphore::new(64)),
+            http_slots: Arc::new(Semaphore::new(http_workers.max(1))),
+            bg_slots: Arc::new(Semaphore::new(bg_workers.max(1))),
+            http_pending: Arc::new(Semaphore::new(64)),
+            bg_pending: Arc::new(Semaphore::new(32)),
             store: Mutex::new(Arc::new(store)),
             path,
             max_heap,
+            bg_max_heap,
             max_body,
             max_scripts,
         }
@@ -111,17 +137,22 @@ impl ScriptHost {
         if spec.requires_body && response.as_deref().unwrap_or(request).body.len() > max_size {
             return Err(io::Error::other("script max-size exceeded"));
         }
+        let is_http = matches!(spec.kind.as_str(), "http-request" | "http-response");
+        let (slots, pending, heap_limit) = if is_http {
+            (&self.http_slots, &self.http_pending, self.max_heap)
+        } else {
+            (&self.bg_slots, &self.bg_pending, self.bg_max_heap)
+        };
         let epoch = self.generation.load(std::sync::atomic::Ordering::Relaxed);
-        let _pending = self
-            .pending
+        let _pending = pending
             .clone()
             .try_acquire_owned()
             .map_err(|_| io::Error::other("script pending queue is full"))?;
-        // 只有一个 worker（避免多份脚本堆叠加）。排队最多等一个 timeout；
+        // HTTP 与后台脚本各用独立槽位池；排队最多等一个 timeout，
         // 拿到槽位后才开始计脚本自身的 timeout，排队时间不挤占执行预算。
         let permit = tokio::time::timeout(
             Duration::from_secs(spec.timeout),
-            self.slots.clone().acquire_owned(),
+            slots.clone().acquire_owned(),
         )
         .await
         .map_err(|_| io::Error::other("script queue timeout"))?
@@ -183,7 +214,7 @@ impl ScriptHost {
             timeout: deadline.saturating_duration_since(std::time::Instant::now()),
             name: spec.name.clone(),
             store: Arc::clone(&*self.store.lock().unwrap()),
-            max_heap: self.max_heap,
+            max_heap: heap_limit,
             max_body: self.max_body,
         };
         let code = spec.code.clone();
@@ -621,5 +652,83 @@ mod tests {
         assert_eq!(take_script_policy(&json!({}), &mut message).as_deref(), Some("🇹🇼台湾"));
         assert!(message.header("X-Stash-Selected-Proxy").is_none());
         assert!(take_script_policy(&json!({"policy": "  "}), &mut message).is_none());
+    }
+
+    #[tokio::test]
+    async fn bg_script_pool_does_not_block_http_script_pool() {
+        struct DummyOutbound;
+        #[async_trait::async_trait]
+        impl Outbound for DummyOutbound {
+            fn tag(&self) -> &str {
+                "dummy"
+            }
+            fn kind(&self) -> &'static str {
+                "reject"
+            }
+            async fn connect_tcp(
+                &self,
+                _target: &oryn_config::TargetAddr,
+            ) -> io::Result<oryn_outbound::BoxStream> {
+                Err(io::Error::other("unused"))
+            }
+            async fn bind_udp(
+                &self,
+                _first_target: &oryn_config::TargetAddr,
+            ) -> io::Result<Box<dyn oryn_outbound::PacketConn>> {
+                Err(io::Error::other("unused"))
+            }
+        }
+
+        let host = Arc::new(ScriptHost::new_with_pools(
+            None,
+            1,
+            1,
+            oryn_script::HEAP_LIMIT,
+            8 << 20,
+            oryn_http_inspect::MAX_BODY,
+            256,
+        ));
+        // 占满后台脚本槽位，模拟慢 cron/event `$httpClient` 正在运行。
+        let _bg_busy = host.bg_slots.clone().acquire_owned().await.unwrap();
+        assert!(host.bg_slots.try_acquire().is_err());
+
+        let http_spec = ScriptRule {
+            enabled: true,
+            event: None,
+            cron: None,
+            name: "fast_http".into(),
+            kind: "http-response".into(),
+            condition: oryn_http_inspect::Condition::Always,
+            source: "test".into(),
+            code: r#"$done({body: '{"ok":true}'});"#.into(),
+            argument: Value::Null,
+            env: Arc::new(BTreeMap::new()),
+            requires_body: true,
+            binary: false,
+            full_headers: false,
+            timeout: 2,
+            max_size: oryn_http_inspect::MAX_BODY,
+            dialect: oryn_module::ModuleFormat::Surge,
+        };
+        let req = Message {
+            url: "https://example.test/api".into(),
+            method: "GET".into(),
+            status: None,
+            headers: vec![],
+            body: vec![],
+        };
+        let mut resp = Message {
+            url: req.url.clone(),
+            method: "GET".into(),
+            status: Some(200),
+            headers: vec![],
+            body: br#"{"ok":false}"#.to_vec(),
+        };
+        let done = host
+            .execute(&http_spec, &req, Some(&mut resp), Arc::new(DummyOutbound))
+            .await
+            .expect("http script must not be blocked by busy bg pool");
+        assert!(done.body_modified);
+        assert_eq!(resp.body, br#"{"ok":true}"#);
     }
 }

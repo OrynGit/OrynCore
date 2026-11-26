@@ -59,7 +59,8 @@ fn prepared_sidecar_equivalence_bounds_allowed_and_cancel() {
         assert!(released(), "cancel must release compiled program");
 
         let mut candidate = jq_config();
-        candidate.modules[0].inline.as_mut().unwrap().meta.system = Some("unsupported".into());
+        std::sync::Arc::make_mut(candidate.modules[0].inline.as_mut().unwrap()).meta.system =
+            Some("unsupported".into());
         let prepared = prepare_for_apply(&ctx, candidate.clone()).await;
         let released = program_released(&prepared.plans[0].1);
         ctx.apply_prepared(prepared);
@@ -141,7 +142,9 @@ fn prepared_failed_update_uses_final_policy_not_old_plan() {
     tokio::task::LocalSet::new().block_on(&rt, async {
         let mut old = jq_config();
         old.modules[0].url = Some("missing.plugin".into());
-        old.modules[0].inline.as_mut().unwrap().rules.push("URL-REGEX,^http://example.invalid/,old".into());
+        std::sync::Arc::make_mut(old.modules[0].inline.as_mut().unwrap())
+            .rules
+            .push("URL-REGEX,^http://example.invalid/,old".into());
         let ctx = EngineCtx::new(oryn_netstack::LwipStack::new(1500).unwrap(), old.clone(),
             Default::default(), std::sync::Arc::new(crate::stats::Stats::default()));
         let mut candidate = old;

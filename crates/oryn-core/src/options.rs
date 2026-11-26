@@ -57,8 +57,14 @@ pub(crate) struct ResourceLimits {
     pub http_body_budget: usize,
     /// 单个 HTTP 正文上限（字节）。
     pub http_max_body: usize,
-    /// 单个 QuickJS 脚本运行时堆上限（字节）。
+    /// 单个 QuickJS HTTP 脚本运行时堆上限（字节）。
     pub script_heap_limit: usize,
+    /// 单个 QuickJS 后台（cron/event）脚本运行时堆上限（字节）。
+    pub script_bg_heap_limit: usize,
+    /// HTTP（http-request/http-response）脚本并发 worker 数。
+    pub script_http_workers: usize,
+    /// 后台（cron/event）脚本并发 worker 数，与 HTTP 池隔离避免慢 `$httpClient` 阻塞前台请求。
+    pub script_bg_workers: usize,
     /// 允许启用的模块上限。
     pub max_modules: usize,
     /// 编译后允许启用的脚本规则上限。
@@ -126,6 +132,21 @@ impl ResourceProfile {
                 #[cfg(any(target_os = "macos", target_os = "linux"))]
                 Self::DesktopHigh => 32 << 20,
                 _ => oryn_script::HEAP_LIMIT,
+            },
+            script_bg_heap_limit: match self {
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                Self::DesktopHigh => 16 << 20,
+                _ => 8 << 20,
+            },
+            script_http_workers: match self {
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                Self::DesktopHigh => 4,
+                _ => 1,
+            },
+            script_bg_workers: match self {
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                Self::DesktopHigh => 2,
+                _ => 1,
             },
             max_modules: match self {
                 #[cfg(any(target_os = "macos", target_os = "linux"))]

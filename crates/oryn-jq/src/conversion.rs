@@ -1,6 +1,7 @@
 //! 省去大正文的 Display -> String -> JSON 往返；特殊值保留原来的解析语义。
-use jaq_json::Val;
+use jaq_json::{Num, Val};
 use serde_json::Value;
+use std::io::Write;
 
 fn legacy(value: &Val) -> Result<Value, String> {
     serde_json::from_str(&value.to_string()).map_err(|e| format!("jq output: {e}"))
@@ -8,6 +9,103 @@ fn legacy(value: &Val) -> Result<Value, String> {
 
 pub(super) fn to_json(value: &Val) -> Result<Value, String> {
     convert(value, 0)
+}
+
+/// 直接把 `jaq_json::Val` 流式写为严格 JSON 字节，避免构造第二棵 `serde_json::Value` 树；
+/// 写出超过 `max_output` 时立即中止。
+pub(super) fn to_json_bytes(
+    value: &Val,
+    max_output: usize,
+    initial_cap: usize,
+) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(initial_cap.min(max_output));
+    write_val(value, 0, &mut out, max_output)?;
+    if out.len() > max_output {
+        return Err("jq output exceeds limit".into());
+    }
+    if out.capacity() > out.len().saturating_add(64 * 1024) && out.capacity() > out.len() * 2 {
+        out.shrink_to_fit();
+    }
+    Ok(out)
+}
+
+fn check_out_len(out: &[u8], max_output: usize) -> Result<(), String> {
+    if out.len() > max_output {
+        Err("jq output exceeds limit".into())
+    } else {
+        Ok(())
+    }
+}
+
+fn write_val(value: &Val, depth: usize, out: &mut Vec<u8>, max_output: usize) -> Result<(), String> {
+    match value {
+        Val::Null => out.extend_from_slice(b"null"),
+        Val::Bool(true) => out.extend_from_slice(b"true"),
+        Val::Bool(false) => out.extend_from_slice(b"false"),
+        Val::Num(Num::Int(i)) => {
+            write!(out, "{i}").map_err(|e| format!("jq output: {e}"))?;
+        }
+        Val::Num(Num::Float(f)) => {
+            if !f.is_finite() {
+                return Err("jq output: non-finite number".into());
+            }
+            serde_json::to_writer(&mut *out, f).map_err(|e| format!("jq output: {e}"))?;
+        }
+        Val::Num(Num::BigInt(_)) | Val::Num(Num::Dec(_)) => {
+            let v = legacy(value)?;
+            serde_json::to_writer(&mut *out, &v).map_err(|e| format!("jq output: {e}"))?;
+        }
+        Val::BStr(_) => return Err("jq output: byte string is not valid JSON".into()),
+        Val::TStr(s) => match std::str::from_utf8(s) {
+            Ok(text) => {
+                serde_json::to_writer(&mut *out, text).map_err(|e| format!("jq output: {e}"))?;
+            }
+            Err(_) => {
+                let v = legacy(value)?;
+                serde_json::to_writer(&mut *out, &v).map_err(|e| format!("jq output: {e}"))?;
+            }
+        },
+        Val::Arr(a) => {
+            check_depth(depth)?;
+            out.push(b'[');
+            for (idx, item) in a.iter().enumerate() {
+                if idx > 0 {
+                    out.push(b',');
+                }
+                write_val(item, depth + 1, out, max_output)?;
+                check_out_len(out, max_output)?;
+            }
+            out.push(b']');
+        }
+        Val::Obj(o) => {
+            check_depth(depth)?;
+            // 仅当存在非文本键或非法 UTF-8 键（可能碰撞为 U+FFFD）时回退到 Value 路径，保证去重与报错完全一致。
+            let fast_keys = o
+                .keys()
+                .all(|k| matches!(k, Val::TStr(s) if std::str::from_utf8(s).is_ok()));
+            if !fast_keys {
+                let v = convert(value, depth)?;
+                serde_json::to_writer(&mut *out, &v).map_err(|e| format!("jq output: {e}"))?;
+                return check_out_len(out, max_output);
+            }
+            out.push(b'{');
+            for (idx, (key, val)) in o.iter().enumerate() {
+                if idx > 0 {
+                    out.push(b',');
+                }
+                let Val::TStr(bytes) = key else {
+                    unreachable!("checked all keys are valid UTF-8 TStr")
+                };
+                let text = std::str::from_utf8(bytes).expect("checked valid UTF-8");
+                serde_json::to_writer(&mut *out, text).map_err(|e| format!("jq output: {e}"))?;
+                out.push(b':');
+                write_val(val, depth + 1, out, max_output)?;
+                check_out_len(out, max_output)?;
+            }
+            out.push(b'}');
+        }
+    }
+    check_out_len(out, max_output)
 }
 
 fn convert(value: &Val, depth: usize) -> Result<Value, String> {
@@ -66,11 +164,19 @@ mod tests {
     fn same(value: &Val) {
         let before = legacy(value);
         let after = to_json(value);
+        let bytes = to_json_bytes(value, 1024 * 1024, 64);
         assert_eq!(before.is_ok(), after.is_ok(), "{value:?}");
-        if let (Ok(a), Ok(b)) = (before, after) {
+        assert_eq!(before.is_ok(), bytes.is_ok(), "bytes {value:?}: {bytes:?}");
+        if let (Ok(a), Ok(b), Ok(raw)) = (before, after, bytes) {
             assert_eq!(
                 serde_json::to_vec(&a).unwrap(),
                 serde_json::to_vec(&b).unwrap()
+            );
+            let parsed: Value = serde_json::from_slice(&raw).unwrap();
+            assert_eq!(
+                serde_json::to_vec(&a).unwrap(),
+                serde_json::to_vec(&parsed).unwrap(),
+                "bytes mismatch for {value:?}"
             );
         }
     }
@@ -149,5 +255,12 @@ mod tests {
             }
             same(&deep);
         }
+    }
+
+    #[test]
+    fn to_json_bytes_enforces_max_output() {
+        let arr = Val::Arr((0..100).map(|i| Val::from(i as isize)).collect::<Vec<_>>().into());
+        assert!(to_json_bytes(&arr, 32, 16).is_err());
+        assert!(to_json_bytes(&arr, 4096, 16).is_ok());
     }
 }

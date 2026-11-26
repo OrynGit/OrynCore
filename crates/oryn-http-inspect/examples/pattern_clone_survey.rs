@@ -109,25 +109,23 @@ fn main() {
     let mut rows = Vec::with_capacity(10);
     let (p, plan) = measure(&mut rows, "load", 1, || {
         let p = Pattern::new(source, "").unwrap();
-        let plan = Plan {
-            request: vec![CompiledRule {
-                condition: Condition::Match(
-                    Expr::Variable("url".into()),
-                    p.clone(),
-                    Some("cap".into()),
+        let mut plan = Plan::default();
+        plan.request.push(CompiledRule {
+            condition: Condition::Match(
+                Expr::Variable("url".into()),
+                p.clone(),
+                Some("cap".into()),
+            ),
+            actions: vec![
+                Action::HeaderSet("X-Capture".into(), Expr::Template("${cap.1}".into())),
+                Action::BodyRegex(
+                    Pattern::new(r"item/(\d+)", "").unwrap(),
+                    Expr::Literal("value=$1".into()),
                 ),
-                actions: vec![
-                    Action::HeaderSet("X-Capture".into(), Expr::Template("${cap.1}".into())),
-                    Action::BodyRegex(
-                        Pattern::new(r"item/(\d+)", "").unwrap(),
-                        Expr::Literal("value=$1".into()),
-                    ),
-                ],
-                dialect: oryn_module::ModuleFormat::Loon,
-                source: String::new(),
-            }],
-            ..Plan::default()
-        };
+            ],
+            dialect: oryn_module::ModuleFormat::Loon,
+            source: String::new(),
+        });
         (p, plan)
     });
     measure(&mut rows, "warm_source", usize::from(warm), || {

@@ -130,17 +130,46 @@ fn rc_unwrap_or_clone<T: Clone>(a: Rc<T>) -> T {
     Rc::try_unwrap(a).unwrap_or_else(|a| (*a).clone())
 }
 
+impl Val {
+    fn oryn_size_bounded(&self, limit: usize) -> usize {
+        match self {
+            Self::BStr(s) | Self::TStr(s) => s.len(),
+            Self::Num(crate::Num::BigInt(v)) => (v.bits() as usize).saturating_add(7) / 8,
+            Self::Num(crate::Num::Dec(v)) => v.len(),
+            Self::Arr(a) => {
+                let mut n = 16usize;
+                for v in a.iter() {
+                    n = n.saturating_add(v.oryn_size_bounded(limit));
+                    if n > limit {
+                        break;
+                    }
+                }
+                n
+            }
+            Self::Obj(o) => {
+                let mut n = 16usize;
+                for (k, v) in o.iter() {
+                    n = n
+                        .saturating_add(k.oryn_size_bounded(limit))
+                        .saturating_add(v.oryn_size_bounded(limit));
+                    if n > limit {
+                        break;
+                    }
+                }
+                n
+            }
+            _ => 16,
+        }
+    }
+}
+
 impl jaq_core::ValT for Val {
     fn oryn_size(&self) -> usize {
-        let size=match self {
-            Self::BStr(s)|Self::TStr(s)=>s.len(),
-            Self::Num(crate::Num::BigInt(v))=>(v.bits() as usize).saturating_add(7)/8,
-            Self::Num(crate::Num::Dec(v))=>v.len(),
-            Self::Arr(a)=>{let mut n=16usize;for v in a.iter(){n=n.saturating_add(v.oryn_size());if n>1024*1024{break}}n},
-            Self::Obj(o)=>{let mut n=16usize;for (k,v) in o.iter(){n=n.saturating_add(k.oryn_size()).saturating_add(v.oryn_size());if n>1024*1024{break}}n},
-            _=>16
-        };
-        if size>1024*1024 {jaq_core::oryn_budget::charge(usize::MAX);}
+        let limit = jaq_core::oryn_budget::max_value_bytes();
+        let size = self.oryn_size_bounded(limit);
+        if size > limit {
+            jaq_core::oryn_budget::charge(usize::MAX);
+        }
         size
     }
     fn from_num(n: &str) -> ValR {

@@ -206,6 +206,9 @@ fn script_and_http_inspection_limits_follow_resource_profile() {
     assert_eq!(constrained.http_body_budget, 6 << 20);
     assert_eq!(constrained.http_max_body, 4 << 20);
     assert_eq!(constrained.script_heap_limit, 16 << 20);
+    assert_eq!(constrained.script_bg_heap_limit, 8 << 20);
+    assert_eq!(constrained.script_http_workers, 1);
+    assert_eq!(constrained.script_bg_workers, 1);
     assert_eq!(constrained.max_modules, 128);
     assert_eq!(constrained.max_scripts, 256);
     assert_eq!(constrained.max_module_resources, 16 << 20);
@@ -217,6 +220,9 @@ fn script_and_http_inspection_limits_follow_resource_profile() {
         assert_eq!(desktop.http_body_budget, 24 << 20);
         assert_eq!(desktop.http_max_body, 8 << 20);
         assert_eq!(desktop.script_heap_limit, 32 << 20);
+        assert_eq!(desktop.script_bg_heap_limit, 16 << 20);
+        assert_eq!(desktop.script_http_workers, 4);
+        assert_eq!(desktop.script_bg_workers, 2);
         assert_eq!(desktop.max_modules, 256);
         assert_eq!(desktop.max_scripts, 512);
         assert_eq!(desktop.max_module_resources, 64 << 20);
@@ -229,6 +235,9 @@ fn script_and_http_inspection_limits_follow_resource_profile() {
         assert_eq!(mobile.http_body_budget, 6 << 20);
         assert_eq!(mobile.http_max_body, 4 << 20);
         assert_eq!(mobile.script_heap_limit, 16 << 20);
+        assert_eq!(mobile.script_bg_heap_limit, 8 << 20);
+        assert_eq!(mobile.script_http_workers, 1);
+        assert_eq!(mobile.script_bg_workers, 1);
         assert_eq!(mobile.max_modules, 128);
         assert_eq!(mobile.max_scripts, 256);
         assert_eq!(mobile.max_module_resources, 16 << 20);

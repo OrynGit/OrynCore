@@ -92,7 +92,7 @@ fn ir_bytes(ir: &oryn_module::ModuleIR) -> usize {
 }
 fn module_size(spec: &oryn_config::ModuleSpec) -> usize {
     spec.resources.values().map(|v| v.len()).sum::<usize>()
-        + spec.inline.as_ref().map_or(0, ir_bytes)
+        + spec.inline.as_deref().map_or(0, ir_bytes)
 }
 fn resource_digest(data: &[u8]) -> [u8; 32] {
     Sha256::digest(data).into()
@@ -109,7 +109,7 @@ fn incremental_module_size(
             unique_res += bytes.len();
         }
     }
-    unique_res + spec.inline.as_ref().map_or(0, ir_bytes)
+    unique_res + spec.inline.as_deref().map_or(0, ir_bytes)
 }
 fn deduplicate_resources(
     spec: &mut oryn_config::ModuleSpec,
@@ -162,7 +162,7 @@ fn save_validated_with(
     use base64::Engine as _;
     validate_with(spec, max_resources, inspect_limits)?;
     let record = ValidatedModule {
-        ir: spec.inline.clone().unwrap(),
+        ir: (**spec.inline.as_ref().unwrap()).clone(),
         resources: spec
             .resources
             .iter()
@@ -201,7 +201,7 @@ fn restore_validated_with(
     let bytes = read_bounded(&dir.join(snapshot_key(spec)), MAX_SNAPSHOT)?;
     let record: ValidatedModule = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
     let mut restored = spec.clone();
-    restored.inline = Some(record.ir);
+    restored.inline = Some(Arc::new(record.ir));
     restored.resources = Default::default();
     for (key, data) in record.resources {
         std::sync::Arc::make_mut(&mut restored.resources).insert(
@@ -462,8 +462,9 @@ async fn load_candidate(
             log::warn!("module {source}: {w}");
         }
         let text = bound.text;
-        spec.inline =
-            Some(oryn_module::parse_named(&text, Some(format), source).map_err(|e| e.to_string())?);
+        spec.inline = Some(Arc::new(
+            oryn_module::parse_named(&text, Some(format), source).map_err(|e| e.to_string())?,
+        ));
     }
     let ir = spec.inline.as_ref().ok_or("module source unavailable")?;
     let refs = resource_references(ir);
@@ -811,7 +812,7 @@ mod tests {
             .unwrap()
             .modules
             .remove(0);
-        spec.inline=Some(oryn_module::parse("[Script]\nfixture = type=http-response, pattern=^https://fixture.test, script-path=script.js, requires-body=true",Some(ModuleFormat::Surge)).unwrap());
+        spec.inline = Some(Arc::new(oryn_module::parse("[Script]\nfixture = type=http-response, pattern=^https://fixture.test, script-path=script.js, requires-body=true", Some(ModuleFormat::Surge)).unwrap()));
         std::sync::Arc::make_mut(&mut spec.resources)
             .insert("script.js".into(), b"$done({body:'ok'});".as_slice().into());
         save_validated(&dir, &spec).unwrap();

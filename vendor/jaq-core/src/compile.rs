@@ -47,6 +47,16 @@ impl<F> Lut<F> {
         Self { terms, funs }
     }
 
+    /// Number of compiled terms retained in this lookup table.
+    pub fn term_count(&self) -> usize {
+        self.terms.len()
+    }
+
+    /// Number of native functions retained in this lookup table.
+    pub fn fun_count(&self) -> usize {
+        self.funs.len()
+    }
+
     fn map_funs<F2>(self, f: impl Fn(F) -> F2) -> Lut<F2> {
         Lut {
             funs: self.funs.into_iter().map(f).collect(),
@@ -58,6 +68,240 @@ impl<F> Lut<F> {
         let tid = self.terms.len();
         self.terms.push(t);
         TermId(tid)
+    }
+}
+
+impl<F> Filter<F> {
+    /// Remove unreachable definitions and unused native functions from the LUT,
+    /// densely reindexing reachable `TermId` and `NativeId` entries.
+    pub fn compact(self) -> Self {
+        let old_terms = self.lut.terms;
+        let old_funs = self.lut.funs;
+        let mut term_map: Vec<Option<TermId>> = alloc::vec![None; old_terms.len()];
+        let mut fun_map: Vec<Option<NativeId>> = alloc::vec![None; old_funs.len()];
+        let mut term_order: Vec<usize> = Vec::new();
+        let mut fun_order: Vec<usize> = Vec::new();
+
+        fn mark_term(tid: TermId, term_map: &mut [Option<TermId>], order: &mut Vec<usize>) {
+            if term_map[tid.0].is_none() {
+                let new_id = TermId(order.len());
+                term_map[tid.0] = Some(new_id);
+                order.push(tid.0);
+            }
+        }
+
+        fn mark_pattern(
+            pat: &Pattern<TermId>,
+            term_map: &mut [Option<TermId>],
+            order: &mut Vec<usize>,
+        ) {
+            if let Pattern::Idx(xs) = pat {
+                for (k, sub) in xs {
+                    mark_term(*k, term_map, order);
+                    mark_pattern(sub, term_map, order);
+                }
+            }
+        }
+
+        mark_term(self.id, &mut term_map, &mut term_order);
+        let mut cursor = 0;
+        while cursor < term_order.len() {
+            let old_id = term_order[cursor];
+            cursor += 1;
+            match &old_terms[old_id] {
+                Term::Id
+                | Term::Recurse
+                | Term::ToString
+                | Term::Int(_)
+                | Term::Num(_)
+                | Term::Str(_)
+                | Term::ObjEmpty
+                | Term::Var(_) => {}
+                Term::Arr(t) | Term::Label(t) | Term::Neg(t) => {
+                    mark_term(*t, &mut term_map, &mut term_order);
+                }
+                Term::ObjSingle(a, b)
+                | Term::Comma(a, b)
+                | Term::Assign(a, b)
+                | Term::Update(a, b)
+                | Term::UpdateMath(a, _, b)
+                | Term::UpdateAlt(a, b)
+                | Term::Logic(a, _, b)
+                | Term::Math(a, _, b)
+                | Term::Cmp(a, _, b)
+                | Term::Alt(a, b)
+                | Term::TryCatch(a, b) => {
+                    mark_term(*a, &mut term_map, &mut term_order);
+                    mark_term(*b, &mut term_map, &mut term_order);
+                }
+                Term::Ite(a, b, c) => {
+                    mark_term(*a, &mut term_map, &mut term_order);
+                    mark_term(*b, &mut term_map, &mut term_order);
+                    mark_term(*c, &mut term_map, &mut term_order);
+                }
+                Term::Pipe(l, pat, r) => {
+                    mark_term(*l, &mut term_map, &mut term_order);
+                    if let Some(pat) = pat {
+                        mark_pattern(pat, &mut term_map, &mut term_order);
+                    }
+                    mark_term(*r, &mut term_map, &mut term_order);
+                }
+                Term::Fold(xs, pat, init, update, fold) => {
+                    mark_term(*xs, &mut term_map, &mut term_order);
+                    mark_pattern(pat, &mut term_map, &mut term_order);
+                    mark_term(*init, &mut term_map, &mut term_order);
+                    mark_term(*update, &mut term_map, &mut term_order);
+                    if let Fold::Foreach(Some(proj)) = fold {
+                        mark_term(*proj, &mut term_map, &mut term_order);
+                    }
+                }
+                Term::Path(t, path) => {
+                    mark_term(*t, &mut term_map, &mut term_order);
+                    for (part, _) in &path.0 {
+                        match part {
+                            crate::path::Part::Index(i) => {
+                                mark_term(*i, &mut term_map, &mut term_order);
+                            }
+                            crate::path::Part::Range(a, b) => {
+                                if let Some(a) = a {
+                                    mark_term(*a, &mut term_map, &mut term_order);
+                                }
+                                if let Some(b) = b {
+                                    mark_term(*b, &mut term_map, &mut term_order);
+                                }
+                            }
+                        }
+                    }
+                }
+                Term::CallDef(def, args, _, _) => {
+                    mark_term(*def, &mut term_map, &mut term_order);
+                    for arg in args.iter() {
+                        let t = match arg {
+                            Arg::Var(t) | Arg::Fun(t) => *t,
+                        };
+                        mark_term(t, &mut term_map, &mut term_order);
+                    }
+                }
+                Term::Native(nid, args) => {
+                    if fun_map[*nid].is_none() {
+                        let new_nid = fun_order.len();
+                        fun_map[*nid] = Some(new_nid);
+                        fun_order.push(*nid);
+                    }
+                    for arg in args.iter() {
+                        let t = match arg {
+                            Arg::Var(t) | Arg::Fun(t) => *t,
+                        };
+                        mark_term(t, &mut term_map, &mut term_order);
+                    }
+                }
+            }
+        }
+
+        fn remap_id(tid: TermId, term_map: &[Option<TermId>]) -> TermId {
+            term_map[tid.0].expect("reachable term must be mapped")
+        }
+
+        fn remap_pattern(pat: Pattern<TermId>, term_map: &[Option<TermId>]) -> Pattern<TermId> {
+            match pat {
+                Pattern::Var => Pattern::Var,
+                Pattern::Idx(xs) => Pattern::Idx(
+                    xs.into_iter()
+                        .map(|(k, sub)| (remap_id(k, term_map), remap_pattern(sub, term_map)))
+                        .collect(),
+                ),
+            }
+        }
+
+        fn remap_args(args: Box<[Arg<TermId>]>, term_map: &[Option<TermId>]) -> Box<[Arg<TermId>]> {
+            args.into_vec()
+                .into_iter()
+                .map(|a| a.map(|t| remap_id(t, term_map)))
+                .collect()
+        }
+
+        fn remap_term(
+            term: Term,
+            term_map: &[Option<TermId>],
+            fun_map: &[Option<NativeId>],
+        ) -> Term {
+            let r = |t| remap_id(t, term_map);
+            match term {
+                Term::Id
+                | Term::Recurse
+                | Term::ToString
+                | Term::Int(_)
+                | Term::Num(_)
+                | Term::Str(_)
+                | Term::ObjEmpty
+                | Term::Var(_) => term,
+                Term::Arr(t) => Term::Arr(r(t)),
+                Term::Label(t) => Term::Label(r(t)),
+                Term::Neg(t) => Term::Neg(r(t)),
+                Term::ObjSingle(a, b) => Term::ObjSingle(r(a), r(b)),
+                Term::Comma(a, b) => Term::Comma(r(a), r(b)),
+                Term::Assign(a, b) => Term::Assign(r(a), r(b)),
+                Term::Update(a, b) => Term::Update(r(a), r(b)),
+                Term::UpdateMath(a, op, b) => Term::UpdateMath(r(a), op, r(b)),
+                Term::UpdateAlt(a, b) => Term::UpdateAlt(r(a), r(b)),
+                Term::Logic(a, op, b) => Term::Logic(r(a), op, r(b)),
+                Term::Math(a, op, b) => Term::Math(r(a), op, r(b)),
+                Term::Cmp(a, op, b) => Term::Cmp(r(a), op, r(b)),
+                Term::Alt(a, b) => Term::Alt(r(a), r(b)),
+                Term::TryCatch(a, b) => Term::TryCatch(r(a), r(b)),
+                Term::Ite(a, b, c) => Term::Ite(r(a), r(b), r(c)),
+                Term::Pipe(l, pat, right) => {
+                    Term::Pipe(r(l), pat.map(|p| remap_pattern(p, term_map)), r(right))
+                }
+                Term::Fold(xs, pat, init, update, fold) => Term::Fold(
+                    r(xs),
+                    remap_pattern(pat, term_map),
+                    r(init),
+                    r(update),
+                    match fold {
+                        Fold::Reduce => Fold::Reduce,
+                        Fold::Foreach(proj) => Fold::Foreach(proj.map(r)),
+                    },
+                ),
+                Term::Path(t, path) => Term::Path(
+                    r(t),
+                    crate::path::Path(
+                        path.0
+                            .into_iter()
+                            .map(|(part, opt)| (part.map(r), opt))
+                            .collect(),
+                    ),
+                ),
+                Term::CallDef(def, args, skip, typ) => {
+                    Term::CallDef(r(def), remap_args(args, term_map), skip, typ)
+                }
+                Term::Native(nid, args) => Term::Native(
+                    fun_map[nid].expect("reachable native fun must be mapped"),
+                    remap_args(args, term_map),
+                ),
+            }
+        }
+
+        let mut term_slots: Vec<Option<Term>> = old_terms.into_iter().map(Some).collect();
+        let mut new_terms = Vec::with_capacity(term_order.len());
+        for old_id in term_order {
+            let term = term_slots[old_id].take().expect("unique reachable term");
+            new_terms.push(remap_term(term, &term_map, &fun_map));
+        }
+
+        let mut fun_slots: Vec<Option<F>> = old_funs.into_iter().map(Some).collect();
+        let mut new_funs = Vec::with_capacity(fun_order.len());
+        for old_nid in fun_order {
+            new_funs.push(fun_slots[old_nid].take().expect("unique reachable fun"));
+        }
+
+        Self {
+            id: remap_id(self.id, &term_map),
+            lut: Lut {
+                terms: new_terms,
+                funs: new_funs,
+            },
+        }
     }
 }
 
@@ -528,7 +772,9 @@ impl<'s, F> Compiler<&'s str, F> {
         */
 
         let lut = self.lut.map_funs(|(_sig, f)| f);
-        errs.is_empty().then(|| Filter { id, lut }).ok_or(errs)
+        errs.is_empty()
+            .then(|| Filter { id, lut }.compact())
+            .ok_or(errs)
     }
 
     fn with_label<T>(&mut self, label: &'s str, f: impl FnOnce(&mut Self) -> T) -> T {

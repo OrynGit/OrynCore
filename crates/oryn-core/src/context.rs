@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use log::warn;
-use oryn_config::{Mode, ModuleSpec, OutboundKind, ProxyProviderSource, RuntimeConfig};
+use oryn_config::{Mode, OutboundKind, ProxyProviderSource, RuntimeConfig};
 use oryn_dns::{DirectTargetResolver, DnsEngine, ProxyServerResolver, Routing};
 use oryn_http_inspect::Plan as HttpPlan;
 use oryn_netstack::LwipStack;
@@ -33,7 +33,6 @@ pub const MAX_CONCURRENT_DNS: usize = 128;
 pub struct RuntimeState {
     pub base_config: RuntimeConfig,
     pub aux_cancel: tokio::sync::watch::Sender<bool>,
-    pub prepared_modules: Vec<ModuleSpec>,
     pub compiled_modules_enabled: Vec<bool>,
     pub module_compile_warnings: Vec<String>,
     pub config: RuntimeConfig,
@@ -251,9 +250,12 @@ impl EngineCtx {
             resource_revision: Cell::new(0),
             proxy_provider_overrides: RefCell::new(HashMap::new()),
             mitm_ca_cache: RefCell::new(None),
-            script_host: Arc::new(crate::scripts::ScriptHost::new_with_limits(
+            script_host: Arc::new(crate::scripts::ScriptHost::new_with_pools(
                 options.data_dir.as_deref(),
+                limits.script_http_workers,
+                limits.script_bg_workers,
                 limits.script_heap_limit,
+                limits.script_bg_heap_limit,
                 limits.http_max_body,
                 limits.max_scripts,
             )),
@@ -500,9 +502,8 @@ impl EngineCtx {
             }
         }
 
-        let prepared_modules = config.modules.clone();
         let can_reuse_plan =
-            is_reload && plans.is_empty() && prepared_modules == old.prepared_modules;
+            is_reload && plans.is_empty() && base_config.modules == old.base_config.modules;
         let (http_plan, compiled_modules_enabled, module_compile_warnings) = if can_reuse_plan {
             for (spec, &enabled) in config
                 .modules
@@ -548,10 +549,7 @@ impl EngineCtx {
             let limits = self.options.resource_profile.limits();
             let inspect_limits = limits.inspect_limits();
             let mut plans = plans.into_iter().peekable();
-            let mut plan = HttpPlan {
-                max_body: limits.http_max_body,
-                ..HttpPlan::default()
-            };
+            let mut plan = HttpPlan::with_max_body(limits.http_max_body);
             for (index, spec) in config
                 .modules
                 .iter_mut()
@@ -733,7 +731,6 @@ impl EngineCtx {
         let state = Rc::new(RuntimeState {
             base_config,
             aux_cancel: tokio::sync::watch::channel(false).0,
-            prepared_modules,
             compiled_modules_enabled,
             module_compile_warnings,
             config,
@@ -801,7 +798,6 @@ fn empty_state(config: &RuntimeConfig, health: &Arc<HealthStore>) -> RuntimeStat
     RuntimeState {
         base_config: placeholder.clone(),
         aux_cancel: tokio::sync::watch::channel(false).0,
-        prepared_modules: Vec::new(),
         compiled_modules_enabled: Vec::new(),
         module_compile_warnings: Vec::new(),
         config: placeholder,

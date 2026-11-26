@@ -16,9 +16,9 @@ pub const MAX_FILTER_BYTES: usize = 256 * 1024;
 
 type Filter = compile::Filter<Native<JustLut<Val>>>;
 
-/// 编译过的 jq 程序。每个 filter 都会把用到的 jq 标准库一起编译进来，单个约 100 KiB；
-/// 模块里的 jq 改写通常只对少数 App 的接口生效，所以 [`Program::compile`] 只校验，
-/// 第一次 [`Program::run`] 时才编译并缓存。
+/// 编译过的 jq 程序。`jaq-core` 编译后自动按入口可达性裁剪未使用的标准库节点；
+/// 模块里的 jq 改写仍按需延迟编译：[`Program::compile`] 只校验，
+/// 第一次 [`Program::run`] / [`Program::run_bytes`] 时才编译并缓存紧凑后的 LUT。
 pub struct Program {
     source: String,
     filter: std::cell::OnceCell<Filter>,
@@ -47,10 +47,9 @@ impl Program {
         Ok(self.filter.get_or_init(|| f))
     }
 
-    pub fn run(&self, input: &serde_json::Value) -> Result<serde_json::Value, String> {
-        jaq_core::oryn_budget::start();
-        let result =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.run_inner(input)));
+    fn with_budget<T>(&self, max_body: usize, f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+        jaq_core::oryn_budget::start_with(max_body);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
         jaq_core::oryn_budget::clear();
         result.unwrap_or_else(|payload| {
             if payload.is::<jaq_core::oryn_budget::Exhausted>() {
@@ -65,10 +64,28 @@ impl Program {
             }
         })
     }
+
+    pub fn run(&self, input: &serde_json::Value) -> Result<serde_json::Value, String> {
+        self.run_with_limit(input, jaq_core::oryn_budget::DEFAULT_MAX_VALUE_BYTES)
+    }
+
+    pub fn run_with_limit(
+        &self,
+        input: &serde_json::Value,
+        max_body: usize,
+    ) -> Result<serde_json::Value, String> {
+        self.with_budget(max_body, || self.run_inner(input))
+    }
+
+    /// 直接从 JSON 字节解码为 `Val` 并流式写出 JSON 字节，省去两棵 `serde_json::Value` 树，
+    /// 同时把执行预算对齐到 `max_output` 并在输出超限时提前中止。
+    pub fn run_bytes(&self, input: &[u8], max_output: usize) -> Result<Vec<u8>, String> {
+        self.with_budget(max_output, || self.run_bytes_inner(input, max_output))
+    }
+
     fn run_inner(&self, input: &serde_json::Value) -> Result<serde_json::Value, String> {
         let filter = self.filter()?;
-        let value: Val =
-            Val::deserialize(input).map_err(|e| format!("jq input: {e}"))?;
+        let value: Val = Val::deserialize(input).map_err(|e| format!("jq input: {e}"))?;
         let ctx = Ctx::<JustLut<Val>>::new(&filter.lut, Vars::new([]));
         let mut outputs = filter.id.run((ctx, value)).map(unwrap_valr);
         let Some(first) = outputs.next() else {
@@ -80,7 +97,29 @@ impl Program {
                 "jq produced multiple outputs; body rewrite requires one JSON value".into(),
             );
         }
+        drop(outputs);
         conversion::to_json(&first)
+    }
+
+    fn run_bytes_inner(&self, input: &[u8], max_output: usize) -> Result<Vec<u8>, String> {
+        let filter = self.filter()?;
+        let value: Val = serde_json::from_slice(input).map_err(|e| format!("jq input: {e}"))?;
+        let ctx = Ctx::<JustLut<Val>>::new(&filter.lut, Vars::new([]));
+        let mut outputs = filter.id.run((ctx, value)).map(unwrap_valr);
+        let Some(first) = outputs.next() else {
+            if input.len() > max_output {
+                return Err("jq output exceeds limit".into());
+            }
+            return Ok(input.to_vec());
+        };
+        let first = first.map_err(|_| "jq runtime error".to_string())?;
+        if outputs.next().is_some() {
+            return Err(
+                "jq produced multiple outputs; body rewrite requires one JSON value".into(),
+            );
+        }
+        drop(outputs);
+        conversion::to_json_bytes(&first, max_output, input.len())
     }
 }
 
@@ -137,11 +176,21 @@ fn describe(kind: &str, errs: &impl std::fmt::Debug) -> String {
 
 /// 一次性改写：每次调用都会重新编译 filter，规则路径应预先 [`Program::compile`] 后复用。
 pub fn rewrite_json(source: &str, input: &[u8]) -> io::Result<Vec<u8>> {
-    let value: serde_json::Value =
-        serde_json::from_slice(input).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let program = Program::compile(source).map_err(io::Error::other)?;
-    let output = program.run(&value).map_err(io::Error::other)?;
-    serde_json::to_vec(&output).map_err(io::Error::other)
+    program
+        .run_bytes(
+            input,
+            input
+                .len()
+                .max(jaq_core::oryn_budget::DEFAULT_MAX_VALUE_BYTES),
+        )
+        .map_err(|e| {
+            if e.starts_with("jq input:") {
+                io::Error::new(io::ErrorKind::InvalidData, e)
+            } else {
+                io::Error::other(e)
+            }
+        })
 }
 
 #[cfg(test)]
@@ -154,41 +203,138 @@ mod tests {
         let out = program.run(&input).unwrap();
         assert_eq!(out["data"]["items"].as_array().unwrap().len(), 1);
     }
+
+    #[test]
+    fn compiled_filter_is_compacted_and_preserves_stdlib_and_tco() {
+        let p = Program::compile(r#"del(.ad) | .items |= map(select(.is_ad != true))"#).unwrap();
+        let f = p.filter().unwrap();
+        // 未裁剪前完整标准库含 2000+ term 与 100+ native fun；裁剪后应远小于此。
+        assert!(
+            f.lut.term_count() < 120,
+            "expected compacted terms < 120, got {}",
+            f.lut.term_count()
+        );
+        assert!(
+            f.lut.fun_count() < 20,
+            "expected compacted funs < 20, got {}",
+            f.lut.fun_count()
+        );
+
+        // 验证尾递归（TCO）与注入的 IN/1 在压缩重排 TermId 后行为不变。
+        let tco = Program::compile(
+            r#"def countdown: if . <= 0 then 0 else (. - 1) | countdown end; countdown"#,
+        )
+        .unwrap();
+        assert_eq!(tco.run(&serde_json::json!(2000)).unwrap(), serde_json::json!(0));
+
+        let in_prog = Program::compile(r#"[.[] | select(IN("a", "c"))]"#).unwrap();
+        assert_eq!(
+            in_prog.run(&serde_json::json!(["a", "b", "c"])).unwrap(),
+            serde_json::json!(["a", "c"])
+        );
+    }
+
     // 旧桥接作为语义oracle，不用于生产；比较完整filter结果及最终JSON表示。
-    fn legacy_run(program: &Program, input: &serde_json::Value) -> Result<serde_json::Value, String> {
+    fn legacy_run(
+        program: &Program,
+        input: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
         let filter = program.filter()?;
         let value: Val = serde_json::from_value(input.clone()).unwrap();
         let ctx = Ctx::<JustLut<Val>>::new(&filter.lut, Vars::new([]));
         let mut outputs = filter.id.run((ctx, value)).map(unwrap_valr);
-        let Some(first) = outputs.next() else { return Ok(input.clone()); };
+        let Some(first) = outputs.next() else {
+            return Ok(input.clone());
+        };
         let first = first.map_err(|_| "runtime".to_string())?;
-        if outputs.next().is_some() { return Err("multiple".into()); }
+        if outputs.next().is_some() {
+            return Err("multiple".into());
+        }
         serde_json::from_str(&first.to_string()).map_err(|e| e.to_string())
     }
 
     #[test]
     fn bridge_matches_legacy_filter_results() {
-        let input: serde_json::Value = serde_json::from_str(r#"{"text":"中文🙂\\n\\u0000\\u007f", "numbers":[-0.0,1.0,1.2345678901234567,1e-308,1e308,-9223372036854775808,18446744073709551615],"data":{"remove":true,"keep":null}}"#).unwrap();
-        for source in [".", "empty", "., .", "del(.data.remove)", ".numbers | map(. + 1)", "[null,true,false,{},[]]", "{z: .text, a: .numbers}", "nan", "infinite", "18446744073709551616", "reduce range(0;127) as $i (null; [.])", "reduce range(0;128) as $i (null; [.])"] {
+        let input_str = r#"{"text":"中文🙂\\n\\u0000\\u007f", "numbers":[-0.0,1.0,1.2345678901234567,1e-308,1e308,-9223372036854775808,18446744073709551615],"data":{"remove":true,"keep":null}}"#;
+        let input: serde_json::Value = serde_json::from_str(input_str).unwrap();
+        for source in [
+            ".",
+            "empty",
+            "., .",
+            "del(.data.remove)",
+            ".numbers | map(. + 1)",
+            "[null,true,false,{},[]]",
+            "{z: .text, a: .numbers}",
+            "nan",
+            "infinite",
+            "18446744073709551616",
+            "reduce range(0;127) as $i (null; [.])",
+            "reduce range(0;128) as $i (null; [.])",
+        ] {
             let program = Program::compile(source).unwrap();
             let before = legacy_run(&program, &input);
             let after = program.run(&input);
+            let bytes = program.run_bytes(input_str.as_bytes(), 1024 * 1024);
             assert_eq!(before.is_ok(), after.is_ok(), "{source}");
-            if let (Ok(a), Ok(b)) = (before, after) {
-                assert_eq!(serde_json::to_vec(&a).unwrap(), serde_json::to_vec(&b).unwrap(), "{source}");
+            assert_eq!(before.is_ok(), bytes.is_ok(), "bytes {source}: {bytes:?}");
+            if let (Ok(a), Ok(b), Ok(raw)) = (before, after, bytes) {
+                assert_eq!(
+                    serde_json::to_vec(&a).unwrap(),
+                    serde_json::to_vec(&b).unwrap(),
+                    "{source}"
+                );
+                let parsed: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+                assert_eq!(
+                    serde_json::to_vec(&a).unwrap(),
+                    serde_json::to_vec(&parsed).unwrap(),
+                    "bytes {source}"
+                );
             }
         }
         // 多种结构而非只有大字符串；输出对象排序及整数/浮点表示须一致。
-        let rows: Vec<_> = (0..256).map(|i| serde_json::json!({"id": i, "text": format!("item-{i}\\\"\n中文"), "f": (i as f64 - 128.0) / 7.0})).collect();
-        let value = serde_json::json!({"rows":rows});
+        let rows: Vec<_> = (0..256)
+            .map(|i| {
+                serde_json::json!({"id": i, "text": format!("item-{i}\\\"\n中文"), "f": (i as f64 - 128.0) / 7.0})
+            })
+            .collect();
+        let value = serde_json::json!({"rows": rows});
         let p = Program::compile(".rows |= map(select(.id % 3 == 0))").unwrap();
         assert_eq!(p.run(&value).unwrap(), legacy_run(&p, &value).unwrap());
     }
 
     #[test]
+    fn run_bytes_handles_2mib_payload_and_respects_output_limit() {
+        let mut raw = String::from(r#"{"ad":1,"items":["#);
+        let pad = "p".repeat(200);
+        for i in 0..8_000usize {
+            if i > 0 {
+                raw.push(',');
+            }
+            raw.push_str(&format!(
+                r#"{{"id":{i},"is_ad":{},"title":"item-{i}-{pad}"}}"#,
+                i % 4 == 0
+            ));
+        }
+        raw.push_str("]}");
+        assert!(raw.len() > 1_800_000, "len={}", raw.len());
+
+        let p = Program::compile(r#"del(.ad) | .items |= map(select(.is_ad != true))"#).unwrap();
+        let out = p.run_bytes(raw.as_bytes(), 4 * 1024 * 1024).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert!(parsed.get("ad").is_none());
+        assert_eq!(parsed["items"].as_array().unwrap().len(), 6_000);
+
+        // 输出超过 max_output 时报错中止。
+        assert!(p.run_bytes(raw.as_bytes(), 1024).is_err());
+    }
+
+    #[test]
     fn user_defined_in_does_not_conflict() {
         let p = Program::compile("def IN(s): any(s; . == 1); [1 | IN(1, 2)]").unwrap();
-        assert_eq!(p.run(&serde_json::Value::Null).unwrap(), serde_json::json!([true]));
+        assert_eq!(
+            p.run(&serde_json::Value::Null).unwrap(),
+            serde_json::json!([true])
+        );
         let err = Program::compile(".a | ").unwrap_err();
         assert!(err.starts_with("jq parse error: "), "{err}");
     }
