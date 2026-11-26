@@ -74,43 +74,38 @@ impl Program {
         input: &serde_json::Value,
         max_body: usize,
     ) -> Result<serde_json::Value, String> {
-        self.with_budget(max_body, || self.run_inner(input))
+        // 延迟编译与输入解码不计入单次 jq 解释器超时预算，避免冷启动或大 JSON 解析误触超时。
+        let filter = self.filter()?;
+        let value: Val = Val::deserialize(input).map_err(|e| format!("jq input: {e}"))?;
+        let first = self.with_budget(max_body, || Self::eval_single(filter, value))?;
+        match first {
+            Some(v) => conversion::to_json(&v),
+            None => Ok(input.clone()),
+        }
     }
 
     /// 直接从 JSON 字节解码为 `Val` 并流式写出 JSON 字节，省去两棵 `serde_json::Value` 树，
     /// 同时把执行预算对齐到 `max_output` 并在输出超限时提前中止。
     pub fn run_bytes(&self, input: &[u8], max_output: usize) -> Result<Vec<u8>, String> {
-        self.with_budget(max_output, || self.run_bytes_inner(input, max_output))
-    }
-
-    fn run_inner(&self, input: &serde_json::Value) -> Result<serde_json::Value, String> {
-        let filter = self.filter()?;
-        let value: Val = Val::deserialize(input).map_err(|e| format!("jq input: {e}"))?;
-        let ctx = Ctx::<JustLut<Val>>::new(&filter.lut, Vars::new([]));
-        let mut outputs = filter.id.run((ctx, value)).map(unwrap_valr);
-        let Some(first) = outputs.next() else {
-            return Ok(input.clone());
-        };
-        let first = first.map_err(|_| "jq runtime error".to_string())?;
-        if outputs.next().is_some() {
-            return Err(
-                "jq produced multiple outputs; body rewrite requires one JSON value".into(),
-            );
-        }
-        drop(outputs);
-        conversion::to_json(&first)
-    }
-
-    fn run_bytes_inner(&self, input: &[u8], max_output: usize) -> Result<Vec<u8>, String> {
         let filter = self.filter()?;
         let value: Val = serde_json::from_slice(input).map_err(|e| format!("jq input: {e}"))?;
+        let first = self.with_budget(max_output, || Self::eval_single(filter, value))?;
+        match first {
+            Some(v) => conversion::to_json_bytes(&v, max_output, input.len()),
+            None => {
+                if input.len() > max_output {
+                    return Err("jq output exceeds limit".into());
+                }
+                Ok(input.to_vec())
+            }
+        }
+    }
+
+    fn eval_single(filter: &Filter, value: Val) -> Result<Option<Val>, String> {
         let ctx = Ctx::<JustLut<Val>>::new(&filter.lut, Vars::new([]));
         let mut outputs = filter.id.run((ctx, value)).map(unwrap_valr);
         let Some(first) = outputs.next() else {
-            if input.len() > max_output {
-                return Err("jq output exceeds limit".into());
-            }
-            return Ok(input.to_vec());
+            return Ok(None);
         };
         let first = first.map_err(|_| "jq runtime error".to_string())?;
         if outputs.next().is_some() {
@@ -118,8 +113,7 @@ impl Program {
                 "jq produced multiple outputs; body rewrite requires one JSON value".into(),
             );
         }
-        drop(outputs);
-        conversion::to_json_bytes(&first, max_output, input.len())
+        Ok(Some(first))
     }
 }
 

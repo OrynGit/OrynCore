@@ -388,6 +388,9 @@ fn run_thread(
     install_panic_log();
     crate::perf::load_markers(options.data_dir.as_deref());
     let rt = match tokio::runtime::Builder::new_current_thread()
+        // iOS 上 pthread 子线程默认仅 512 KiB 栈，为 spawn_blocking 脚本工作线程预留 1 MiB 虚拟栈
+        // （按页按需提交，空闲零额外物理内存），避免复杂 CryptoJS / Protobuf 脚本误触栈保护页。
+        .thread_stack_size(1024 * 1024)
         .enable_all()
         .build()
     {
@@ -878,7 +881,7 @@ fn handle_command(ctx: &Rc<EngineCtx>, req: &Value) -> Value {
             "utun_buffer_full_drops": oryn_netstack::utun::BUFFER_FULL_DROPS.load(Relaxed),
             "output_dropped": ctx.stack.output_dropped(),
             "mode": state.router().mode().as_str(),
-            "warnings": state.config.warnings.len(),
+            "warnings": state.config.warnings.len() + state.scripts.runtime_warning_count(),
             "config_generation": ctx.config_generation.get(),
             "resource_revision": ctx.resource_revision.get(),
             "loop_perf": crate::perf::snapshot(),
@@ -1370,7 +1373,11 @@ fn handle_command(ctx: &Rc<EngineCtx>, req: &Value) -> Value {
                 "resource_revision": ctx.resource_revision.get(),
             })
         }
-        "warnings" => json!({ "warnings": state.config.warnings }),
+        "warnings" => {
+            let mut list = state.config.warnings.clone();
+            list.extend(state.scripts.runtime_warnings());
+            json!({ "warnings": list })
+        }
         "clear_dns_cache" => {
             ctx.dns.clear_cache();
             json!({ "ok": true })

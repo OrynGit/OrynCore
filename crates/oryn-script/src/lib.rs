@@ -256,7 +256,7 @@ pub fn run(
     };
     let runtime = Runtime::new().map_err(|e| e.to_string())?;
     runtime.set_memory_limit(heap_limit);
-    runtime.set_max_stack_size(256 * 1024);
+    runtime.set_max_stack_size(512 * 1024);
     let end = Instant::now() + input.timeout.min(Duration::from_secs(300));
     let cancellation = input.cancellation.clone();
     runtime.set_interrupt_handler(Some(Box::new(move || {
@@ -403,6 +403,12 @@ pub fn run(
                     .map_err(|e| e.to_string())?,
             )
             .map_err(|e| e.to_string())?;
+        ctx.globals()
+            .set(
+                "__random_bytes",
+                rquickjs::Function::new(ctx.clone(), random_bytes).map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
 
         ctx.globals()
             .set("__input", initial_meta)
@@ -420,6 +426,10 @@ pub fn run(
                 .map_err(|e| e.to_string())?;
         }
 
+        // 在进入 JS 求值前刷新 QuickJS 栈顶，避免把外层 Rust 栈帧计入 JS 栈深上限。
+        unsafe {
+            rquickjs::qjs::JS_UpdateStackTop(rquickjs::qjs::JS_GetRuntime(ctx.as_raw().as_ptr()));
+        }
         ctx.eval::<(), _>(include_str!("runtime.js"))
             .map_err(|e| format!("script bootstrap: {e}"))?;
         // 加载模块时已为大脚本缓存字节码，执行时不再解析源码。
@@ -567,9 +577,12 @@ fn parse(code: &str) -> std::io::Result<()> {
     let budget = |what: &str| Error::new(ErrorKind::Unsupported, format!("script exceeds {what}"));
     let rt = Runtime::new().map_err(Error::other)?;
     rt.set_memory_limit(PARSE_HEAP_LIMIT);
-    rt.set_max_stack_size(256 * 1024);
+    rt.set_max_stack_size(512 * 1024);
     let ctx = Context::full(&rt).map_err(Error::other)?;
     ctx.with(|ctx| {
+        unsafe {
+            rquickjs::qjs::JS_UpdateStackTop(rquickjs::qjs::JS_GetRuntime(ctx.as_raw().as_ptr()));
+        }
         ctx.globals().set("source", code).map_err(Error::other)?;
         match ctx.eval::<rquickjs::Function, _>("new Function(source)") {
             Ok(_) => Ok(()),
@@ -664,6 +677,49 @@ fn gzip_bytes<'js>(
         return Err(conversion_error());
     }
     rquickjs::TypedArray::new(ctx, out)
+}
+
+fn random_bytes<'js>(
+    ctx: rquickjs::Ctx<'js>,
+    len: usize,
+) -> rquickjs::Result<rquickjs::TypedArray<'js, u8>> {
+    if len > 65536 {
+        return Err(conversion_error());
+    }
+    let mut buf = vec![0u8; len];
+    fill_random(&mut buf);
+    rquickjs::TypedArray::new(ctx, buf)
+}
+
+fn fill_random(buf: &mut [u8]) {
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+            if f.read_exact(buf).is_ok() {
+                return;
+            }
+        }
+    }
+    use sha2::{Digest, Sha256};
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let mut offset = 0usize;
+    while offset < buf.len() {
+        let mut h = Sha256::new();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0u128, |d| d.as_nanos());
+        h.update(nanos.to_le_bytes());
+        h.update(
+            COUNTER
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                .to_le_bytes(),
+        );
+        let digest = h.finalize();
+        let take = (buf.len() - offset).min(digest.len());
+        buf[offset..offset + take].copy_from_slice(&digest[..take]);
+        offset += take;
+    }
 }
 
 fn base64_bytes(data: rquickjs::TypedArray<'_, u8>, max_body: usize) -> rquickjs::Result<String> {
@@ -1089,6 +1145,57 @@ mod third_party {
         let body: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(body["showMedal"], 0);
         assert_eq!(body["keep"], 42);
+    }
+
+    #[test]
+    fn crypto_random_loon_iphone_and_deep_apply_chain() {
+        let inp = Input {
+            cancellation: None,
+            event: Value::Null,
+            cron: None,
+            kind: "http-response".into(),
+            loon: true,
+            request: serde_json::json!({"url":"https://example.test","headers":{}}),
+            response: serde_json::json!({"status":200}),
+            request_body: BodyData::None,
+            response_body: BodyData::Text(r#"{"ok":false}"#.into()),
+            argument: Value::Null,
+            env: Default::default(),
+            binary: false,
+            timeout: Duration::from_secs(10),
+            name: "compat".into(),
+            store: Default::default(),
+            max_heap: 0,
+            max_body: 0,
+        };
+        let code = r#"
+            const a = new Uint8Array(16);
+            crypto.getRandomValues(a);
+            const b = new Uint8Array(16);
+            crypto.getRandomValues(b);
+            const diff = a.some((v, i) => v !== b[i]);
+            function chain(n) { return n <= 0 ? 1 : chain.apply(null, [n - 1]) + 1; }
+            function direct(n) { return n <= 0 ? 1 : direct(n - 1) + 1; }
+            $done({
+                body: JSON.stringify({
+                    diff,
+                    loon_iphone: /iPhone/.test($loon),
+                    env_version: $environment.version,
+                    start_ms: $script.startTime > 1e12,
+                    depth: chain(12),
+                    direct_depth: direct(50)
+                })
+            });
+        "#;
+        let out = run(code, inp, |_| unreachable!()).unwrap();
+        let BodyData::Text(text) = out.body else { panic!("expected text") };
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["diff"], true);
+        assert_eq!(v["loon_iphone"], true);
+        assert_eq!(v["env_version"], "5.11.0");
+        assert_eq!(v["start_ms"], true);
+        assert_eq!(v["depth"], 13);
+        assert_eq!(v["direct_depth"], 51);
     }
 }
 

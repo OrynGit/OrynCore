@@ -159,12 +159,13 @@ fn compile(code: &str) -> std::io::Result<Vec<u8>> {
         .map_err(|_| Error::new(ErrorKind::InvalidData, "script contains a NUL byte"))?;
     let rt = Runtime::new().map_err(Error::other)?;
     rt.set_memory_limit(COMPILE_HEAP_LIMIT);
-    rt.set_max_stack_size(256 * 1024);
+    rt.set_max_stack_size(512 * 1024);
     let ctx = Context::full(&rt).map_err(Error::other)?;
     ctx.with(|ctx| {
         // 安全：source 以 NUL 结尾且在调用期间存活；返回值与缓冲区在本作用域内释放。
         unsafe {
             let raw = ctx.as_raw().as_ptr();
+            qjs::JS_UpdateStackTop(qjs::JS_GetRuntime(raw));
             let name = c"script";
             let func = qjs::JS_Eval(
                 raw,

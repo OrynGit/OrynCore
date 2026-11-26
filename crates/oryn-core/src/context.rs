@@ -483,6 +483,7 @@ impl EngineCtx {
             self.iperf.cancel("configuration reloaded");
             self.network_test.cancel("configuration reloaded");
             self.selftest.cancel("configuration reloaded");
+            self.script_host.clear_runtime_warnings();
         }
         let base_config = config.clone();
         let mut config = config;
