@@ -789,3 +789,262 @@ mod tests {
         assert_eq!(got, b"raw");
     }
 }
+
+#[cfg(test)]
+mod legacy_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const UUID: [u8; 16] = [
+        0xb8, 0x31, 0x38, 0x1d, 0x63, 0x24, 0x4d, 0x53, 0xad, 0x4f, 0x8c, 0xda, 0x48, 0xb3, 0x08,
+        0x11,
+    ];
+
+    fn alter_ids(uuid: &[u8; 16], count: u16) -> Vec<[u8; 16]> {
+        let mut out = Vec::with_capacity(usize::from(count) + 1);
+        let mut cur = *uuid;
+        for _ in 0..count {
+            cur = md5(&[cur.as_slice(), b"16167dc8-16b6-4e6d-b8bb-65dd68113a81"].concat());
+            out.push(cur);
+        }
+        out.push(*uuid);
+        out
+    }
+
+    struct ParsedLegacyHeader {
+        req_key: [u8; 16],
+        req_iv: [u8; 16],
+        resp_auth: u8,
+        options: u8,
+        security: u8,
+        command: u8,
+        consumed: usize,
+    }
+
+    /// 独立按 V2Fly VMess legacy（MD5/HMAC-MD5 + CFB）协议解析并校验请求首部。
+    fn parse_legacy_request(
+        uuid: &[u8; 16],
+        alter_id: u16,
+        ts: u64,
+        wire: &[u8],
+    ) -> ParsedLegacyHeader {
+        assert!(wire.len() >= 16 + 38, "legacy request too short");
+        let auth = &wire[..16];
+        let ts_bytes = ts.to_be_bytes();
+        let candidates = alter_ids(uuid, alter_id);
+        assert!(
+            candidates.iter().any(|id| hmac_md5(id, &ts_bytes) == auth),
+            "HMAC-MD5 auth tag did not match any alterId for alterId={alter_id}"
+        );
+
+        let command_key = md5(&[uuid.as_slice(), b"c48619fe-8f02-49e0-b9e9-edf763e17e21"].concat());
+        let header_iv = md5(&ts_bytes.repeat(4));
+        let mut plain = wire[16..].to_vec();
+        Cfb::new(&command_key, &header_iv).apply(&mut plain, true);
+
+        assert_eq!(plain[0], 1, "VMess version must be 1");
+        let req_iv: [u8; 16] = plain[1..17].try_into().unwrap();
+        let req_key: [u8; 16] = plain[17..33].try_into().unwrap();
+        let resp_auth = plain[33];
+        let options = plain[34];
+        let pad_len = usize::from(plain[35] >> 4);
+        let security = plain[35] & 0x0f;
+        let command = plain[37];
+
+        // port(2) + atype(1) + addr
+        let addr_len = match plain[40] {
+            1 => 2 + 1 + 4,
+            3 => 2 + 1 + 16,
+            2 => 2 + 1 + 1 + usize::from(plain[41]),
+            other => panic!("unexpected VMess atyp {other}"),
+        };
+        let header_body_len = 38 + addr_len + pad_len;
+        let expected_fnv = fnv(&plain[..header_body_len]).to_be_bytes();
+        assert_eq!(
+            &plain[header_body_len..header_body_len + 4],
+            &expected_fnv,
+            "FNV1a checksum mismatch"
+        );
+        ParsedLegacyHeader {
+            req_key,
+            req_iv,
+            resp_auth,
+            options,
+            security,
+            command,
+            consumed: 16 + header_body_len + 4,
+        }
+    }
+
+    /// 按 alterId=1 与 alterId=64 × 全部加密方式验证 legacy 握手、分块/无分块载荷、半关闭与分段响应头（OrynCore#62）。
+    #[tokio::test]
+    async fn legacy_alter_id_tcp_roundtrip_and_fragmented_response_header() {
+        let ts = 1_764_000_000u64;
+        for alter_id in [1u16, 64u16] {
+            for cipher in [
+                "aes-128-cfb",
+                "aes-128-gcm",
+                "chacha20-poly1305",
+                "none",
+                "zero",
+                "auto",
+            ] {
+                let (pad, auth_len) = if matches!(cipher, "aes-128-gcm" | "chacha20-poly1305" | "auto") {
+                    (true, true)
+                } else {
+                    (false, false)
+                };
+                let spec = VmessSpec {
+                    uuid: UUID,
+                    alter_id,
+                    cipher: cipher.into(),
+                    global_padding: pad,
+                    authenticated_length: auth_len,
+                };
+                let target = TargetAddr::Domain("echo.example.com".into(), 443);
+                let (header, session) = Session::request_at(&spec, &target, 1, ts).unwrap();
+
+                let (mut client, mut server) = tokio::io::duplex(64 * 1024);
+                client.write_all(&header).await.unwrap();
+                let mut stream = session.stream(client);
+                stream.write_all(b"hello-vmess-legacy").await.unwrap();
+                stream.shutdown().await.unwrap();
+
+                let mut client_wire = vec![0u8; 4096];
+                let mut total = 0usize;
+                loop {
+                    let n = tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        server.read(&mut client_wire[total..]),
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    total += n;
+                    if cipher != "none" && cipher != "zero" {
+                        // 分块模式在半关闭后等待回显再收，不依赖 TCP FIN。
+                        let parsed = parse_legacy_request(&UUID, alter_id, ts, &client_wire[..total]);
+                        let mut srv_read = Body::new(
+                            &spec,
+                            parsed.options,
+                            &parsed.req_key,
+                            &parsed.req_iv,
+                            &parsed.req_key,
+                            &parsed.req_iv,
+                        );
+                        let mut rest = BytesMut::from(&client_wire[parsed.consumed..total]);
+                        if let Some(cfb) = &mut srv_read.cfb {
+                            cfb.apply(&mut rest, true);
+                        }
+                        if let Ok(Some(first)) = srv_read.decode(&mut rest) {
+                            assert_eq!(first.as_ref(), b"hello-vmess-legacy");
+                            if matches!(srv_read.decode(&mut rest), Ok(Some(end)) if end.is_empty()) {
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                let parsed = parse_legacy_request(&UUID, alter_id, ts, &client_wire[..total]);
+                assert_eq!(parsed.command, 1);
+                if matches!(cipher, "none" | "zero") {
+                    assert_eq!(parsed.security, 5);
+                    assert_eq!(parsed.options, 0);
+                    assert_eq!(&client_wire[parsed.consumed..total], b"hello-vmess-legacy");
+                }
+
+                let resp_key = hash16(&parsed.req_key, true);
+                let resp_iv = hash16(&parsed.req_iv, true);
+                // 包含非零 command 字节，验证 legacy 响应首部跨字节分片与之后负载的 CFB 状态切换。
+                let mut resp_header = vec![parsed.resp_auth, 0, 0, 2, 0xaa, 0xbb];
+                let mut resp_cfb = Cfb::new(&resp_key, &resp_iv);
+                resp_cfb.apply(&mut resp_header, false);
+
+                let mut srv_write = Body::new(
+                    &spec,
+                    parsed.options,
+                    &resp_key,
+                    &resp_iv,
+                    &parsed.req_key,
+                    &parsed.req_iv,
+                );
+                if parsed.security == 1 {
+                    // legacy + aes-128-cfb 的响应首部与载荷共用同一条连续 CFB 流。
+                    srv_write.cfb = Some(resp_cfb);
+                }
+                let mut resp_wire = resp_header;
+                let payload_wire = srv_write.encode(b"reply-from-legacy-peer").unwrap();
+                resp_wire.extend_from_slice(&payload_wire);
+                if parsed.options & 1 != 0 {
+                    resp_wire.extend_from_slice(&srv_write.encode(&[]).unwrap());
+                }
+
+                // 按小分片写回（先写 3 字节破坏首个 read>=4 假设，再写剩余字节），测试响应头分段解密。
+                let split = 3usize.min(resp_wire.len());
+                server.write_all(&resp_wire[..split]).await.unwrap();
+                server.flush().await.unwrap();
+                tokio::task::yield_now().await;
+                server.write_all(&resp_wire[split..]).await.unwrap();
+                server.shutdown().await.unwrap();
+
+                let mut reply = Vec::new();
+                stream.read_to_end(&mut reply).await.unwrap();
+                assert_eq!(reply, b"reply-from-legacy-peer", "alter_id={alter_id} cipher={cipher}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_alter_id_udp_and_bad_response_auth_rejected() {
+        let ts = 1_764_000_123u64;
+        for cipher in ["aes-128-cfb", "aes-128-gcm", "none", "zero"] {
+            let spec = VmessSpec {
+                uuid: UUID,
+                alter_id: 64,
+                cipher: cipher.into(),
+                global_padding: false,
+                authenticated_length: false,
+            };
+            let target = TargetAddr::Ip("198.51.100.9:53".parse().unwrap());
+            let (header, session) = Session::request_at(&spec, &target, 2, ts).unwrap();
+            let parsed = parse_legacy_request(&UUID, 64, ts, &header);
+            assert_eq!(parsed.command, 2);
+            assert_ne!(parsed.options & 1, 0, "UDP must chunk even for {cipher}");
+
+            let (mut client, mut server) = tokio::io::duplex(4096);
+            client.write_all(&header).await.unwrap();
+            let mut stream = session.stream(client);
+            stream.write_all(b"dns-query").await.unwrap();
+            stream.flush().await.unwrap();
+
+            let mut buf = vec![0u8; 4096];
+            let n = server.read(&mut buf).await.unwrap();
+            let mut rest = BytesMut::from(&buf[parsed.consumed..n]);
+            let mut srv_read = Body::new(
+                &spec,
+                parsed.options,
+                &parsed.req_key,
+                &parsed.req_iv,
+                &parsed.req_key,
+                &parsed.req_iv,
+            );
+            if let Some(cfb) = &mut srv_read.cfb {
+                cfb.apply(&mut rest, true);
+            }
+            assert_eq!(srv_read.decode(&mut rest).unwrap().unwrap().as_ref(), b"dns-query");
+
+            // 错误的 response auth 字节必须拒绝
+            let resp_key = hash16(&parsed.req_key, true);
+            let resp_iv = hash16(&parsed.req_iv, true);
+            let mut bad_resp = [parsed.resp_auth ^ 0xff, 0, 0, 0];
+            Cfb::new(&resp_key, &resp_iv).apply(&mut bad_resp, false);
+            server.write_all(&bad_resp).await.unwrap();
+            server.flush().await.unwrap();
+            let mut out = [0u8; 16];
+            assert!(stream.read(&mut out).await.is_err());
+        }
+    }
+}
