@@ -134,6 +134,18 @@ pub trait ValT:
         f: impl Fn(Self) -> I,
     ) -> ValX<'a, Self>;
 
+    /// Like [`Self::map_index`], but used for intermediate segments of a multi-part path
+    /// (e.g. `.a` in `del(.a.b)` or `.a[]?.b |= f`). Missing keys and `null` containers
+    /// stay untouched when the inner update leaves `null` unchanged.
+    fn map_index_inner<'a, I: Iterator<Item = ValX<'a, Self>>>(
+        self,
+        index: &Self,
+        opt: Opt,
+        f: impl Fn(Self) -> I,
+    ) -> ValX<'a, Self> {
+        self.map_index(index, opt, f)
+    }
+
     /// Map a function over the slice of the value with the given range.
     ///
     /// This is used by `.[s:e] |= f`, `.[s:] |= f`, and `.[:e] |= f`.

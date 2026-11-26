@@ -338,6 +338,52 @@ mod tests {
         let err = Program::compile(".a | ").unwrap_err();
         assert!(err.starts_with("jq parse error: "), "{err}");
     }
+
+    #[test]
+    fn path_update_and_delete_match_jq_on_missing_and_null_paths() {
+        let cases: &[(&str, &str, &str)] = &[
+            ("{}", "del(.a.b)", "{}"),
+            ("{}", "del(.a.b.c)", "{}"),
+            (r#"{"a":null}"#, "del(.a.b)", r#"{"a":null}"#),
+            (r#"{"a":{"b":1}}"#, "del(.a.b)", r#"{"a":{}}"#),
+            ("{}", ".a.b = 1", r#"{"a":{"b":1}}"#),
+            ("{}", ".a.b = null", r#"{"a":{"b":null}}"#),
+            ("{}", ".a.b |= .", r#"{"a":{"b":null}}"#),
+            ("{}", ".a |= .", r#"{"a":null}"#),
+            ("{}", "del(.a[]?.b)", "{}"),
+            ("{}", ".a[]?.b |= 1", "{}"),
+            (r#"{"data":{}}"#, "del(.data.tab_nav[]?.tab_param)", r#"{"data":{}}"#),
+            (r#"{"a":[null]}"#, "del(.a[0].b)", r#"{"a":[null]}"#),
+            ("[1]", "del(.[5])", "[1]"),
+            ("[1]", "del(.[5].a)", "[1]"),
+            ("[1]", ".[2] = 9", "[1,null,9]"),
+            ("[1]", r#".[2].a = 1"#, r#"[1,null,{"a":1}]"#),
+            ("null", "del(.a)", "null"),
+            ("null", "del(.[0])", "null"),
+            ("null", ".a = 1", r#"{"a":1}"#),
+            ("null", ".[1] = 1", "[null,1]"),
+            ("null", ".[]? |= 1", "null"),
+            (
+                "{}",
+                ".data.hotReplyRows |= if . then map(select(.id != 1)) else . end",
+                r#"{"data":{"hotReplyRows":null}}"#,
+            ),
+        ];
+        for (input, filter, expected) in cases {
+            let p = Program::compile(filter).unwrap();
+            let out = p.run_bytes(input.as_bytes(), 1024 * 1024).unwrap_or_else(|e| {
+                panic!("filter `{filter}` on `{input}` failed: {e}");
+            });
+            let got: serde_json::Value = serde_json::from_slice(&out).unwrap();
+            let want: serde_json::Value = serde_json::from_str(expected).unwrap();
+            assert_eq!(got, want, "input={input} filter={filter}");
+        }
+        // 非对象/非 null 路径上的 del 仍报错（与 jq 一致）。
+        let err = Program::compile("del(.a.b)")
+            .unwrap()
+            .run_bytes(br#"{"a":1}"#, 1024 * 1024);
+        assert!(err.is_err());
+    }
 }
 
 impl std::fmt::Debug for Program {

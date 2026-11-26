@@ -16,10 +16,11 @@ pub fn parse(root: &Yaml, b: &mut Builder) -> Vec<ModuleSpec> {
         }
     };
     let mut out = Vec::new();
-    if items.len() > 64 {
-        b.warn("module count exceeds 64; extra modules ignored");
+    const MAX_PARSED_MODULES: usize = 256;
+    if items.len() > MAX_PARSED_MODULES {
+        b.warn("module count exceeds 256; extra modules ignored");
     }
-    for (index, item) in items.iter().take(64).enumerate() {
+    for (index, item) in items.iter().take(MAX_PARSED_MODULES).enumerate() {
         let mut url = str_of(item, "url");
         let inline_text = str_of(item, "inline");
         if url.is_none() && inline_text.is_none() {
@@ -29,7 +30,7 @@ pub fn parse(root: &Yaml, b: &mut Builder) -> Vec<ModuleSpec> {
         let format = str_of(item, "format").and_then(|v| match v.to_ascii_lowercase().as_str() {
             "surge" => Some(ModuleFormat::Surge),
             "loon" => Some(ModuleFormat::Loon),
-            "auto" => None,
+            "auto" | "egern" => None,
             other => {
                 b.warn(format!("modules[{index}] unknown format {other}"));
                 None

@@ -117,7 +117,12 @@ where
 {
     if let Some((part, opt)) = iter.next() {
         use core::iter::once;
-        part.update(v, opt, |v| once(update(iter.clone(), last.clone(), v, f)))
+        match part {
+            Part::Index(idx) => {
+                v.map_index_inner(&idx, opt, |v| once(update(iter.clone(), last.clone(), v, f)))
+            }
+            _ => part.update(v, opt, |v| once(update(iter.clone(), last.clone(), v, f))),
+        }
     } else {
         last.0.update(v, last.1, f)
     }

@@ -22,8 +22,8 @@ mod yaml;
 pub use addr::TargetAddr;
 pub use cidr::IpCidr;
 pub use domain::{
-    glob_match, hostname_matches, listed_host_matches, normalize_domain, suffix_match,
-    DomainPattern, ListedPort,
+    glob_match, hostname_matches, listed_host_matches, mitm_hostname_matches,
+    mitm_listed_host_matches, normalize_domain, suffix_match, DomainPattern, ListedPort,
 };
 pub use model::*;
 pub use parse::{

@@ -64,7 +64,10 @@ impl Inspector {
         stream: S,
         http2: bool,
     ) -> io::Result<()> {
+        let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let served_for_service = Arc::clone(&served);
         let service = service_fn(move |req| {
+            served_for_service.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let this = self.clone();
             async move {
                 let response =
@@ -101,15 +104,28 @@ impl Inspector {
                     .await
                     .map_err(err)
             } else {
-                hyper::server::conn::http1::Builder::new()
+                match hyper::server::conn::http1::Builder::new()
                     .keep_alive(true)
                     .max_buf_size(32768)
                     .timer(TokioTimer::new())
-                    .header_read_timeout(Duration::from_secs(15))
+                    .header_read_timeout(Duration::from_secs(30))
                     .serve_connection(io, service)
                     .with_upgrades()
                     .await
-                    .map_err(err)
+                {
+                    Ok(()) => Ok(()),
+                    // HTTP/1.1 keep-alive 空闲超时关闭属于正常生命周期，不视为连接错误。
+                    Err(e)
+                        if e.is_timeout()
+                            && served.load(std::sync::atomic::Ordering::Relaxed) > 0 =>
+                    {
+                        Ok(())
+                    }
+                    Err(e) if e.is_timeout() => {
+                        Err(io::Error::new(io::ErrorKind::TimedOut, e.to_string()))
+                    }
+                    Err(e) => Err(err(e)),
+                }
             }
         };
         tokio::pin!(pump, serving);
@@ -140,33 +156,63 @@ impl Inspector {
         if parts.method == http::Method::CONNECT {
             return Ok(error_response(405));
         }
-        let url = if parts.uri.scheme().is_some() {
-            parts.uri.to_string()
-        } else {
-            let host = parts.headers.get("host").and_then(|v| v.to_str().ok());
-            let base: Uri = self.origin.parse().map_err(err)?;
-            format!(
-                "{}://{}{}",
-                base.scheme_str().unwrap_or("http"),
-                host.unwrap_or(base.authority().map(|x| x.as_str()).unwrap_or("")),
+        let base: Uri = self.origin.parse().map_err(err)?;
+        let (scheme, raw_authority, path_and_query) = if let Some(scheme) = parts.uri.scheme_str() {
+            let auth = parts
+                .uri
+                .authority()
+                .map(|a| a.as_str())
+                .or_else(|| parts.headers.get("host").and_then(|v| v.to_str().ok()))
+                .or_else(|| base.authority().map(|a| a.as_str()))
+                .unwrap_or("");
+            (
+                scheme,
+                auth,
                 parts
                     .uri
                     .path_and_query()
                     .map(|p| p.as_str())
-                    .unwrap_or("/")
+                    .unwrap_or("/"),
+            )
+        } else {
+            let auth = parts
+                .headers
+                .get("host")
+                .and_then(|v| v.to_str().ok())
+                .or_else(|| base.authority().map(|x| x.as_str()))
+                .unwrap_or("");
+            (
+                base.scheme_str().unwrap_or("http"),
+                auth,
+                parts
+                    .uri
+                    .path_and_query()
+                    .map(|p| p.as_str())
+                    .unwrap_or("/"),
             )
         };
+        let authority = strip_default_port(scheme, raw_authority);
+        let url = format!("{scheme}://{authority}{path_and_query}");
+        let mut headers = header_pairs(&parts.headers);
+        // HTTP/2 下主机名位于 `:authority`，补齐 `Host` 供规则与脚本读取。
+        if !authority.is_empty() && !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("host")) {
+            headers.push(("Host".into(), authority.to_owned()));
+        }
         let mut message = Message {
             url,
             method: parts.method.to_string(),
             status: None,
-            headers: header_pairs(&parts.headers),
+            headers,
             body: vec![],
         };
-        let original: Uri = self.origin.parse().map_err(err)?;
+        let original = base;
         let requested: Uri = message.url.parse().map_err(err)?;
         if original.scheme_str() == Some("https")
-            && (requested.host() != original.host() || requested.scheme_str() != Some("https"))
+            && (!requested
+                .host()
+                .zip(original.host())
+                .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b))
+                || requested.scheme_str() != Some("https"))
         {
             return Ok(error_response(421));
         }
@@ -309,6 +355,14 @@ impl Inspector {
         *outgoing.headers_mut() = headers_with(&request_meta.headers, Some(&parts.headers))?;
         if !upgrading {
             strip_hop(outgoing.headers_mut());
+        }
+        // 响应正文可能命中重写或脚本时，去掉不被本地解压器支持的压缩算法（如 zstd）。
+        if self.plan.might_need_response_body(&request_meta) {
+            sanitize_accept_encoding(outgoing.headers_mut());
+        }
+        if h2 {
+            // HTTP/2 使用 `:authority` 伪首部；移除冗余 Host，避免部分服务端或 hyper 拒绝。
+            outgoing.headers_mut().remove("host");
         }
         if !h2 {
             if let Some(names) = request_trailer_names {
@@ -478,6 +532,47 @@ impl Inspector {
         let body = std::mem::replace(response.body_mut(), full(vec![]));
         *response.body_mut() = DrivenBody::new(body, None, transaction, Some(permit)).boxed_unsync();
         Ok(response)
+    }
+}
+fn strip_default_port<'a>(scheme: &str, authority: &'a str) -> &'a str {
+    let default = match scheme {
+        "https" => ":443",
+        "http" => ":80",
+        _ => return authority,
+    };
+    authority.strip_suffix(default).unwrap_or(authority)
+}
+fn sanitize_accept_encoding(h: &mut http::HeaderMap) {
+    let Some(raw) = h
+        .get("accept-encoding")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+    else {
+        return;
+    };
+    let kept: Vec<&str> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|part| {
+            let name = part
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            matches!(
+                name.as_str(),
+                "gzip" | "x-gzip" | "deflate" | "br" | "identity"
+            )
+        })
+        .collect();
+    if kept.is_empty() {
+        h.insert(
+            "accept-encoding",
+            http::HeaderValue::from_static("gzip, deflate, br"),
+        );
+    } else if let Ok(v) = http::HeaderValue::from_str(&kept.join(", ")) {
+        h.insert("accept-encoding", v);
     }
 }
 fn error_response(code: u16) -> Response<BoxBody> {
@@ -1681,6 +1776,82 @@ response if ${url} ~= /fixture/ && ${response.header['X-State']} == "new" then s
             assert!(budget.clone().try_acquire_many_owned(four_mib_pages).is_err());
             drop(first);
             assert!(budget.clone().try_acquire_many_owned(four_mib_pages).is_ok());
+        }).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn normalizes_default_port_and_strips_unsupported_accept_encoding_for_rewrites() {
+        tokio::task::LocalSet::new().run_until(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let seen_ae = Arc::new(std::sync::Mutex::new(String::new()));
+            let seen_ae_peer = Arc::clone(&seen_ae);
+            let peer = tokio::task::spawn_local(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                let service = service_fn(move |req: Request<Incoming>| {
+                    let seen = Arc::clone(&seen_ae_peer);
+                    async move {
+                        let ae = req
+                            .headers()
+                            .get("accept-encoding")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("")
+                            .to_owned();
+                        *seen.lock().unwrap() = ae;
+                        Ok::<_, Infallible>(
+                            Response::builder()
+                                .header("Content-Type", "application/json")
+                                .body(full(br#"{"ad":true,"ok":1}"#.to_vec()))
+                                .unwrap(),
+                        )
+                    }
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(socket), service)
+                    .await;
+            });
+            // 规则要求 URL 不含 `:80` 默认端口。
+            let ir = oryn_module::parse(
+                "[Body Rewrite]\nhttp-response-jq ^http://fixture\\.test/feed$ 'del(.ad)'\n",
+                Some(oryn_module::ModuleFormat::Surge),
+            )
+            .unwrap();
+            let plan = oryn_http_inspect::compile_module(&ir, &Default::default(), &Default::default()).unwrap();
+            let inspector = Inspector {
+                scripts: Arc::new(crate::scripts::ScriptHost::new(None)),
+                plan: Rc::new(plan),
+                outbound: Arc::new(Peer(addr)),
+                origin: "http://fixture.test:80".into(),
+                skip_verify: false,
+                transactions: Some(Arc::new(Semaphore::new(8))),
+                upstream_establish: Arc::new(Semaphore::new(8)),
+                bodies: Arc::new(Semaphore::new(body_budget_pages(6 * 1024 * 1024))),
+                max_body: oryn_http_inspect::MAX_BODY,
+            };
+            let (app, server) = tokio::io::duplex(65536);
+            let serving = tokio::task::spawn_local(inspector.serve(server, false));
+            let (mut client, driver) = hyper::client::conn::http1::handshake(TokioIo::new(app)).await.unwrap();
+            let driving = tokio::task::spawn_local(driver);
+            let response = client
+                .send_request(
+                    Request::builder()
+                        .uri("/feed")
+                        .header("Host", "fixture.test:80")
+                        .header("Accept-Encoding", "gzip, deflate, br, zstd")
+                        .body(full(vec![]))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 200);
+            let got = response.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(got, Bytes::from_static(br#"{"ok":1}"#));
+            let ae = seen_ae.lock().unwrap().clone();
+            assert_eq!(ae, "gzip, deflate, br");
+            drop(client);
+            driving.abort();
+            serving.abort();
+            peer.abort();
         }).await;
     }
 }

@@ -233,19 +233,32 @@ impl ScriptHost {
             let mut headers=options["headers"].as_object().map(|o|o.iter().filter_map(|(k,v)|Some((k.as_str(),v.as_str()?))).collect::<Vec<_>>()).unwrap_or_default();
             // 脚本未指定 UA 时与 Surge 一致，带上模块下载同款 UA（部分站点只放行 Surge / Loon / Clash 系）。
             if !headers.iter().any(|(k,_)|k.eq_ignore_ascii_case("user-agent")){headers.push(("User-Agent",crate::modules::MODULE_USER_AGENT));}
-            let body=match &options["body"]{Value::String(s)=>s.as_bytes().to_vec(),Value::Null=>vec![],v=>v.to_string().into_bytes()};
+            let body = if let Some(b64) = options["body_base64"].as_str() {
+                use base64::Engine as _;
+                base64::engine::general_purpose::STANDARD
+                    .decode(b64)
+                    .map_err(|e| format!("invalid script HTTP binary body: {e}"))?
+            } else {
+                match &options["body"] {
+                    Value::String(s) => s.as_bytes().to_vec(),
+                    Value::Null => vec![],
+                    v => v.to_string().into_bytes(),
+                }
+            };
             let mut selected=outbound.clone();
             if let Some(routing)=&routing {
                 let parsed=url::Url::parse(url).map_err(|e|e.to_string())?;let host=parsed.host_str().ok_or("HTTP host missing")?;let port=parsed.port_or_known_default().unwrap_or(443);let target=oryn_config::TargetAddr::from_host(host,port);
-                let index=if let Some(policy)=options["policy"].as_str(){routing.outbounds.iter().position(|o|o.tag()==policy).ok_or("unknown script policy")?}else{
+                let policy_name = options["policy"].as_str().or_else(|| options["node"].as_str()).map(str::trim).filter(|s| !s.is_empty());
+                let index=if let Some(policy)=policy_name{routing.outbounds.iter().position(|o|o.tag()==policy).ok_or("unknown script policy")?}else{
                     let mut flow=oryn_router::FlowContext::new(0,oryn_router::Network::Tcp,"127.0.0.1:0".parse().unwrap(),std::net::SocketAddr::from(([0,0,0,0],port)));flow.set_domain(host.into(),oryn_router::DomainSource::Sniffed);
                     if routing.router.needs_ip_resolution(&flow){if let Some(dns)=&dns{if let Ok(Ok(ips))=handle.block_on(tokio::time::timeout(deadline.saturating_duration_since(std::time::Instant::now()),dns.resolve_direct_target(host))){if let Some(ip)=ips.first(){flow.destination.set_ip(*ip);}}}}
                     routing.router.route(&flow).outbound
                 };
                 selected=oryn_outbound::resolve(&routing.outbounds[index],&oryn_outbound::PickMeta{source:None,target:&target,network:oryn_router::Network::Tcp}).ok_or("script HTTP route rejected")?.leaf;
             }
+            let max_redirects = if options["auto-redirect"].as_bool() == Some(false) { 0 } else { 8 };
             let req=oryn_http::Request{method:options["method"].as_str().unwrap_or("GET"),url,headers:&headers,body:&body};
-            let response=handle.block_on(oryn_http::fetch(&oryn_http::OutboundConnector(selected),req,&oryn_http::Options{max_body:host_max_body,timeout:deadline.saturating_duration_since(std::time::Instant::now()).min(Duration::from_secs(30)),max_redirects:3,skip_verify:false})).map_err(|e|e.to_string())?;
+            let response=handle.block_on(oryn_http::fetch(&oryn_http::OutboundConnector(selected),req,&oryn_http::Options{max_body:host_max_body,timeout:deadline.saturating_duration_since(std::time::Instant::now()).min(Duration::from_secs(30)),max_redirects,skip_verify:false})).map_err(|e|e.to_string())?;
             let binary=options["binary-mode"].as_bool()==Some(true);
             let body=if binary{
                 BodyData::Binary(response.body)
@@ -327,11 +340,10 @@ impl ScriptHost {
         let has_new_body = !matches!(returned_body, BodyData::None);
         let mut m = if local {
             result = result["response"].clone();
-            request.response(
-                result["status"].as_u64().unwrap_or(200) as u16,
-                vec![],
-                "text/plain",
-            )
+            let status = parse_status_code(&result["status"])
+                .or_else(|| parse_status_code(&result["statusCode"]))
+                .unwrap_or(200);
+            request.response(status, vec![], "text/plain")
         } else {
             let meta = response.as_deref().unwrap_or(request);
             Message {
@@ -346,13 +358,20 @@ impl ScriptHost {
         if let Some(url) = &new_url {
             m.url = url.clone();
         }
-        if let Some(status) = result["status"].as_u64() {
-            m.status = Some(u16::try_from(status).map_err(io::Error::other)?);
+        if let Some(status) = parse_status_code(&result["status"])
+            .or_else(|| parse_status_code(&result["statusCode"]))
+        {
+            m.status = Some(status);
         }
         if let Some(headers) = result["headers"].as_object() {
             m.headers = headers
                 .iter()
-                .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_owned())))
+                .filter_map(|(k, v)| match v {
+                    Value::String(s) => Some((k.clone(), s.clone())),
+                    Value::Number(n) => Some((k.clone(), n.to_string())),
+                    Value::Bool(b) => Some((k.clone(), b.to_string())),
+                    _ => None,
+                })
                 .collect();
         }
         if let Some(headers) = result["headers"].as_array() {
@@ -459,6 +478,24 @@ impl ScriptHost {
             .map(|resolved| resolved.leaf)
             .ok_or_else(|| io::Error::other(format!("script policy {policy} rejected the connection")))
     }
+}
+
+/// 解析脚本返回的 HTTP 状态码：支持数字（`200`）、数字串（`"404"`）和状态行（`"HTTP/1.1 404 Not Found"`）。
+fn parse_status_code(value: &Value) -> Option<u16> {
+    if let Some(n) = value.as_u64() {
+        return u16::try_from(n).ok().filter(|n| (100..=999).contains(n));
+    }
+    let s = value.as_str()?.trim();
+    if let Ok(n) = s.parse::<u16>() {
+        return (100..=999).contains(&n).then_some(n);
+    }
+    let mut parts = s.split_whitespace();
+    let first = parts.next()?;
+    if first.len() >= 5 && first[..5].eq_ignore_ascii_case("HTTP/") {
+        let code = parts.next()?.parse::<u16>().ok()?;
+        return (100..=999).contains(&code).then_some(code);
+    }
+    None
 }
 
 fn body_for_script(message: &Message, max_size: usize, binary: bool) -> io::Result<BodyData> {
@@ -730,5 +767,15 @@ mod tests {
             .expect("http script must not be blocked by busy bg pool");
         assert!(done.body_modified);
         assert_eq!(resp.body, br#"{"ok":true}"#);
+    }
+
+    #[test]
+    fn parses_status_line_strings_and_status_code_field() {
+        assert_eq!(parse_status_code(&json!(200)), Some(200));
+        assert_eq!(parse_status_code(&json!("404")), Some(404));
+        assert_eq!(parse_status_code(&json!("HTTP/1.1 404 Not Found")), Some(404));
+        assert_eq!(parse_status_code(&json!("HTTP/2 204")), Some(204));
+        assert_eq!(parse_status_code(&json!("invalid")), None);
+        assert_eq!(parse_status_code(&json!(99)), None);
     }
 }

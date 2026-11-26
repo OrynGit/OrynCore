@@ -131,6 +131,130 @@ fn rc_unwrap_or_clone<T: Clone>(a: Rc<T>) -> T {
 }
 
 impl Val {
+    fn map_index_with<'a, I: Iterator<Item = ValX<'a>>>(
+        mut self,
+        index: &Self,
+        opt: path::Opt,
+        inner: bool,
+        f: impl Fn(Self) -> I,
+    ) -> ValX<'a> {
+        // 避免 `null | .[100000000] = 1` 在受限扩展进程中分配超大稀疏数组。
+        const MAX_AUTO_ARRAY_INDEX: usize = 4096;
+        if let (Val::BStr(_) | Val::TStr(_) | Val::Arr(_), Val::Obj(o)) = (&self, index) {
+            use jaq_core::ValT;
+            let range = o.get(&Val::utf8_str("start"))..o.get(&Val::utf8_str("end"));
+            return self.map_range(range, opt, f);
+        };
+        let should_write = |y: &Val| !inner || !matches!(y, Val::Null);
+        match self {
+            Val::Obj(ref mut o) => {
+                use indexmap::map::Entry::{Occupied, Vacant};
+                match Rc::make_mut(o).entry(index.clone()) {
+                    Occupied(mut e) => {
+                        let v = core::mem::take(e.get_mut());
+                        match f(v).next().transpose()? {
+                            Some(y) => {
+                                e.insert(y);
+                            }
+                            // this runs in constant time, at the price of
+                            // changing the order of the elements
+                            None => {
+                                e.swap_remove();
+                            }
+                        };
+                    }
+                    Vacant(e) => {
+                        if let Some(y) = f(Val::Null).next().transpose()? {
+                            if should_write(&y) {
+                                e.insert(y);
+                            }
+                        }
+                    }
+                }
+                Ok(self)
+            }
+            Val::Arr(ref mut a) => {
+                let oob = || Error::str(format_args!("index {index} out of bounds"));
+                let pos = match index.as_pos_usize() {
+                    Ok(p) => p,
+                    Err(e) => return opt.fail(self, |_| Exn::from(e)),
+                };
+                if let Some(i) = abs_index(pos, a.len()) {
+                    let a = Rc::make_mut(a);
+                    let x = core::mem::take(&mut a[i]);
+                    if let Some(y) = f(x).next().transpose()? {
+                        a[i] = y;
+                    } else {
+                        a.remove(i);
+                    }
+                    return Ok(self);
+                }
+                if pos.0 {
+                    let i = pos.1;
+                    if let Some(y) = f(Val::Null).next().transpose()? {
+                        if should_write(&y) {
+                            if i > MAX_AUTO_ARRAY_INDEX {
+                                return opt.fail(self, |_| Exn::from(oob()));
+                            }
+                            let a = Rc::make_mut(a);
+                            let grow = i.saturating_sub(a.len()).saturating_add(1);
+                            jaq_core::oryn_budget::charge(grow.saturating_mul(16));
+                            a.resize(i, Val::Null);
+                            a.push(y);
+                        }
+                    }
+                    Ok(self)
+                } else {
+                    if let Some(y) = f(Val::Null).next().transpose()? {
+                        if should_write(&y) {
+                            return opt.fail(self, |_| Exn::from(oob()));
+                        }
+                    }
+                    Ok(self)
+                }
+            }
+            Val::Null => {
+                if matches!(index, Val::TStr(_) | Val::BStr(_)) {
+                    if let Some(y) = f(Val::Null).next().transpose()? {
+                        if should_write(&y) {
+                            let mut m = Map::default();
+                            m.insert(index.clone(), y);
+                            return Ok(Self::obj(m));
+                        }
+                    }
+                    return Ok(Val::Null);
+                }
+                if let Ok(pos) = index.as_pos_usize() {
+                    let oob = || Error::str(format_args!("index {index} out of bounds"));
+                    if pos.0 {
+                        let i = pos.1;
+                        if let Some(y) = f(Val::Null).next().transpose()? {
+                            if should_write(&y) {
+                                if i > MAX_AUTO_ARRAY_INDEX {
+                                    return opt.fail(self, |_| Exn::from(oob()));
+                                }
+                                jaq_core::oryn_budget::charge(i.saturating_add(1).saturating_mul(16));
+                                let mut arr = alloc::vec![Val::Null; i];
+                                arr.push(y);
+                                return Ok(Val::Arr(Rc::new(arr)));
+                            }
+                        }
+                        return Ok(Val::Null);
+                    } else {
+                        if let Some(y) = f(Val::Null).next().transpose()? {
+                            if should_write(&y) {
+                                return opt.fail(self, |_| Exn::from(oob()));
+                            }
+                        }
+                        return Ok(Val::Null);
+                    }
+                }
+                opt.fail(self, |v| Exn::from(Error::typ(v, Type::Iter.as_str())))
+            }
+            _ => opt.fail(self, |v| Exn::from(Error::typ(v, Type::Iter.as_str()))),
+        }
+    }
+
     fn oryn_size_bounded(&self, limit: usize) -> usize {
         match self {
             Self::BStr(s) | Self::TStr(s) => s.len(),
@@ -237,55 +361,21 @@ impl jaq_core::ValT for Val {
     }
 
     fn map_index<'a, I: Iterator<Item = ValX<'a>>>(
-        mut self,
+        self,
         index: &Self,
         opt: path::Opt,
         f: impl Fn(Self) -> I,
     ) -> ValX<'a> {
-        if let (Val::BStr(_) | Val::TStr(_) | Val::Arr(_), Val::Obj(o)) = (&self, index) {
-            let range = o.get(&Val::utf8_str("start"))..o.get(&Val::utf8_str("end"));
-            return self.map_range(range, opt, f);
-        };
-        match self {
-            Val::Obj(ref mut o) => {
-                use indexmap::map::Entry::{Occupied, Vacant};
-                match Rc::make_mut(o).entry(index.clone()) {
-                    Occupied(mut e) => {
-                        let v = core::mem::take(e.get_mut());
-                        match f(v).next().transpose()? {
-                            Some(y) => e.insert(y),
-                            // this runs in constant time, at the price of
-                            // changing the order of the elements
-                            None => e.swap_remove(),
-                        };
-                    }
-                    Vacant(e) => {
-                        if let Some(y) = f(Val::Null).next().transpose()? {
-                            e.insert(y);
-                        }
-                    }
-                }
-                Ok(self)
-            }
-            Val::Arr(ref mut a) => {
-                let oob = || Error::str(format_args!("index {index} out of bounds"));
-                let abs_or = |i| abs_index(i, a.len()).ok_or_else(oob);
-                let i = match index.as_pos_usize().and_then(abs_or) {
-                    Ok(i) => i,
-                    Err(e) => return opt.fail(self, |_| Exn::from(e)),
-                };
+        self.map_index_with(index, opt, false, f)
+    }
 
-                let a = Rc::make_mut(a);
-                let x = core::mem::take(&mut a[i]);
-                if let Some(y) = f(x).next().transpose()? {
-                    a[i] = y;
-                } else {
-                    a.remove(i);
-                }
-                Ok(self)
-            }
-            _ => opt.fail(self, |v| Exn::from(Error::typ(v, Type::Iter.as_str()))),
-        }
+    fn map_index_inner<'a, I: Iterator<Item = ValX<'a>>>(
+        self,
+        index: &Self,
+        opt: path::Opt,
+        f: impl Fn(Self) -> I,
+    ) -> ValX<'a> {
+        self.map_index_with(index, opt, true, f)
     }
 
     fn map_range<'a, I: Iterator<Item = ValX<'a>>>(

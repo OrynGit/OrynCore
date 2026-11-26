@@ -286,7 +286,8 @@ pub(crate) async fn prepare_for_startup(ctx: &Rc<EngineCtx>, config: RuntimeConf
 
 /// 启动后在后台联网准备模块并发布。`modules` 是离线准备之前的模块列表：
 /// 离线时没有缓存的模块已被禁用，不能拿已发布的 base_config 去刷新。
-/// 期间若有其他重载（切换配置、代理集合更新）发布了新配置，它们自己会联网准备，这里放弃。
+/// 期间若有完整配置重载（`config_generation` 递增）则放弃；若仅发生了代理集合等
+/// 局部更新（`PartialUpdate`），则把最新准备好的模块合并到当前 `base_config` 上发布。
 pub(crate) fn refresh_deferred(ctx: &Rc<EngineCtx>, modules: Vec<oryn_config::ModuleSpec>) {
     if ctx.reload_compiling.get()
         || ctx.pending_reload.borrow().as_ref().is_some_and(|t| !t.is_finished())
@@ -294,15 +295,29 @@ pub(crate) fn refresh_deferred(ctx: &Rc<EngineCtx>, modules: Vec<oryn_config::Mo
         return;
     }
     let state = ctx.state();
+    let generation = ctx.config_generation.get();
     let c = ctx.clone();
     *ctx.pending_reload.borrow_mut() = Some(tokio::task::spawn_local(async move {
         let mut base = state.base_config.clone();
         base.modules = modules;
         let prepared = prepare_for_apply(&c, base).await;
+        if c.config_generation.get() != generation {
+            return;
+        }
         if Rc::ptr_eq(&state, &c.state()) {
             c.apply_prepared(prepared);
-            log::info!("modules refreshed after startup");
+        } else {
+            let (ready_cfg, plans) = prepared.into_parts();
+            let mut merged = c.state().base_config.clone();
+            merged.modules = ready_cfg.modules;
+            merged.warnings.extend(ready_cfg.warnings);
+            c.apply_prepared_partial(PreparedConfig {
+                config: merged,
+                plans,
+                deferred: false,
+            });
         }
+        log::info!("modules refreshed after startup");
     }));
 }
 
@@ -623,6 +638,18 @@ async fn resource(
         format!("0.0.0.0:{port}").parse().unwrap(),
     );
     flow.set_domain(host.into(), DomainSource::Sniffed);
+    if state.router().needs_ip_resolution(&flow) {
+        if let Ok(Ok(ips)) = tokio::time::timeout(
+            Duration::from_secs(5),
+            ctx.dns.resolve_direct_target(host),
+        )
+        .await
+        {
+            if let Some(ip) = ips.first() {
+                flow.destination.set_ip(*ip);
+            }
+        }
+    }
     let route = state.router().route(&flow);
     let out = resolve(
         &state.routing.outbounds[route.outbound],
@@ -636,7 +663,7 @@ async fn resource(
     let options = Options {
         max_body: max,
         timeout: Duration::from_secs(15),
-        max_redirects: 3,
+        max_redirects: 8,
         ..Default::default()
     };
     let request = Request {
@@ -713,12 +740,26 @@ pub(crate) fn refresh(ctx: &Rc<EngineCtx>, state: Rc<crate::context::RuntimeStat
         return;
     }
     let base = state.base_config.clone();
+    let generation = ctx.config_generation.get();
     let c = ctx.clone();
     *ctx.pending_reload.borrow_mut() = Some(tokio::task::spawn_local(async move {
         let prepared = prepare_for_apply(&c, base).await;
-        // prepare 的下载 await 期间可能已发布新配置，不能用旧 base_config 覆盖。
+        // prepare 的下载 await 期间若有完整重载，不能用旧 base_config 覆盖。
+        if c.config_generation.get() != generation {
+            return;
+        }
         if Rc::ptr_eq(&state, &c.state()) {
             c.apply_prepared(prepared);
+        } else {
+            let (ready_cfg, plans) = prepared.into_parts();
+            let mut merged = c.state().base_config.clone();
+            merged.modules = ready_cfg.modules;
+            merged.warnings.extend(ready_cfg.warnings);
+            c.apply_prepared_partial(PreparedConfig {
+                config: merged,
+                plans,
+                deferred: false,
+            });
         }
     }));
 }

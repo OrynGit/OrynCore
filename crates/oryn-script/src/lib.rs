@@ -182,7 +182,7 @@ fn body_to_js<'js>(ctx: &rquickjs::Ctx<'js>, body: BodyData) -> rquickjs::Result
 }
 
 fn extract_body<'js>(val: rquickjs::Value<'js>, max_body: usize) -> rquickjs::Result<BodyData> {
-    if val.is_undefined() {
+    if val.is_undefined() || val.is_null() {
         return Ok(BodyData::None);
     }
     if let Some(s) = val.as_string() {
@@ -379,6 +379,13 @@ pub fn run(
                     .map_err(|e| e.to_string())?,
             )
             .map_err(|e| e.to_string())?;
+        ctx.globals()
+            .set(
+                "__gzip",
+                rquickjs::Function::new(ctx.clone(), move |ctx, data| gzip_bytes(ctx, data, max_body))
+                    .map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
         let max_b64 = max_body.saturating_mul(2);
         ctx.globals()
             .set(
@@ -387,6 +394,13 @@ pub fn run(
                     base64_text(text, encode, max_b64)
                 })
                 .map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
+        ctx.globals()
+            .set(
+                "__b64_bytes",
+                rquickjs::Function::new(ctx.clone(), move |data| base64_bytes(data, max_body))
+                    .map_err(|e| e.to_string())?,
             )
             .map_err(|e| e.to_string())?;
 
@@ -631,6 +645,34 @@ fn ungzip<'js>(
         return Err(conversion_error());
     }
     rquickjs::TypedArray::new(ctx, out)
+}
+
+fn gzip_bytes<'js>(
+    ctx: rquickjs::Ctx<'js>,
+    data: rquickjs::TypedArray<'js, u8>,
+    max_body: usize,
+) -> rquickjs::Result<rquickjs::TypedArray<'js, u8>> {
+    use std::io::Write;
+    let bytes = unsafe { data.as_bytes() }.ok_or_else(conversion_error)?;
+    if bytes.len() > max_body {
+        return Err(conversion_error());
+    }
+    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    enc.write_all(bytes).map_err(|_| conversion_error())?;
+    let out = enc.finish().map_err(|_| conversion_error())?;
+    if out.len() > max_body {
+        return Err(conversion_error());
+    }
+    rquickjs::TypedArray::new(ctx, out)
+}
+
+fn base64_bytes(data: rquickjs::TypedArray<'_, u8>, max_body: usize) -> rquickjs::Result<String> {
+    use base64::Engine as _;
+    let bytes = unsafe { data.as_bytes() }.ok_or_else(conversion_error)?;
+    if bytes.len() > max_body {
+        return Err(conversion_error());
+    }
+    Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
 }
 
 fn base64_text(text: String, encode: bool, max_chars: usize) -> rquickjs::Result<String> {
@@ -945,6 +987,72 @@ mod tests {
         std::thread::sleep(Duration::from_millis(20));
         epoch.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         assert!(worker.join().unwrap().is_err());
+    }
+
+    #[test]
+    fn compat_globals_url_bodybytes_statuscode_and_gzip() {
+        // 1. Surge 请求脚本不应在 globalThis 挂载 $loon / $response / $argument
+        let mut req_input = input();
+        req_input.kind = "http-request".into();
+        req_input.loon = false;
+        req_input.response = Value::Null;
+        req_input.response_body = BodyData::None;
+        req_input.argument = Value::Null;
+        let out = run(
+            r#"
+            if ('$loon' in globalThis) throw Error('polluted $loon');
+            if ('$response' in globalThis) throw Error('polluted $response');
+            if ('$argument' in globalThis) throw Error('polluted $argument');
+            if (typeof $script.startTime !== 'number' || $script.startTime <= 0) throw Error('bad startTime');
+            if (!$environment['surge-version'] || !$environment.system) throw Error('bad env');
+            console.info('info');
+            console.debug('debug');
+            const u = new URL('https://api.example.com:443/v1/feed?a=1&b=two');
+            if (u.host !== 'api.example.com' || u.searchParams.get('b') !== 'two') throw Error('bad URL');
+            u.searchParams.set('c', '3');
+            u.searchParams.delete('a');
+            if (u.href !== 'https://api.example.com/v1/feed?b=two&c=3') throw Error('bad mutated URL: ' + u.href);
+            const rel = new URL('/v2/ok?x=1', u);
+            if (rel.href !== 'https://api.example.com/v2/ok?x=1') throw Error('bad relative URL');
+            const gz = $utils.gzip(new TextEncoder().encode('hello-oryn'));
+            const dec = new TextDecoder().decode($utils.ungzip(gz));
+            if (dec !== 'hello-oryn') throw Error('bad gzip roundtrip');
+            $done({url: u.href, body: null});
+            "#,
+            req_input,
+            |_| unreachable!(),
+        )
+        .unwrap();
+        assert_eq!(out.result["url"], "https://api.example.com/v1/feed?b=two&c=3");
+        assert_eq!(out.body, BodyData::None);
+
+        // 2. 二进制 bodyBytes + statusCode + 二进制 $httpClient POST
+        let mut bin_input = input();
+        bin_input.binary = true;
+        bin_input.response_body = BodyData::Binary(vec![1, 2, 3]);
+        let out = run(
+            r#"
+            if ($response.statusCode !== 200) throw Error('bad statusCode');
+            if (!($response.bodyBytes instanceof Uint8Array) || $response.bodyBytes[1] !== 2) throw Error('bad bodyBytes');
+            $httpClient.post({url: 'https://fixture.test/bin', 'binary-mode': true, bodyBytes: new Uint8Array([9, 8])}, (err, resp, data) => {
+                if (resp.statusCode !== 201 || !(resp.bodyBytes instanceof Uint8Array)) throw Error('bad httpClient binary');
+                $done({bodyBytes: new Uint8Array([7, 6, 5])});
+            });
+            "#,
+            bin_input,
+            |opts| {
+                assert_eq!(opts["body_base64"], "CQg=");
+                Ok(HostReply::Http(HttpReply {
+                    status: 201,
+                    headers: BTreeMap::new(),
+                    body: BodyData::Binary(vec![0xaa, 0xbb]),
+                    binary: true,
+                }))
+            },
+        )
+        .unwrap();
+        assert_eq!(out.body, BodyData::Binary(vec![7, 6, 5]));
+        assert!(out.result.get("bodyBytes").is_none());
     }
 }
 
