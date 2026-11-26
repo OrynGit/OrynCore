@@ -37,6 +37,19 @@ pub async fn transport_with(
     url: &url::Url,
     cert: Option<&str>,
 ) -> io::Result<BoxStream> {
+    transport_derp(dialer, url, cert, false, &[]).await
+}
+
+/// 连接 DERP 节点：`insecure` 对应 DERPMap 里的 `InsecureForTests`（非 127.0.0.1 走 HTTPS
+/// 时跳过证书链校验，仅校验握手签名）；`fallback_ips` 用于 `HostName` 仅作 SNI/无 DNS 解析时
+/// 回退直连 DERPMap 给出的 `IPv4` / `IPv6`（OrynCore#43）。
+pub async fn transport_derp(
+    dialer: &dyn Dialer,
+    url: &url::Url,
+    cert: Option<&str>,
+    insecure: bool,
+    fallback_ips: &[std::net::IpAddr],
+) -> io::Result<BoxStream> {
     if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
         return Err(err("Tailscale URL contains credentials or fragment"));
     }
@@ -46,12 +59,28 @@ pub async fn transport_with(
     let port = url
         .port_or_known_default()
         .ok_or_else(|| err("invalid Tailscale server port"))?;
-    let target = host
+    let host_unbracketed = host.trim_start_matches('[').trim_end_matches(']');
+    let target = host_unbracketed
         .parse()
         .map(|ip| TargetAddr::Ip(std::net::SocketAddr::new(ip, port)))
-        .unwrap_or_else(|_| TargetAddr::Domain(host.into(), port));
-    let stream = dialer.dial_tcp(&target).await?;
-    if url.scheme() == "http" && host == "127.0.0.1" {
+        .unwrap_or_else(|_| TargetAddr::Domain(host_unbracketed.into(), port));
+    let stream = match dialer.dial_tcp(&target).await {
+        Ok(stream) => stream,
+        Err(first_err) => {
+            let mut connected = None;
+            for ip in fallback_ips {
+                if let Ok(stream) = dialer
+                    .dial_tcp(&TargetAddr::Ip(std::net::SocketAddr::new(*ip, port)))
+                    .await
+                {
+                    connected = Some(stream);
+                    break;
+                }
+            }
+            connected.ok_or(first_err)?
+        }
+    };
+    if url.scheme() == "http" && host_unbracketed == "127.0.0.1" {
         return Ok(stream);
     }
     if url.scheme() != "https" {
@@ -63,11 +92,11 @@ pub async fn transport_with(
     };
     let name = match cert {
         Some(c) if pinned.is_none() => c,
-        _ => host,
+        _ => host_unbracketed,
     };
     let spec = TlsSpec {
         sni: Some(name.into()),
-        skip_cert_verify: pinned.is_some(),
+        skip_cert_verify: insecure || pinned.is_some(),
         alpn: vec!["http/1.1".into()],
         fingerprint: pinned,
         client_fingerprint: None,
@@ -439,5 +468,101 @@ mod os_and_cert_tests {
         assert_eq!(hash[31], 0xb2);
         assert!(cert_hash("abcd").is_err());
         assert!(cert_hash(&"zz".repeat(32)).is_err());
+    }
+
+    #[tokio::test]
+    async fn derp_tls_supports_sha256_raw_insecure_for_tests_and_ip_fallback() {
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+        use tokio::net::TcpListener;
+
+        struct LoopbackDialer(std::net::SocketAddr);
+        #[async_trait::async_trait]
+        impl Dialer for LoopbackDialer {
+            async fn dial_tcp(&self, target: &TargetAddr) -> io::Result<BoxStream> {
+                match target {
+                    TargetAddr::Ip(addr) if *addr == self.0 => {
+                        let s = tokio::net::TcpStream::connect(self.0).await?;
+                        Ok(Box::new(s))
+                    }
+                    TargetAddr::Domain(host, _) if host == "derp-999.invalid" => {
+                        Err(io::Error::new(io::ErrorKind::NotFound, "no dns"))
+                    }
+                    _ => Err(io::Error::new(io::ErrorKind::ConnectionRefused, "unexpected target")),
+                }
+            }
+        }
+
+        let cert = rcgen::generate_simple_self_signed(vec!["wrong.internal".into()]).unwrap();
+        let cert_der = CertificateDer::from(cert.cert.der().to_vec());
+        let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
+        let digest = ring::digest::digest(&ring::digest::SHA256, cert_der.as_ref());
+        let sha256_pin = format!(
+            "sha256-raw:{}",
+            digest
+                .as_ref()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        );
+
+        let tls_cfg = Arc::new(
+            rustls::ServerConfig::builder_with_provider(oryn_tls::provider())
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(vec![cert_der], key_der)
+                .unwrap(),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let acceptor = tokio_rustls::TlsAcceptor::from(tls_cfg);
+            while let Ok((stream, _)) = listener.accept().await {
+                let acc = acceptor.clone();
+                tokio::spawn(async move {
+                    if let Ok(mut tls) = acc.accept(stream).await {
+                        let mut buf = [0u8; 4];
+                        if tls.read_exact(&mut buf).await.is_ok() {
+                            let _ = tls.write_all(&buf).await;
+                        }
+                    }
+                });
+            }
+        });
+
+        let dialer = LoopbackDialer(addr);
+        let direct_url: url::Url = format!("https://127.0.0.1:{}/derp", addr.port()).parse().unwrap();
+        let named_url: url::Url = format!("https://derp-999.invalid:{}/derp", addr.port())
+            .parse()
+            .unwrap();
+        let fallback = [addr.ip()];
+
+        // 默认不跳过校验且无 pin：拒绝自签证书
+        assert!(transport_derp(&dialer, &direct_url, None, false, &[]).await.is_err());
+
+        // Err 固定哈希拒绝；正确 sha256-raw:<hex> 与 HostName 不可解析时 IPv4 回退均成功
+        let bad_pin = format!("sha256-raw:{}", "00".repeat(32));
+        assert!(transport_derp(&dialer, &direct_url, Some(&bad_pin), false, &[]).await.is_err());
+
+        let mut s = transport_derp(&dialer, &named_url, Some(&sha256_pin), false, &fallback)
+            .await
+            .expect("sha256-raw self-signed DERP with IP fallback must succeed");
+        s.write_all(b"ping").await.unwrap();
+        let mut echo = [0u8; 4];
+        s.read_exact(&mut echo).await.unwrap();
+        assert_eq!(&echo, b"ping");
+
+        // 非 127.0.0.1 节点开启 InsecureForTests (insecure = true) 通过自签 TLS
+        let mut s2 = transport_derp(&dialer, &named_url, None, true, &fallback)
+            .await
+            .expect("InsecureForTests HTTPS DERP must succeed");
+        s2.write_all(b"pong").await.unwrap();
+        s2.read_exact(&mut echo).await.unwrap();
+        assert_eq!(&echo, b"pong");
+
+        // 同时传错 pin + insecure=true 仍须被 PinnedVerifier 拒绝
+        assert!(transport_derp(&dialer, &direct_url, Some(&bad_pin), true, &[]).await.is_err());
+
+        server_task.abort();
     }
 }
