@@ -637,7 +637,7 @@ impl Peer {
 
     /// 丢掉会话与进行中的握手，下次发送时重新握手。
     fn reset(&mut self, private_key: [u8; 32], keepalive_secs: u16) {
-        let keepalive_secs = self.keepalive.unwrap_or(keepalive_secs);
+        let keepalive_secs = self.effective_keepalive(keepalive_secs);
         self.tunn = new_tunn(
             private_key,
             self.public_key,
@@ -647,6 +647,10 @@ impl Peer {
         );
         self.handshake = None;
         self.queued.clear();
+    }
+
+    fn effective_keepalive(&self, interface_keepalive_secs: u16) -> u16 {
+        self.keepalive.unwrap_or(interface_keepalive_secs)
     }
 
     fn has_session(&self) -> bool {
@@ -1015,7 +1019,11 @@ impl Engine {
                     // 可能已失效的密钥，要等计时器兜底才恢复。没有流的对端不探测，下次使用时再握手。
                     match self.peers[i].tunn.time_since_last_handshake() {
                         Some(age) if age >= REKEY_AFTER && has_flows => self.probe(i),
-                        Some(age) if age < REKEY_AFTER && self.spec.keepalive_secs > 0 => {
+                        Some(age)
+                            if age < REKEY_AFTER
+                                && self.peers[i].effective_keepalive(self.spec.keepalive_secs)
+                                    > 0 =>
+                        {
                             if let TunnResult::WriteToNetwork(out) =
                                 self.peers[i].tunn.encapsulate(&[], &mut self.scratch)
                             {
@@ -1767,9 +1775,13 @@ impl Engine {
             .iface
             .poll_delay(now_smol(), &self.sockets)
             .map(|d| Duration::from_micros(d.total_micros()));
-        let keepalive = self.spec.keepalive_secs > 0
-            && !self.asleep
-            && self.peers.iter().any(|p| !p.dormant && p.has_session());
+        // 逐对端 keepalive（如 Tailscale 仅对有直连端点的对端开 25 s 保活）同样需要驱动空闲定时器（OrynCore#43）。
+        let keepalive = !self.asleep
+            && self.peers.iter().any(|p| {
+                !p.dormant
+                    && p.has_session()
+                    && p.effective_keepalive(self.spec.keepalive_secs) > 0
+            });
         let handshaking = self.peers.iter().any(|p| p.handshake.is_some());
         if !self.tcp.is_empty() || handshaking || keepalive {
             wait = Some(wait.map_or(TICK, |w| w.min(TICK)));

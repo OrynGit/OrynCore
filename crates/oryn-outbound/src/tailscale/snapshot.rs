@@ -68,6 +68,10 @@ pub struct Snapshot {
     pub region_nodes: BTreeMap<u16, Vec<url::Url>>,
     /// DERP 节点的 `CertName`：证书期望名称，或 `sha256-raw:<hex>` 固定自签证书（自建 derper）。
     pub derp_certs: BTreeMap<url::Url, String>,
+    /// 声明 `InsecureForTests: true` 的 DERP 节点（含非 127.0.0.1 自建测试/内网节点）。
+    pub derp_insecure: std::collections::BTreeSet<url::Url>,
+    /// DERPMap 给出的显式节点 IP（当 `HostName` 无 DNS 或作 SNI 虚拟名时作为拨号回退）。
+    pub derp_ips: BTreeMap<url::Url, Vec<IpAddr>>,
     pub dns_resolvers: Vec<std::net::SocketAddr>,
     pub dns_routes: BTreeMap<String, Vec<std::net::SocketAddr>>,
     pub dns_fallback: Vec<std::net::SocketAddr>,
@@ -419,6 +423,8 @@ impl Snapshot {
         BTreeMap<u16, url::Url>,
         BTreeMap<u16, Vec<url::Url>>,
         BTreeMap<url::Url, String>,
+        std::collections::BTreeSet<url::Url>,
+        BTreeMap<url::Url, Vec<IpAddr>>,
         Option<i64>,
         bool,
     ) {
@@ -437,6 +443,8 @@ impl Snapshot {
             self.regions.clone(),
             self.region_nodes.clone(),
             self.derp_certs.clone(),
+            self.derp_insecure.clone(),
+            self.derp_ips.clone(),
             self.expiry,
             self.authorized,
         )
@@ -604,6 +612,8 @@ impl Snapshot {
         self.regions.clear();
         self.region_nodes.clear();
         self.derp_certs.clear();
+        self.derp_insecure.clear();
+        self.derp_ips.clear();
         let own_name = name(&self.own)?;
         if !own_name.is_empty() {
             self.records.insert(own_name, self.own_ips.clone());
@@ -740,10 +750,10 @@ impl Snapshot {
                         if host.is_empty() || host.len() > 253 || port > 65535 {
                             return Err(err("invalid DERP server"));
                         }
-                        // 明文 DERP 仅限本机协议对端；控制服务仍经过 TS2021 身份握手。
-                        let scheme = if host == "127.0.0.1"
-                            && node["InsecureForTests"].as_bool() == Some(true)
-                        {
+                        let insecure = node["InsecureForTests"].as_bool() == Some(true);
+                        // 本机 loopback 测试对端允许明文；非 127.0.0.1 节点走 HTTPS 并记录 InsecureForTests，
+                        // 与官方 derphttp_client 一致（OrynCore#43）。
+                        let scheme = if host == "127.0.0.1" && insecure {
                             "http"
                         } else {
                             "https"
@@ -751,11 +761,25 @@ impl Snapshot {
                         let url: url::Url = format!("{scheme}://{host}:{port}/derp")
                             .parse()
                             .map_err(io::Error::other)?;
+                        if insecure {
+                            self.derp_insecure.insert(url.clone());
+                        }
                         if let Some(cert) = node["CertName"].as_str().filter(|c| !c.is_empty()) {
                             if cert.len() > 253 + 11 {
                                 return Err(err("invalid DERP certificate name"));
                             }
                             self.derp_certs.insert(url.clone(), cert.to_string());
+                        }
+                        let host_ip = host.parse::<IpAddr>().ok();
+                        let fallback_ips: Vec<IpAddr> = ["IPv4", "IPv6"]
+                            .iter()
+                            .filter_map(|k| node[*k].as_str())
+                            .filter(|v| !v.is_empty() && *v != "none")
+                            .filter_map(|v| v.parse::<IpAddr>().ok())
+                            .filter(|ip| Some(*ip) != host_ip)
+                            .collect();
+                        if !fallback_ips.is_empty() {
+                            self.derp_ips.insert(url.clone(), fallback_ips);
                         }
                         urls.push(url);
                     }
@@ -1068,5 +1092,20 @@ mod tests {
         let wire = |i: usize| super::super::derp::wire_peer(&s.peers[i], i, false, false);
         assert_eq!(wire(0).keepalive_secs, Some(25));
         assert_eq!(wire(1).keepalive_secs, None);
+
+        // 非 127.0.0.1 节点开启 InsecureForTests 与 IPv4/IPv6 回退应被记录且变更时触发硬切换（OrynCore#43）
+        let gen2 = s.generation;
+        s.apply(json!({"DERPMap": {"Regions": {"999": {"Nodes": [
+            {"HostName": "derp-999", "IPv4": "172.18.0.9", "IPv6": "none", "DERPPort": 8443, "InsecureForTests": true}
+        ]}}}}))
+        .unwrap();
+        assert_eq!(s.generation, gen2 + 1);
+        let derp_999 = &s.region_nodes[&999][0];
+        assert_eq!(derp_999.as_str(), "https://derp-999:8443/derp");
+        assert!(s.derp_insecure.contains(derp_999));
+        assert_eq!(
+            s.derp_ips[derp_999],
+            vec!["172.18.0.9".parse::<IpAddr>().unwrap()]
+        );
     }
 }

@@ -13,7 +13,7 @@ use oryn_udp::DatagramFactory;
 use std::{
     collections::BTreeMap,
     io,
-    net::{Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
 };
 use tokio::{
@@ -59,10 +59,12 @@ async fn send(w: &mut (impl AsyncWrite + Unpin), kind: u8, body: &[u8]) -> io::R
 async fn connect(
     url: &url::Url,
     cert: Option<&str>,
+    insecure: bool,
+    fallback_ips: &[IpAddr],
     keys: &NodeState,
     dialer: &dyn Dialer,
 ) -> io::Result<BoxStream> {
-    let mut stream = control::transport_with(dialer, url, cert).await?;
+    let mut stream = control::transport_derp(dialer, url, cert, insecure, fallback_ips).await?;
     let host = &url[url::Position::BeforeHost..url::Position::AfterPort];
     stream.write_all(format!("GET /derp HTTP/1.1\r\nHost: {host}\r\nConnection: Upgrade\r\nUpgrade: DERP\r\n\r\n").as_bytes()).await?;
     let (status, fields) = control::headers(&mut stream).await?;
@@ -172,7 +174,22 @@ impl Relay {
             let mut stream = None;
             for url in urls.iter().take(8) {
                 let cert = snapshot.derp_certs.get(url).map(String::as_str);
-                match control::timed(connect(url, cert, keys, dialer.as_ref())).await {
+                let insecure = snapshot.derp_insecure.contains(url);
+                let fallback_ips = snapshot
+                    .derp_ips
+                    .get(url)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                match control::timed(connect(
+                    url,
+                    cert,
+                    insecure,
+                    fallback_ips,
+                    keys,
+                    dialer.as_ref(),
+                ))
+                .await
+                {
                     Ok(value) => {
                         stream = Some(value);
                         break;

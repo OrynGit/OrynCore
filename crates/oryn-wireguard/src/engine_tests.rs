@@ -437,3 +437,86 @@ fn global_budget_is_shared_and_pressure_stops_growth() {
     crate::resources::set_pressure(Pressure::Normal);
     crate::resources::configure(crate::resources::Limits::DEFAULT);
 }
+
+#[test]
+fn per_peer_keepalive_drives_idle_timers_and_wake_when_interface_keepalive_is_zero() {
+    let mut spec = control_spec();
+    spec.keepalive_secs = 0;
+    let peer2_secret = [0x44; 32];
+    let mut second_peer = spec.peers[0].clone();
+    second_peer.endpoint = TargetAddr::Ip("127.0.0.1:10002".parse().unwrap());
+    second_peer.public_key = PublicKey::from(&StaticSecret::from(peer2_secret)).to_bytes();
+    second_peer.allowed_ips = vec![Cidr::parse("10.1.0.0/24").unwrap()];
+    spec.peers[0].keepalive_secs = Some(25);
+    second_peer.keepalive_secs = None;
+    spec.peers.push(second_peer);
+
+    let mut engine = Engine::new(spec, Arc::new(UdpFactory));
+    let local_public = PublicKey::from(&StaticSecret::from([0x11; 32])).to_bytes();
+    let mut remotes = [
+        new_tunn([0x22; 32], local_public, None, 0, 1),
+        new_tunn(peer2_secret, local_public, None, 0, 2),
+    ];
+    let mut buf = [0; WIRE_BUF];
+    for (i, remote) in remotes.iter_mut().enumerate() {
+        engine.peers[i].endpoint = Some(
+            format!("127.0.0.1:1000{}", i + 1)
+                .parse()
+                .unwrap(),
+        );
+        let init = network(
+            engine.peers[i]
+                .tunn
+                .format_handshake_initiation(&mut buf, false),
+        );
+        let response = network(remote.decapsulate(None, &init, &mut buf));
+        let confirm = network(engine.peers[i].tunn.decapsulate(None, &response, &mut buf));
+        assert!(matches!(
+            remote.decapsulate(None, &confirm, &mut buf),
+            TunnResult::Done
+        ));
+    }
+
+    // 接口级 keepalive=0 且无活动流时，仅配置了逐对端 keepalive 的对端仍须调度定时器。
+    assert_eq!(engine.peers[0].effective_keepalive(0), 25);
+    assert_eq!(engine.peers[1].effective_keepalive(0), 0);
+    assert!(engine.next_wait().is_some());
+
+    // 若全部有会话的对端都没有 keepalive，则不应唤醒保活定时器。
+    engine.peers[0].keepalive = Some(0);
+    assert!(engine.next_wait().is_none());
+
+    // 唤醒路径同样尊重逐对端 keepalive。
+    engine.peers[0].keepalive = Some(25);
+    let sent = Arc::new(std::sync::Mutex::new(Vec::<SocketAddr>::new()));
+    struct CaptureSocket(Arc<std::sync::Mutex<Vec<SocketAddr>>>);
+    impl oryn_udp::Datagrams for CaptureSocket {
+        fn try_send_to(&self, _: &[u8], peer: SocketAddr) -> io::Result<()> {
+            self.0.lock().unwrap().push(peer);
+            Ok(())
+        }
+        fn recv_from<'life0, 'life1, 'async_trait>(
+            &'life0 self,
+            _: &'life1 mut [u8],
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = io::Result<(usize, SocketAddr)>> + Send + 'async_trait>,
+        >
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(std::future::pending())
+        }
+    }
+    let cap: Arc<dyn oryn_udp::Datagrams> = Arc::new(CaptureSocket(sent.clone()));
+    engine.wires.v4 = Some(cap);
+    engine.command(Command::Sleep);
+    assert!(engine.next_wait().is_none());
+    engine.command(Command::Wake);
+    let sent = sent.lock().unwrap();
+    assert_eq!(
+        sent.as_slice(),
+        &["127.0.0.1:10001".parse::<SocketAddr>().unwrap()]
+    );
+}
