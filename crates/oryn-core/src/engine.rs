@@ -438,7 +438,7 @@ fn run_thread(
             bootstrap.outbounds.len(),
             bootstrap.rules.len(),
             bootstrap.providers.len(),
-            bootstrap.modules.len(),
+            modules.len(),
             options.mtu,
             bootstrap.dns.nameserver.len(),
             log::max_level()

@@ -1461,8 +1461,7 @@ impl MitmSpec {
             let (exclude, pattern) = item
                 .strip_prefix('-')
                 .map_or((false, item.as_str()), |p| (true, p));
-            if !crate::listed_host_matches(pattern, Some(host), port, crate::ListedPort::Fixed(443))
-            {
+            if !crate::mitm_listed_host_matches(pattern, Some(host), port) {
                 continue;
             }
             if exclude {
@@ -1471,5 +1470,23 @@ impl MitmSpec {
             included = true;
         }
         included
+    }
+
+    /// 是否有启用中的 MITM 规则覆盖该端口（用于在无 Fake-IP 映射时决定是否嗅探 TLS SNI）。
+    pub fn has_port(&self, port: u16) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        self.hostnames.iter().any(|item| {
+            let item = item.trim();
+            if item.is_empty() || item.starts_with('-') {
+                return false;
+            }
+            let wanted = item
+                .rsplit_once(':')
+                .and_then(|(host, raw)| raw.parse::<u16>().ok().filter(|_| !host.is_empty()))
+                .unwrap_or(443);
+            wanted == 0 || wanted == port
+        })
     }
 }

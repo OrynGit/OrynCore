@@ -1044,6 +1044,59 @@ impl Plan {
             .iter()
             .any(|s| s.enabled && s.kind == "http-response" && s.requires_body)
     }
+
+    /// 预判此请求的响应是否可能命中正文重写或 `requires-body` 响应脚本。
+    /// 用于在发往上游前过滤不被支持的 `Accept-Encoding`（如 `zstd`），避免响应因无法解压而跳过改写。
+    pub fn might_need_response_body(&self, request: &Message) -> bool {
+        fn may_match_request(c: &Condition, req: &Message) -> bool {
+            match c {
+                Condition::Always => true,
+                Condition::And(a, b) => may_match_request(a, req) && may_match_request(b, req),
+                Condition::Or(a, b) => may_match_request(a, req) || may_match_request(b, req),
+                Condition::Match(Expr::Variable(v), p, _) if v == "url" => p.matches(&req.url),
+                Condition::Match(Expr::Variable(v), p, _) if v == "request.method" => {
+                    p.matches(&req.method)
+                }
+                Condition::Eq(Expr::Variable(v), Expr::Literal(Value::String(s)))
+                | Condition::Eq(Expr::Literal(Value::String(s)), Expr::Variable(v))
+                    if v == "request.method" =>
+                {
+                    req.method == *s
+                }
+                _ => true,
+            }
+        }
+        let index = self.ensure_index();
+        for &idx in index
+            .response
+            .host_indices(&request.url)
+            .iter()
+            .chain(&index.response.fallback)
+        {
+            let rule = &self.response[idx];
+            if rule.actions.iter().any(Action::needs_body)
+                && may_match_request(&rule.condition, request)
+            {
+                return true;
+            }
+        }
+        for &idx in index
+            .scripts
+            .host_indices(&request.url)
+            .iter()
+            .chain(&index.scripts.fallback)
+        {
+            let s = &self.scripts[idx];
+            if s.enabled
+                && s.kind == "http-response"
+                && s.requires_body
+                && may_match_request(&s.condition, request)
+            {
+                return true;
+            }
+        }
+        false
+    }
     pub fn from_modules(modules: &[oryn_module::ModuleIR], warnings: &mut Vec<String>) -> Self {
         let mut plan = Self::default();
         for m in modules {
@@ -1889,33 +1942,54 @@ fn check_header(k: &str, v: &str) -> io::Result<()> {
     http::header::HeaderValue::from_str(v).map_err(invalid)?;
     Ok(())
 }
-/// 按需零拷贝读取正文；未压缩（`identity` 或无 `Content-Encoding`）时直接借用原切片。
+/// 按需零拷贝读取正文；未压缩（`identity` 或无 `Content-Encoding`）或空正文时直接借用原切片。
+/// 支持逗号分隔的多重编码、`x-gzip`，以及原始 deflate（无 zlib 头）回退。
 pub fn decode_body_cow<'a>(m: &'a Message, max_body: usize) -> io::Result<Cow<'a, [u8]>> {
-    let encoding = m
+    if m.body.is_empty() {
+        return Ok(Cow::Borrowed(&[]));
+    }
+    let encodings: Vec<String> = m
         .header("Content-Encoding")
-        .unwrap_or("identity")
-        .to_ascii_lowercase();
-    if encoding == "identity" {
+        .unwrap_or("")
+        .split(',')
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty() && s != "identity")
+        .collect();
+    if encodings.is_empty() {
         if m.body.len() > max_body {
             return Err(invalid("decompressed body exceeds limit"));
         }
         return Ok(Cow::Borrowed(&m.body));
     }
-    let mut reader: Box<dyn Read + '_> = match encoding.as_str() {
-        "gzip" => Box::new(flate2::read::GzDecoder::new(m.body.as_slice())),
-        "deflate" => Box::new(flate2::read::ZlibDecoder::new(m.body.as_slice())),
-        "br" => Box::new(brotli::Decompressor::new(m.body.as_slice(), 4096)),
-        _ => return Err(invalid("unsupported content encoding")),
+    let decode_once = |enc: &str, data: &[u8]| -> io::Result<Vec<u8>> {
+        let read_bounded = |mut reader: Box<dyn Read + '_>| -> io::Result<Vec<u8>> {
+            let mut out = Vec::new();
+            reader
+                .by_ref()
+                .take((max_body + 1) as u64)
+                .read_to_end(&mut out)?;
+            if out.len() > max_body {
+                return Err(invalid("decompressed body exceeds limit"));
+            }
+            Ok(out)
+        };
+        match enc {
+            "gzip" | "x-gzip" => read_bounded(Box::new(flate2::read::GzDecoder::new(data))),
+            "deflate" => match read_bounded(Box::new(flate2::read::ZlibDecoder::new(data))) {
+                Ok(out) => Ok(out),
+                Err(_) => read_bounded(Box::new(flate2::read::DeflateDecoder::new(data))),
+            },
+            "br" => read_bounded(Box::new(brotli::Decompressor::new(data, 4096))),
+            _ => Err(invalid("unsupported content encoding")),
+        }
     };
-    let mut out = vec![];
-    reader
-        .by_ref()
-        .take((max_body + 1) as u64)
-        .read_to_end(&mut out)?;
-    if out.len() > max_body {
-        return Err(invalid("decompressed body exceeds limit"));
+    let mut current: Cow<'a, [u8]> = Cow::Borrowed(&m.body);
+    // RFC 9110: Content-Encoding 按应用顺序排列，解码需从外到内逆序执行。
+    for enc in encodings.iter().rev() {
+        let next = decode_once(enc, &current)?;
+        current = Cow::Owned(next);
     }
-    Ok(Cow::Owned(out))
+    Ok(current)
 }
 
 pub fn decode_body(m: &Message) -> io::Result<Vec<u8>> {
@@ -2188,5 +2262,66 @@ mod pattern_tests {
         let out: Value = serde_json::from_slice(&jq_resp.body).unwrap();
         assert!(out.get("ad").is_none());
         assert_eq!(out["items"].as_array().unwrap().len(), 6_000);
+    }
+
+    #[test]
+    fn decode_body_handles_empty_xgzip_raw_deflate_and_chained_encodings() {
+        // 空正文不因 Content-Encoding 失败
+        let empty = Message {
+            url: "https://a.test/".into(),
+            method: "GET".into(),
+            status: Some(204),
+            headers: vec![("Content-Encoding".into(), "gzip".into())],
+            body: vec![],
+        };
+        assert_eq!(decode_body_cow(&empty, MAX_BODY).unwrap().as_ref(), b"");
+
+        // x-gzip
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        std::io::Write::write_all(&mut gz, br#"{"ok":1}"#).unwrap();
+        let xgz = Message {
+            url: "https://a.test/".into(),
+            method: "GET".into(),
+            status: Some(200),
+            headers: vec![("Content-Encoding".into(), "x-gzip".into())],
+            body: gz.finish().unwrap(),
+        };
+        assert_eq!(decode_body_cow(&xgz, MAX_BODY).unwrap().as_ref(), br#"{"ok":1}"#);
+
+        // 原始 RFC 1951 deflate（无 zlib 头）回退
+        let mut raw = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::fast());
+        std::io::Write::write_all(&mut raw, br#"{"raw":true}"#).unwrap();
+        let def = Message {
+            url: "https://a.test/".into(),
+            method: "GET".into(),
+            status: Some(200),
+            headers: vec![("Content-Encoding".into(), "deflate".into())],
+            body: raw.finish().unwrap(),
+        };
+        assert_eq!(decode_body_cow(&def, MAX_BODY).unwrap().as_ref(), br#"{"raw":true}"#);
+
+        // might_need_response_body 精确按 URL 判定
+        let ir = oryn_module::parse(
+            "[Rewrite]\n^https://api\\.a\\.test/feed$ response-body-json-jq 'del(.ad)'\n",
+            Some(ModuleFormat::Loon),
+        )
+        .unwrap();
+        let plan = compile_module(&ir, &BTreeMap::new(), &Resources::new()).unwrap();
+        let hit = Message {
+            url: "https://api.a.test/feed".into(),
+            method: "GET".into(),
+            status: None,
+            headers: vec![],
+            body: vec![],
+        };
+        let miss = Message {
+            url: "https://other.test/video.mp4".into(),
+            method: "GET".into(),
+            status: None,
+            headers: vec![],
+            body: vec![],
+        };
+        assert!(plan.might_need_response_body(&hit));
+        assert!(!plan.might_need_response_body(&miss));
     }
 }

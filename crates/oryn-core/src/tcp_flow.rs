@@ -185,7 +185,7 @@ async fn handle(ctx: Rc<EngineCtx>, mut stream: LwipTcpStream, phase: &crate::ad
     mitm &= !raw;
     let inspect = !raw
         && (mitm
-            || state.config.mitm.enabled && destination.port() == 443
+            || state.config.mitm.has_port(destination.port())
             || !state.http_plan.is_empty() && matches!(destination.port(), 80 | 443 | 8080)
             || list_match(&state.config.force_http_hosts));
     if inspect && first.is_empty() {
@@ -275,12 +275,13 @@ async fn handle(ctx: Rc<EngineCtx>, mut stream: LwipTcpStream, phase: &crate::ad
         } else {
             host.clone()
         };
-        let origin = format!(
-            "{}://{}:{}",
-            if mitm { "https" } else { "http" },
-            authority,
-            destination.port()
-        );
+        let scheme = if mitm { "https" } else { "http" };
+        let default_port = if mitm { 443 } else { 80 };
+        let origin = if destination.port() == default_port {
+            format!("{scheme}://{authority}")
+        } else {
+            format!("{scheme}://{authority}:{}", destination.port())
+        };
         let inspector = crate::http::Inspector {
             scripts: state.scripts.clone(),
             plan: state.http_plan.clone(),
@@ -327,8 +328,12 @@ async fn handle(ctx: Rc<EngineCtx>, mut stream: LwipTcpStream, phase: &crate::ad
         };
         let result = tokio::select! { result = operation => result, _ = conn.cancelled() => Ok(()) };
         if let Err(e) = result {
-            conn.set_error(&e);
-            warn!("TCP #{id} {label} HTTP inspection: {e}");
+            if e.kind() == io::ErrorKind::TimedOut {
+                debug!("TCP #{id} {label} HTTP inspection idle timeout: {e}");
+            } else {
+                conn.set_error(&e);
+                warn!("TCP #{id} {label} HTTP inspection: {e}");
+            }
         }
         return;
     }

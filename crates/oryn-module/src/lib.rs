@@ -1,6 +1,8 @@
-//! Surge/Loon 文本输入。保留来源顺序、方言和参数；不执行网络请求或脚本。
+//! Surge/Loon/Egern 模块文本输入。保留来源顺序、方言和参数；不执行网络请求或脚本。
+mod egern;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+pub use egern::is_egern_yaml;
 pub const MAX_MODULE_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_LINES: usize = 32768;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,6 +78,9 @@ impl std::fmt::Display for ParseError {
 }
 impl std::error::Error for ParseError {}
 pub fn detect_format(text: &str) -> ModuleFormat {
+    if egern::is_egern_yaml(text) {
+        return ModuleFormat::Surge;
+    }
     // 转换仓库会保留 Loon 元数据，实际 section 与脚本语法比注释元数据更可靠。
     if text.lines().any(|s| {
         matches!(
@@ -165,6 +170,9 @@ pub fn parse_named(
 ) -> Result<ModuleIR, ParseError> {
     if text.len() > MAX_MODULE_BYTES || text.lines().count() > MAX_LINES {
         return Err(ParseError("module exceeds size or line limit".into()));
+    }
+    if egern::is_egern_yaml(text) {
+        return egern::parse_yaml(text, name);
     }
     let mut out = ModuleIR {
         format: format.unwrap_or_else(|| detect_format(text)),
@@ -587,6 +595,9 @@ pub fn bind(
     format: ModuleFormat,
     args: &[(String, String)],
 ) -> Result<Bound, ParseError> {
+    if egern::is_egern_yaml(text) {
+        return egern::bind_yaml(text, args);
+    }
     let ir = parse(text, Some(format))?;
     if let Some(warning) = ir.warnings.iter().find(|w| w.contains("invalid argument declaration:")) {
         return Err(ParseError(warning.clone()));

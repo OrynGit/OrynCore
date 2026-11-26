@@ -197,6 +197,55 @@ pub fn listed_host_matches(
     domain.is_some_and(|host| hostname_matches(pattern, host))
 }
 
+/// MITM 主机名匹配（Surge / Loon / Egern 语义）：与 [`hostname_matches`] 相同，
+/// 但前导 `*.example.com` 同时覆盖多级子域（如 `sdkapp.uve.weibo.com` 命中 `*.weibo.com`，
+/// 裸域 `weibo.com` 不命中）。
+pub fn mitm_hostname_matches(pattern: &str, host: &str) -> bool {
+    let pattern = normalize_domain(pattern);
+    let host = normalize_domain(host);
+    if pattern.is_empty() || host.is_empty() {
+        return false;
+    }
+    if let Some(rest) = pattern.strip_prefix("*.") {
+        if !rest.is_empty() {
+            for (idx, b) in host.bytes().enumerate() {
+                if b == b'.' && mitm_hostname_matches(rest, &host[idx + 1..]) {
+                    return true;
+                }
+            }
+            return false;
+        }
+    }
+    hostname_matches(&pattern, &host)
+}
+
+/// MITM 列表项匹配（默认端口 443，`:0` 表示任意端口，支持多级 `*.` 通配）。
+pub fn mitm_listed_host_matches(item: &str, domain: Option<&str>, port: u16) -> bool {
+    let item = item.trim();
+    if item.is_empty() {
+        return false;
+    }
+    let (pattern, wanted) = match item.rsplit_once(':').and_then(|(host, raw)| {
+        raw.parse::<u16>()
+            .ok()
+            .filter(|_| !host.is_empty())
+            .map(|parsed| (host, parsed))
+    }) {
+        Some(split) => split,
+        None => (item, 443),
+    };
+    if wanted != 0 && port != wanted {
+        return false;
+    }
+    if pattern == "*" {
+        return true;
+    }
+    if pattern.eq_ignore_ascii_case("<ip-address>") {
+        return domain.is_none_or(is_ip_literal);
+    }
+    domain.is_some_and(|host| mitm_hostname_matches(pattern, host))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -344,5 +393,43 @@ mod tests {
             443,
             ListedPort::Fixed(443)
         ));
+    }
+
+    #[test]
+    fn mitm_wildcard_matches_multilevel_subdomains_and_ports() {
+        assert!(mitm_hostname_matches("*.weibo.com", "api.weibo.com"));
+        assert!(mitm_hostname_matches("*.weibo.com", "sdkapp.uve.weibo.com"));
+        assert!(!mitm_hostname_matches("*.weibo.com", "weibo.com"));
+        assert!(!mitm_hostname_matches("*.weibo.com", "evilweibo.com"));
+        assert!(mitm_hostname_matches(
+            "upos-sz-mirror*.bilivideo.com",
+            "upos-sz-mirrorcoso1.bilivideo.com"
+        ));
+        assert!(mitm_hostname_matches(
+            "upos-*-mirrorakam.akamaized.net",
+            "upos-hz-mirrorakam.akamaized.net"
+        ));
+        assert!(!mitm_hostname_matches(
+            "upos-*-mirrorakam.akamaized.net",
+            "upos-hz-mirrorakam.akamaized.net.extra"
+        ));
+
+        let spec = crate::MitmSpec {
+            enabled: true,
+            hostnames: vec![
+                "*.weibo.com".into(),
+                "-deny.uve.weibo.com".into(),
+                "upos-sz-mirror*.bilivideo.com:4483".into(),
+            ],
+            ..Default::default()
+        };
+        assert!(spec.matches("sdkapp.uve.weibo.com", 443));
+        assert!(!spec.matches("deny.uve.weibo.com", 443));
+        assert!(!spec.matches("weibo.com", 443));
+        assert!(spec.matches("upos-sz-mirrorcoso1.bilivideo.com", 4483));
+        assert!(!spec.matches("upos-sz-mirrorcoso1.bilivideo.com", 443));
+        assert!(spec.has_port(443));
+        assert!(spec.has_port(4483));
+        assert!(!spec.has_port(8443));
     }
 }
