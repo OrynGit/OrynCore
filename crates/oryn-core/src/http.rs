@@ -222,6 +222,19 @@ impl Inspector {
         let buffered = buffer.is_some();
         let request_trailer_names = trailer_names(request_trailers.as_ref());
         if need && !buffered {
+            let url_no_query = message
+                .url
+                .split(['?', '#'])
+                .next()
+                .unwrap_or(&message.url);
+            log::warn!(
+                "HTTP request body on {url_no_query} exceeds rewrite budget ({} bytes)",
+                self.max_body
+            );
+            self.scripts.record_runtime_warning(format!(
+                "HTTP request body on {url_no_query} exceeds rewrite budget ({} bytes)",
+                self.max_body
+            ));
             return Ok(error_response(413));
         }
         if let Some(data) = buffer {
@@ -267,7 +280,12 @@ impl Inspector {
                     }
                 }
                 Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => return Err(e),
-                Err(e) => log::warn!("HTTP request script {} skipped: {e}", spec.name),
+                Err(e) => {
+                    log::warn!("HTTP request script {} skipped: {e}", spec.name);
+                    if !e.to_string().contains("cancelled by reload") {
+                        self.scripts.record_runtime_warning(format!("script {}: {e}", spec.name));
+                    }
+                }
             }
         }
         // 无 response 正文脚本时无需跨网络等待期保留请求正文与页面配额，发送完毕即由 GuardedBody 释放。
@@ -463,6 +481,15 @@ impl Inspector {
         let body_rewritten = self.plan.apply_response_with_effects(&mut msg, &request_meta, !need || buffered)?;
         if need && !buffered {
             log::warn!("HTTP response body exceeds rewrite budget; passing through");
+            let url_no_query = request_meta
+                .url
+                .split(['?', '#'])
+                .next()
+                .unwrap_or(&request_meta.url);
+            self.scripts.record_runtime_warning(format!(
+                "HTTP response body on {url_no_query} exceeds rewrite budget ({} bytes)",
+                self.max_body
+            ));
         }
         for spec in scripts.iter().filter(|s| (!s.requires_body || buffered)
             && !(s.dialect == oryn_module::ModuleFormat::Loon && body_rewritten)) {
@@ -475,6 +502,9 @@ impl Inspector {
                     return Err(e);
                 }
                 log::warn!("HTTP response script {} skipped: {e}", spec.name);
+                if !e.to_string().contains("cancelled by reload") {
+                    self.scripts.record_runtime_warning(format!("script {}: {e}", spec.name));
+                }
             }
         }
         let body = if buffered {

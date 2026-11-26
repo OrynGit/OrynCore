@@ -99,7 +99,7 @@ fn prepared_script_env_and_compile_warnings_match_fresh() {
                 data_dir: Some(dir.clone()), ..Default::default()
             }, std::sync::Arc::new(crate::stats::Stats::default()));
         let mut candidate = config();
-        candidate.modules = crate::proxy_providers::compile("modules:\n  - format: surge\n    inline: |\n      [Script]\n      test = type=http-request, pattern=^http://example.invalid/, script-path=test.js\n      [Body Rewrite]\n      http-response-jq ^http://example.invalid/ 'invalid syntax ???'\nrules: ['MATCH,DIRECT']", None, None).unwrap().modules;
+        candidate.modules = crate::proxy_providers::compile("modules:\n  - format: surge\n    inline: |\n      [Script]\n      test = type=http-request, pattern=^http://example.invalid/, script-path=test.js, timeout=999\n      [Body Rewrite]\n      http-response-jq ^http://example.invalid/ 'invalid syntax ???'\nrules: ['MATCH,DIRECT']", None, None).unwrap().modules;
         candidate.modules[0].env.insert("prepared_env".into(), "present".into());
         let prepared = prepare_for_apply(&ctx, candidate).await;
         assert_eq!(prepared.plans.len(), 1);
@@ -116,7 +116,7 @@ fn prepared_script_env_and_compile_warnings_match_fresh() {
         assert!(
             compile_warnings
                 .iter()
-                .any(|w| w.contains("Oryn script resource limits:")),
+                .any(|w| w.contains("script timeout 999s rounded up and capped to Oryn limit:")),
             "{compile_warnings:?}"
         );
         let fresh_config = prepared.config.clone();

@@ -23,6 +23,8 @@ pub struct ScriptHost {
     network: std::sync::RwLock<Option<(Arc<oryn_dns::Routing>, Arc<oryn_dns::DnsEngine>)>>,
     pub results: Mutex<BTreeMap<String, Value>>,
     pub notifications: Mutex<std::collections::VecDeque<Value>>,
+    /// 运行时脚本/正文超限或执行异常（有界去重，完整重载时清空），经 `warnings` 控制命令暴露给用户。
+    runtime_warnings: Mutex<std::collections::VecDeque<String>>,
     /// 前台 HTTP 脚本与后台 cron/event 脚本分池，避免后台慢 `$httpClient` 阻塞 HTTP 请求。
     http_slots: Arc<Semaphore>,
     bg_slots: Arc<Semaphore>,
@@ -90,6 +92,7 @@ impl ScriptHost {
             network: Default::default(),
             results: Mutex::new(BTreeMap::new()),
             notifications: Mutex::new(Default::default()),
+            runtime_warnings: Mutex::new(Default::default()),
             http_slots: Arc::new(Semaphore::new(http_workers.max(1))),
             bg_slots: Arc::new(Semaphore::new(bg_workers.max(1))),
             http_pending: Arc::new(Semaphore::new(64)),
@@ -104,6 +107,31 @@ impl ScriptHost {
     }
     pub fn max_scripts(&self) -> usize {
         self.max_scripts
+    }
+    pub fn record_runtime_warning(&self, warning: String) {
+        let mut queue = self.runtime_warnings.lock().unwrap();
+        let trimmed: String = warning.chars().take(512).collect();
+        if queue.iter().any(|existing| existing == &trimmed) {
+            return;
+        }
+        if queue.len() >= 32 {
+            queue.pop_front();
+        }
+        queue.push_back(trimmed);
+    }
+    pub fn runtime_warnings(&self) -> Vec<String> {
+        self.runtime_warnings
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect()
+    }
+    pub fn runtime_warning_count(&self) -> usize {
+        self.runtime_warnings.lock().unwrap().len()
+    }
+    pub fn clear_runtime_warnings(&self) {
+        self.runtime_warnings.lock().unwrap().clear();
     }
     fn record_result(&self, name: &str, result: Value) {
         let mut results = self.results.lock().unwrap();
@@ -177,7 +205,11 @@ impl ScriptHost {
             v
         };
         let request_body = if spec.requires_body {
-            if response.is_some() && request.body.len() > max_size {
+            // 无正文请求（如 GET/HEAD）在 binary-body-mode 下不传空的 Uint8Array(0)，
+            // 避免把 truthy 空数组交给把 `if ($request.body)` 当作「存在请求体」判断的脚本。
+            if (response.is_some() && request.body.len() > max_size)
+                || (spec.binary && request.body.is_empty())
+            {
                 BodyData::None
             } else {
                 body_for_script(request, max_size, spec.binary)?
@@ -555,6 +587,11 @@ pub async fn auxiliary(state: std::rc::Rc<crate::context::RuntimeState>, spec: S
             state
                 .scripts
                 .record_result(&spec.name, json!({"error":e.to_string()}));
+            if !e.to_string().contains("cancelled by reload") {
+                state
+                    .scripts
+                    .record_runtime_warning(format!("script {}: {e}", spec.name));
+            }
         }
         log::warn!("script {}: {e}", spec.name);
     }
@@ -777,5 +814,57 @@ mod tests {
         assert_eq!(parse_status_code(&json!("HTTP/2 204")), Some(204));
         assert_eq!(parse_status_code(&json!("invalid")), None);
         assert_eq!(parse_status_code(&json!(99)), None);
+    }
+
+    #[tokio::test]
+    async fn empty_binary_request_passes_undefined_body_and_runtime_warnings_dedup() {
+        struct DummyOutbound;
+        #[async_trait::async_trait]
+        impl Outbound for DummyOutbound {
+            fn tag(&self) -> &str { "dummy" }
+            fn kind(&self) -> &'static str { "reject" }
+            async fn connect_tcp(&self, _: &oryn_config::TargetAddr) -> io::Result<oryn_outbound::BoxStream> {
+                Err(io::Error::other("unused"))
+            }
+            async fn bind_udp(&self, _: &oryn_config::TargetAddr) -> io::Result<Box<dyn oryn_outbound::PacketConn>> {
+                Err(io::Error::other("unused"))
+            }
+        }
+        let host = Arc::new(ScriptHost::new(None));
+        let spec = ScriptRule {
+            enabled: true,
+            event: None,
+            cron: None,
+            name: "req_proto".into(),
+            kind: "http-request".into(),
+            condition: oryn_http_inspect::Condition::Always,
+            source: "test".into(),
+            code: r#"if ($request.body) { throw new Error("empty GET had truthy body"); } $done({});"#.into(),
+            argument: Value::Null,
+            env: Arc::new(BTreeMap::new()),
+            requires_body: true,
+            binary: true,
+            full_headers: false,
+            timeout: 2,
+            max_size: oryn_http_inspect::MAX_BODY,
+            dialect: oryn_module::ModuleFormat::Loon,
+        };
+        let req = Message {
+            url: "https://spclient.wg.spotify.com/color-lyrics/v2/track/abc".into(),
+            method: "GET".into(),
+            status: None,
+            headers: vec![],
+            body: vec![],
+        };
+        host.execute(&spec, &req, None, Arc::new(DummyOutbound))
+            .await
+            .expect("empty binary GET request must keep $request.body falsy");
+
+        host.record_runtime_warning("script foo: timeout".into());
+        host.record_runtime_warning("script foo: timeout".into());
+        assert_eq!(host.runtime_warning_count(), 1);
+        assert_eq!(host.runtime_warnings(), vec!["script foo: timeout"]);
+        host.clear_runtime_warnings();
+        assert_eq!(host.runtime_warning_count(), 0);
     }
 }

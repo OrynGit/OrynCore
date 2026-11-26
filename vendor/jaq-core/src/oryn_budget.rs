@@ -45,7 +45,8 @@ pub fn start_with(max_body: usize) {
             bytes,
             max_val,
             depth: 0,
-            end: Instant::now() + Duration::from_millis(250),
+            // 与 HTTP 改写总预算（500 ms）对齐，避免 2–4 MiB JSON 在移动降频或调试构建下误超时。
+            end: Instant::now() + Duration::from_millis(500),
         })
     });
 }
@@ -71,7 +72,10 @@ pub fn charge(bytes: usize) {
         let Some(v) = b.as_mut() else {
             return false;
         };
-        if v.steps == 0 || bytes > v.bytes || Instant::now() >= v.end {
+        if v.steps == 0
+            || bytes > v.bytes
+            || ((v.steps & 0xff) == 0 && Instant::now() >= v.end)
+        {
             return true;
         }
         v.steps -= 1;

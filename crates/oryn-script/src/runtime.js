@@ -1,11 +1,11 @@
 (()=>{
 // 隔离上下文内的 API；没有 require、文件系统或系统环境变量。
 // 宿主函数先收进闭包再从全局删除，脚本无法直接调用或替换它们。
-const __host_call = __host, __finish_call = __finish, __store_r = __store_read, __store_w = __store_write, __enc = __utf8encode, __dec = __utf8decode, __ungz = __ungzip, __gz = __gzip, __b64 = __base64, __b64b = __b64_bytes;
+const __host_call = __host, __finish_call = __finish, __store_r = __store_read, __store_w = __store_write, __enc = __utf8encode, __dec = __utf8decode, __ungz = __ungzip, __gz = __gzip, __b64 = __base64, __b64b = __b64_bytes, __rand = __random_bytes;
 const input = JSON.parse(__input);
 const __rb = typeof __req_body === 'undefined' ? undefined : __req_body;
 const __sb = typeof __res_body === 'undefined' ? undefined : __res_body;
-for (const k of ['__host','__finish','__store_read','__store_write','__utf8encode','__utf8decode','__ungzip','__gzip','__base64','__b64_bytes','__input','__req_body','__res_body']) delete globalThis[k];
+for (const k of ['__host','__finish','__store_read','__store_write','__utf8encode','__utf8decode','__ungzip','__gzip','__base64','__b64_bytes','__random_bytes','__input','__req_body','__res_body']) delete globalThis[k];
 let finished = false, nextID = 1;
 let requests = [], callbacks = new Map(), timers = new Map(), logs = [], notifications = [];
 const $request = ['http-request','http-response','rule'].includes(input.kind) && input.request && typeof input.request === 'object' ? input.request : undefined;
@@ -23,17 +23,18 @@ if ($response) {
 }
 const $argument = (input.argument === null || input.argument === undefined) ? undefined : input.argument;
 const ctx = {env: Object.assign({}, input.env || {})};
-const $script = {name: input.name, type: input.kind, binaryBodyMode: input.binary, startTime: Date.now() / 1000};
+const $script = {name: input.name, type: input.kind, binaryBodyMode: input.binary, startTime: input.loon ? Date.now() : Date.now() / 1000};
 const $environment = {
  "surge-version": "5.11.0",
  "surge-build": "3000",
+ "version": "5.11.0",
  "system": "iOS",
  "system-version": "18.0",
  "device-model": "iPhone",
  "language": "zh-Hans",
  "oryn-version": "0.0.1"
 };
-const $loon = input.loon ? "Oryn compatibility" : undefined;
+const $loon = input.loon ? "iPhone, iOS 18.0, Loon 3.2.0 (Oryn)" : undefined;
 const control = (name,extra={}) => {const r=JSON.parse(__host_call(JSON.stringify(Object.assign({control:name},extra))));if(r.error)throw Error(r.error);return r;};
 const $surge = {
  selectGroupDetails:()=>control('groups'),
@@ -56,6 +57,19 @@ const atob=text=>__b64(String(text),false), btoa=text=>__b64(String(text),true);
 const $utils = {
  ungzip:bytes=>__ungz(bytes instanceof Uint8Array?bytes:new Uint8Array(bytes||[])),
  gzip:bytes=>__gz(bytes instanceof Uint8Array?bytes:(typeof bytes==='string'?__enc(bytes):new Uint8Array(bytes||[])))
+};
+const crypto = {
+ getRandomValues(arr) {
+  if (!ArrayBuffer.isView(arr) || arr instanceof DataView || arr instanceof Float32Array || arr instanceof Float64Array) {
+   throw new TypeError('Expected integer TypedArray');
+  }
+  const n = arr.byteLength;
+  if (n > 65536) throw new RangeError('QuotaExceededError');
+  if (n > 0) {
+   new Uint8Array(arr.buffer, arr.byteOffset, n).set(__rand(n));
+  }
+  return arr;
+ }
 };
 const $network = {};
 const $event = (input.event === null || input.event === undefined) ? undefined : input.event;
@@ -248,7 +262,7 @@ function __timers(){for(const [id,t] of Array.from(timers)){if(t.due<=Date.now()
 function __poll(){let next=null;for(const t of timers.values()){const d=Math.max(0,t.due-Date.now());if(next===null||d<next)next=d;}return JSON.stringify({done:finished,request:requests.shift()||null,next,pending:callbacks.size>0});}
 function __take_logs(){const out={logs,notifications};logs=[];notifications=[];return JSON.stringify(out);}
 
-Object.assign(globalThis, {$utils,TextEncoder,TextDecoder,URL,URLSearchParams,atob,btoa,$surge,$config,$httpAPI,ctx,$script,$environment,$network,$done,console,$persistentStore,$notification,$httpClient,setTimeout,clearTimeout,setInterval,clearInterval});
+Object.assign(globalThis, {$utils,crypto,TextEncoder,TextDecoder,URL,URLSearchParams,atob,btoa,$surge,$config,$httpAPI,ctx,$script,$environment,$network,$done,console,$persistentStore,$notification,$httpClient,setTimeout,clearTimeout,setInterval,clearInterval});
 // 只在确实存在时挂载上下文变量，避免 `"$loon" in globalThis` / `"$response" in globalThis` 误判。
 if($loon!==undefined)globalThis.$loon=$loon;
 if($request!==undefined)globalThis.$request=$request;

@@ -450,8 +450,8 @@ fn action(name: &str, args: &[Expr], cond: &Condition, res: &Resources) -> io::R
             Action::HeaderRegex(s(0)?, regex(get(1)?)?, get(2)?.clone())
         }
         n if n.ends_with(".body.replace") => Action::BodyRegex(regex(get(0)?)?, get(1)?.clone()),
-        n if n.ends_with(".json.add") => Action::JsonAdd(s(0)?, get(1)?.clone()),
-        n if n.ends_with(".json.replace") => Action::JsonReplace(s(0)?, get(1)?.clone()),
+        n if n.ends_with(".json.add") => Action::JsonAdd(s(0)?, loon_json_value(get(1)?)),
+        n if n.ends_with(".json.replace") => Action::JsonReplace(s(0)?, loon_json_value(get(1)?)),
         n if n.ends_with(".json.delete") => Action::JsonDelete(s(0)?),
         n if n.ends_with(".json.jq") => jq(&s(0)?)?,
         n if n.ends_with(".json.jq_file") => {
@@ -495,6 +495,24 @@ fn action(name: &str, args: &[Expr], cond: &Condition, res: &Resources) -> io::R
     };
     Ok(vec![a])
 }
+fn loon_json_value(expr: &Expr) -> Expr {
+    // Loon DSL 没有对象/数组字面量，模块常以 `"{}"` / `"[]"` 表达 JSON 容器值（如小红书、高德、滴滴去广告）。
+    // 仅当静态字符串字面量可解析为 JSON Object/Array 时转换，保留普通字符串和数字字面量语义不变。
+    if let Expr::Literal(Value::String(s)) = expr {
+        let trimmed = s.trim();
+        if (trimmed.starts_with('{') && trimmed.ends_with('}'))
+            || (trimmed.starts_with('[') && trimmed.ends_with(']'))
+        {
+            if let Ok(parsed @ (Value::Object(_) | Value::Array(_))) =
+                serde_json::from_str::<Value>(trimmed)
+            {
+                return Expr::Literal(parsed);
+            }
+        }
+    }
+    expr.clone()
+}
+
 fn loon(
     line: &str,
     args: &BTreeMap<String, Value>,
@@ -1087,18 +1105,8 @@ pub fn compile_module_with_limits(
         let script_name = result.as_ref().map(|rule| rule.name.as_str()).unwrap_or("<invalid>");
         plan.warnings.extend(warnings.into_iter().map(|w| format!("{}:{}: script {script_name}: {w}", script.source.name, script.source.line)));
         match result {
-            Ok(rule) => {
-                let max_timeout = if matches!(rule.kind.as_str(), "http-request" | "http-response") {
-                    limits.http_max_timeout
-                } else {
-                    limits.bg_max_timeout
-                };
-                plan.warnings.push(format!(
-                    "{}:{}: Oryn script resource limits: default timeout {}s, maximum {max_timeout}s; body size capped at {} bytes",
-                    script.source.name, script.source.line, limits.default_timeout, limits.max_body
-                ));
-                plan.scripts.push(rule);
-            }
+            // 仅在脚本确实触发超时/正文上限截断或跳过时写入告警；符合限额的正常脚本不再逐条刷屏。
+            Ok(rule) => plan.scripts.push(rule),
             Err(e)
                 if matches!(
                     e.kind(),
@@ -1728,26 +1736,29 @@ s2 = type=http-request, pattern=^https://b\\.test/, script-path=a.js, timeout=ba
     fn resource_limits_notice_and_max_size_clamping() {
         let text = "\
 [Script]
+normal = type=http-response, pattern=^https://ok\\.test/, script-path=a.js, timeout=20, requires-body=true
 unbounded = type=http-response, pattern=^https://a\\.test/, script-path=a.js, max-size=-1
-oversize = type=http-response, pattern=^https://b\\.test/, script-path=a.js, max-size=10485760
+oversize = type=http-response, pattern=^https://b\\.test/, script-path=a.js, max-size=10485760, timeout=120
 cronjob = type=cron, cronexp=\"0 * * * *\", script-path=a.js
 ";
         let ir = oryn_module::parse(text, Some(ModuleFormat::Surge)).unwrap();
         let mut resources = Resources::new();
         resources.insert("a.js".into(), Arc::<[u8]>::from(&b"$done({});"[..]));
         let plan = compile_module(&ir, &BTreeMap::new(), &resources).unwrap();
-        assert_eq!(plan.scripts.len(), 3, "{:?}", plan.warnings);
-        assert_eq!(plan.scripts[0].timeout, DEFAULT_SCRIPT_TIMEOUT);
-        assert_eq!(plan.scripts[0].max_size, MAX_BODY);
+        assert_eq!(plan.scripts.len(), 4, "{:?}", plan.warnings);
+        assert_eq!(plan.scripts[0].timeout, 20);
+        assert_eq!(plan.scripts[1].timeout, DEFAULT_SCRIPT_TIMEOUT);
         assert_eq!(plan.scripts[1].max_size, MAX_BODY);
-        assert!(plan.warnings.iter().any(|w| {
-            w.contains("Oryn script resource limits: default timeout 10s, maximum 60s; body size capped at 4194304 bytes")
-        }), "{:?}", plan.warnings);
-        assert!(plan.warnings.iter().any(|w| {
-            w.contains("Oryn script resource limits: default timeout 10s, maximum 300s; body size capped at 4194304 bytes")
-        }), "{:?}", plan.warnings);
+        assert_eq!(plan.scripts[2].max_size, MAX_BODY);
+        assert_eq!(plan.scripts[2].timeout, DEFAULT_HTTP_SCRIPT_MAX_TIMEOUT);
+        assert!(
+            plan.warnings.iter().all(|w| !w.contains("script normal:") && !w.contains("script cronjob:")),
+            "normal scripts within limits must not emit false warnings: {:?}",
+            plan.warnings
+        );
         assert!(plan.warnings.iter().any(|w| w.contains("script max-size -1 capped to Oryn limit: 4194304 bytes")), "{:?}", plan.warnings);
         assert!(plan.warnings.iter().any(|w| w.contains("script max-size 10485760 capped to Oryn limit: 4194304 bytes")), "{:?}", plan.warnings);
+        assert!(plan.warnings.iter().any(|w| w.contains("script timeout 120s rounded up and capped to Oryn limit: 60s (maximum 60s)")), "{:?}", plan.warnings);
 
         let desktop = InspectLimits {
             max_body: DESKTOP_MAX_BODY,
@@ -1755,9 +1766,39 @@ cronjob = type=cron, cronexp=\"0 * * * *\", script-path=a.js
         };
         let dplan = compile_module_with_limits(&ir, &BTreeMap::new(), &resources, &[], desktop).unwrap();
         assert_eq!(dplan.max_body, DESKTOP_MAX_BODY);
-        assert_eq!(dplan.scripts[0].max_size, DESKTOP_MAX_BODY);
         assert_eq!(dplan.scripts[1].max_size, DESKTOP_MAX_BODY);
-        assert!(dplan.warnings.iter().any(|w| w.contains("body size capped at 8388608 bytes")), "{:?}", dplan.warnings);
+        assert_eq!(dplan.scripts[2].max_size, DESKTOP_MAX_BODY);
+        assert!(dplan.warnings.iter().any(|w| w.contains("script max-size 10485760 capped to Oryn limit: 8388608 bytes")), "{:?}", dplan.warnings);
+    }
+
+    #[test]
+    fn loon_json_replace_parses_object_and_array_literals() {
+        let text = "\
+[Rewrite]
+response if ${url} ~= /^https:\\/\\/api\\.example\\/feed$/i then response.json.replace([\"data.items\", \"data.meta\", \"data.label\", \"data.flag\"], [\"[]\", \"{}\", \"plain\", 0])
+";
+        let ir = oryn_module::parse(text, Some(ModuleFormat::Loon)).unwrap();
+        let plan = compile_module(&ir, &BTreeMap::new(), &Resources::new()).unwrap();
+        let req = Message {
+            url: "https://api.example/feed".into(),
+            method: "GET".into(),
+            status: None,
+            headers: vec![],
+            body: vec![],
+        };
+        let mut resp = Message {
+            url: req.url.clone(),
+            method: "GET".into(),
+            status: Some(200),
+            headers: vec![("Content-Type".into(), "application/json".into())],
+            body: br#"{"data":{"items":[1,2],"meta":{"ad":true},"label":"old","flag":1}}"#.to_vec(),
+        };
+        plan.apply_response(&mut resp, &req).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({"data":{"items":[],"meta":{},"label":"plain","flag":0}})
+        );
     }
 
     #[test]
